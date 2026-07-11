@@ -73,6 +73,44 @@ impl QT {
             QTKind::I2 { .. } => self.rows * self.cols.div_ceil(4) + self.rows * 4,
         }
     }
+
+    /// Dequantizes row `row` into a fresh `Vec<f32>` of length `cols` — port of `embed_row`
+    /// (which is just this, specialized to the embedding table) generalized to any QT, since
+    /// nothing about it is embedding-specific.
+    pub fn row_f32(&self, row: usize) -> Vec<f32> {
+        let cols = self.cols;
+        match &self.kind {
+            QTKind::F32(data) => data[row * cols..(row + 1) * cols].to_vec(),
+            QTKind::I8 { data, scale } => {
+                let s = scale[row];
+                data[row * cols..(row + 1) * cols].iter().map(|&v| v as f32 * s).collect()
+            }
+            QTKind::I4 { data, scale } => {
+                let s = scale[row];
+                let rb = cols.div_ceil(2);
+                let wr = &data[row * rb..(row + 1) * rb];
+                (0..cols)
+                    .map(|k| {
+                        let byte = wr[k >> 1];
+                        let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                        (nibble as i32 - 8) as f32 * s
+                    })
+                    .collect()
+            }
+            QTKind::I2 { data, scale } => {
+                let s = scale[row];
+                let rb = cols.div_ceil(4);
+                let wr = &data[row * rb..(row + 1) * rb];
+                (0..cols)
+                    .map(|k| {
+                        let byte = wr[k >> 2];
+                        let bits = (byte >> ((k & 3) * 2)) & 3;
+                        (bits as i32 - 2) as f32 * s
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 /// f32[rows,cols] -> int8[rows,cols] + per-row scale, symmetric quantization.

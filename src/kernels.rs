@@ -183,6 +183,98 @@ fn quantize_activations(x: &[f32], s: usize, cols: usize) -> (Vec<i8>, Vec<f32>)
     (xq, sx)
 }
 
+/// `acc[0..I) += coef * W[row,:]` — dequantizes one row of `w` on the fly and scales it by
+/// `coef` before accumulating. This is the "weight absorption" building block: MLA's decode
+/// path folds `q_nope · k_nope_t = q_nope · (W_K L_t) = (W_K^T q_nope) · L_t`, so instead of
+/// reconstructing `k_nope_t` per cached token it accumulates `W_K^T q_nope` once (a sum of
+/// `qk_nope` scaled rows) and dot-products that against the raw latents directly.
+pub fn qt_addrow(w: &QT, row: usize, coef: f32, acc: &mut [f32]) {
+    let i = w.cols;
+    match &w.kind {
+        QTKind::F32(data) => {
+            let wr = &data[row * i..(row + 1) * i];
+            for (a, &wv) in acc.iter_mut().zip(wr) {
+                *a += coef * wv;
+            }
+        }
+        QTKind::I8 { data, scale } => {
+            let c = coef * scale[row];
+            let wr = &data[row * i..(row + 1) * i];
+            for (a, &wv) in acc.iter_mut().zip(wr) {
+                *a += c * wv as f32;
+            }
+        }
+        QTKind::I4 { data, scale } => {
+            let c = coef * scale[row];
+            let rb = i.div_ceil(2);
+            let wr = &data[row * rb..(row + 1) * rb];
+            for k in 0..i {
+                let byte = wr[k >> 1];
+                let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                acc[k] += c * (nibble as i32 - 8) as f32;
+            }
+        }
+        QTKind::I2 { data, scale } => {
+            let c = coef * scale[row];
+            let rb = i.div_ceil(4);
+            let wr = &data[row * rb..(row + 1) * rb];
+            for k in 0..i {
+                let byte = wr[k >> 2];
+                let bits = (byte >> ((k & 3) * 2)) & 3;
+                acc[k] += c * (bits as i32 - 2) as f32;
+            }
+        }
+    }
+}
+
+/// `y[j] = W[r0+j,:] · x` for `j` in `0..n` — a matvec over a row slice of `w`, dequantizing
+/// on the fly. Used by the absorbed decode path to apply `W_V` to the attention-weighted
+/// latent sum without ever materializing the full dense `V` matrix.
+///
+/// Accumulates in `f64` (matching `qt_matvec_rows` in `glm.c`) even though every other kernel
+/// here uses `f32` — this is the original's own choice, not a rabbit addition, so it's kept
+/// for token-exact parity rather than "corrected" to match the rest of the file.
+pub fn qt_matvec_rows(w: &QT, r0: usize, n: usize, x: &[f32], y: &mut [f32]) {
+    let i = w.cols;
+    for (j, yj) in y.iter_mut().enumerate().take(n) {
+        let row = r0 + j;
+        let a: f64 = match &w.kind {
+            QTKind::F32(data) => {
+                let wr = &data[row * i..(row + 1) * i];
+                wr.iter().zip(x).map(|(&wv, &xv)| wv as f64 * xv as f64).sum()
+            }
+            QTKind::I8 { data, scale } => {
+                let wr = &data[row * i..(row + 1) * i];
+                let acc: f32 = wr.iter().zip(x).map(|(&wv, &xv)| wv as f32 * xv).sum();
+                acc as f64 * scale[row] as f64
+            }
+            QTKind::I4 { data, scale } => {
+                let rb = i.div_ceil(2);
+                let wr = &data[row * rb..(row + 1) * rb];
+                let mut acc = 0f32;
+                for k in 0..i {
+                    let byte = wr[k >> 1];
+                    let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                    acc += (nibble as i32 - 8) as f32 * x[k];
+                }
+                acc as f64 * scale[row] as f64
+            }
+            QTKind::I2 { data, scale } => {
+                let rb = i.div_ceil(4);
+                let wr = &data[row * rb..(row + 1) * rb];
+                let mut acc = 0f32;
+                for k in 0..i {
+                    let byte = wr[k >> 2];
+                    let bits = (byte >> ((k & 3) * 2)) & 3;
+                    acc += (bits as i32 - 2) as f32 * x[k];
+                }
+                acc as f64 * scale[row] as f64
+            }
+        };
+        *yj = a as f32;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
