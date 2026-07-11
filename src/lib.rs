@@ -2,8 +2,10 @@
 
 pub mod attention;
 pub mod config;
+pub mod expert_cache;
 pub mod kernels;
 pub mod model;
+pub mod moe;
 pub mod quant;
 pub mod safetensors;
 pub mod tokenizer;
