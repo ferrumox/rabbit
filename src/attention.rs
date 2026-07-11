@@ -296,7 +296,15 @@ pub fn attention(
     let qk_rope = cfg.qk_rope as usize;
     let kv_lora = cfg.kv_lora as usize;
     let q_lora = cfg.q_lora as usize;
-    let kv_start = kv.len();
+    // `st0`/`m->kv_start[layer]` in the C: always 0 here. It's only ever mutated for the MTP
+    // KV row (`mtp_draft`/`mtp_absorb`, out of scope — MTP restarts its own decode-only
+    // window there), so for every layer this port actually runs, the causal window always
+    // starts at position 0. Earlier this derived `kv_start` from `kv.len()` instead (treating
+    // it as "how many positions this call is continuing from"), which made a decode step
+    // attend only to itself instead of the full history — caught by
+    // `greedy_generation_from_prompt_reproduces_the_oracle_continuation` diverging right
+    // after the first token.
+    let kv_start = 0;
 
     let mut ctx = vec![0f32; s * h * vh];
     let mut q = vec![0f32; s * h * qh];
