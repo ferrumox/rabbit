@@ -76,6 +76,10 @@ pub struct Model {
     /// layer has its weights on disk, matching `model_init`'s all-or-nothing auto-detection
     /// (a partially `--indexer`-converted model must not silently mix sparse/dense layers).
     pub has_dsa: bool,
+    /// quantization bits for routed experts, loaded on demand by `expert_cache.rs` — stored
+    /// here (like `m->ebits` in the C) so it travels with the model instead of needing to be
+    /// threaded through every call site that might load an expert.
+    pub ebits: u8,
 }
 
 #[derive(Debug)]
@@ -115,7 +119,9 @@ fn ld(shards: &Shards, name: &str) -> Result<Vec<f32>, ModelError> {
     Ok(shards.read_f32(name, false)?)
 }
 
-fn qt_load(shards: &Shards, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
+/// `pub(crate)`: `expert_cache.rs` reuses this to load a routed expert's gate/up/down tensors
+/// the same way every other dense-resident tensor is loaded (see the module doc's scope cut).
+pub(crate) fn qt_load(shards: &Shards, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
     let w = shards.read_f32(name, false)?;
     if w.len() != rows * cols {
         return Err(ModelError::ShapeMismatch { name: name.to_string(), expected: rows * cols, got: w.len() });
@@ -144,7 +150,7 @@ fn detect_has_dsa(cfg: &Cfg, shards: &Shards) -> bool {
 }
 
 impl Model {
-    pub fn load(snap_dir: &Path, dbits: u8) -> Result<Model, ModelError> {
+    pub fn load(snap_dir: &Path, dbits: u8, ebits: u8) -> Result<Model, ModelError> {
         let cfg = Cfg::load(snap_dir)?;
         let shards = Shards::open(snap_dir)?;
         let d = cfg.hidden as usize;
@@ -217,7 +223,7 @@ impl Model {
             layers.push(Layer { in_ln, post_ln, attn, dsa, ffn });
         }
 
-        Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa })
+        Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa, ebits })
     }
 
     /// Dequantizes token `tok`'s embedding row into `x[hidden]`.
@@ -386,7 +392,7 @@ mod tests {
     #[test]
     fn loads_dense_and_moe_layers_with_correct_shapes() {
         let fixture = TinyFixture::new("shapes").build(true);
-        let m = Model::load(&fixture.0, 32).unwrap();
+        let m = Model::load(&fixture.0, 32, 32).unwrap();
 
         assert_eq!(m.layers.len(), 2);
         assert!(matches!(m.layers[0].ffn, Ffn::Dense(_)));
@@ -409,13 +415,13 @@ mod tests {
     #[test]
     fn detects_dsa_only_when_all_full_layers_have_indexer_weights() {
         let fixture_with = TinyFixture::new("dsa_with").build(true);
-        let m_with = Model::load(&fixture_with.0, 32).unwrap();
+        let m_with = Model::load(&fixture_with.0, 32, 32).unwrap();
         assert!(m_with.has_dsa);
         assert!(m_with.layers[0].dsa.is_none()); // layer 0 is "shared" type
         assert!(m_with.layers[1].dsa.is_some()); // layer 1 is "full" type
 
         let fixture_without = TinyFixture::new("dsa_without").build(false);
-        let m_without = Model::load(&fixture_without.0, 32).unwrap();
+        let m_without = Model::load(&fixture_without.0, 32, 32).unwrap();
         assert!(!m_without.has_dsa);
         assert!(m_without.layers[1].dsa.is_none());
     }
@@ -423,7 +429,7 @@ mod tests {
     #[test]
     fn embed_row_dequantizes_the_right_row_at_full_precision() {
         let fixture = TinyFixture::new("embed_row").build(true);
-        let m = Model::load(&fixture.0, 32).unwrap(); // dbits=32 -> F32, exact passthrough
+        let m = Model::load(&fixture.0, 32, 32).unwrap(); // dbits=32 -> F32, exact passthrough
 
         let embed_tensor = &m.tensors_for_test_only_embed();
         let row2 = m.embed_row(2);
@@ -444,7 +450,7 @@ mod tests {
     #[test]
     fn quantized_dbits_still_loads_and_shapes_match() {
         let fixture = TinyFixture::new("quantized_dbits").build(true);
-        let m = Model::load(&fixture.0, 8).unwrap(); // int8 dense weights
+        let m = Model::load(&fixture.0, 8, 8).unwrap(); // int8 dense weights
         assert!(matches!(m.layers[0].attn.q_a.kind, crate::quant::QTKind::I8 { .. }));
         // io_bits = dbits>=8 ? 16 : dbits -> embed/lm_head stay F32 even at dbits=8.
         assert!(matches!(m.embed.kind, crate::quant::QTKind::F32(_)));
