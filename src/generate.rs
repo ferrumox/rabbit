@@ -1,0 +1,696 @@
+//! Port of `layer_forward`/`layers_forward`/`kv_alloc`/`step`/`step_all` + sampling
+//! (`argmax_v`/`dist_build`/`dist_sample`/`pick_tok`) — the autoregressive generation loop.
+//!
+//! `kv_alloc`'s fixed-capacity preallocation (`max_t`) isn't ported: `KvCache`/`DsaCache`
+//! (from `attention.rs`) already grow on demand via `Vec`, so there's nothing to preallocate
+//! — `KvState::new` just creates the empty per-layer caches.
+//!
+//! Out of scope for this whole port stage (per `rabbit-plan.md`'s "Fuera de alcance"): MTP /
+//! speculative decoding (`mtp_*`, `ngram_draft`, `spec_decode`'s draft machinery) and the
+//! `PILOT`/`SPEC`/`LOOKA` prefetch-and-research instrumentation. What's left of `spec_decode`
+//! once you delete all of that is exactly a plain greedy/sampling loop — that's `generate()`
+//! here.
+
+use crate::attention::{self, Absorb, Dsa, DsaCache, KvCache, Selection};
+use crate::config::Cfg;
+use crate::expert_cache::ExpertCache;
+use crate::kernels::matmul_qt;
+use crate::model::{Ffn, Model, ModelError};
+use crate::moe;
+use crate::safetensors::Shards;
+
+/// Per-layer KV state for one generation session: compressed MLA latents (`KvCache`) for
+/// every layer, plus the DSA indexer's key cache (`DsaCache`) for layers that have one.
+pub struct KvState {
+    layers: Vec<KvCache>,
+    dsa: Vec<Option<DsaCache>>,
+}
+
+impl KvState {
+    pub fn new(model: &Model) -> KvState {
+        let kv_lora = model.cfg.kv_lora as usize;
+        let qk_rope = model.cfg.qk_rope as usize;
+        let index_hd = model.cfg.index_hd as usize;
+        let layers = model.layers.iter().map(|_| KvCache::new(kv_lora, qk_rope)).collect();
+        let dsa = model.layers.iter().map(|l| l.dsa.as_ref().map(|_| DsaCache::new(index_hd))).collect();
+        KvState { layers, dsa }
+    }
+}
+
+/// One `ExpertCache` per MoE layer (`None` for dense layers) — owned by the caller so it
+/// persists (and keeps warming up) across multiple `generate`/`step` calls.
+pub struct ExpertCaches(Vec<Option<ExpertCache>>);
+
+impl ExpertCaches {
+    pub fn new(model: &Model, capacity: usize) -> ExpertCaches {
+        let v = model
+            .layers
+            .iter()
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::new(capacity)) } else { None })
+            .collect();
+        ExpertCaches(v)
+    }
+}
+
+fn embed_tokens(model: &Model, ids: &[usize]) -> Vec<f32> {
+    let d = model.cfg.hidden as usize;
+    let mut x = vec![0f32; ids.len() * d];
+    for (si, &tok) in ids.iter().enumerate() {
+        x[si * d..(si + 1) * d].copy_from_slice(&model.embed_row(tok));
+    }
+    x
+}
+
+/// One transformer layer: `x += attention(rmsnorm(x, in_ln))`, then `x += ffn(rmsnorm(x,
+/// post_ln))` — dense MLP or MoE depending on `layer.ffn`. `dsa` selects this layer's DSA
+/// behavior (already resolved by `layers_forward`, which owns the full-vs-shared threading).
+#[allow(clippy::too_many_arguments)]
+fn layer_forward(
+    cfg: &Cfg,
+    model: &Model,
+    li: usize,
+    shards: &Shards,
+    caches: &mut ExpertCaches,
+    x: &mut [f32],
+    s: usize,
+    pos_base: usize,
+    kv_layer: &mut KvCache,
+    dsa: Dsa<'_>,
+) -> Result<Option<Selection>, ModelError> {
+    let d = cfg.hidden as usize;
+    let layer = &model.layers[li];
+
+    let mut nrm = vec![0f32; s * d];
+    let mut tmp = vec![0f32; s * d];
+
+    for si in 0..s {
+        nrm[si * d..(si + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
+        attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.in_ln, cfg.eps);
+    }
+    let fresh_selection = attention::attention(cfg, &layer.attn, kv_layer, &nrm, s, pos_base, dsa, Absorb::Auto, &mut tmp);
+    for (xi, &ti) in x.iter_mut().zip(&tmp) {
+        *xi += ti;
+    }
+
+    for si in 0..s {
+        nrm[si * d..(si + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
+        attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.post_ln, cfg.eps);
+    }
+    match &layer.ffn {
+        Ffn::Dense(w) => moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, &mut tmp),
+        Ffn::Moe(w) => {
+            let cache = caches.0[li].as_mut().expect("MoE layer must have an ExpertCache");
+            moe::moe(cfg, w, cache, shards, li, model.ebits, &nrm, s, &mut tmp)?;
+        }
+    }
+    for (xi, &ti) in x.iter_mut().zip(&tmp) {
+        *xi += ti;
+    }
+
+    Ok(fresh_selection)
+}
+
+/// Runs every layer in order on new tokens `x[S,hidden]` at absolute position `pos_base`,
+/// updating `x` in place with each layer's residual output.
+///
+/// DSA selection (see `attention.rs`'s module doc) is only computed on the very first call
+/// for this KV state (`pos_base==0`, matching the C's per-layer `kv_start[layer]==0` gate,
+/// which — since every layer is always advanced in lockstep by the same `S` new positions —
+/// reduces to a single model-wide condition): a "full" indexer layer computes a fresh
+/// `Selection`; a "shared" layer reuses whichever `Selection` the most recent "full" layer
+/// produced. Decode calls (`pos_base>0`) always get dense (unrestricted) attention.
+pub fn layers_forward(model: &Model, shards: &Shards, caches: &mut ExpertCaches, x: &mut [f32], s: usize, pos_base: usize, kv: &mut KvState) -> Result<(), ModelError> {
+    let cfg = &model.cfg;
+    let is_first_call = pos_base == 0;
+    let mut last_selection: Option<Selection> = None;
+
+    for li in 0..model.layers.len() {
+        let dsa_mode = if model.has_dsa && is_first_call {
+            if let Some(dsa_w) = &model.layers[li].dsa {
+                match kv.dsa[li].as_mut() {
+                    Some(cache) => Dsa::Compute { weights: dsa_w, cache, force: false },
+                    None => Dsa::Off,
+                }
+            } else if let Some(sel) = &last_selection {
+                Dsa::Reuse(sel)
+            } else {
+                Dsa::Off
+            }
+        } else {
+            Dsa::Off
+        };
+
+        let fresh = layer_forward(cfg, model, li, shards, caches, x, s, pos_base, &mut kv.layers[li], dsa_mode)?;
+        if let Some(sel) = fresh {
+            last_selection = Some(sel);
+        }
+    }
+    Ok(())
+}
+
+/// Decode/prefill step returning logits for only the LAST new position — the common case
+/// (one new token per generation step; a prefix prefill only needs the tail logits to pick
+/// the next token).
+pub fn step(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &mut KvState, ids: &[usize], pos_base: usize) -> Result<Vec<f32>, ModelError> {
+    let s = ids.len();
+    let d = model.cfg.hidden as usize;
+    let mut x = embed_tokens(model, ids);
+    layers_forward(model, shards, caches, &mut x, s, pos_base, kv)?;
+
+    let mut last = x[(s - 1) * d..s * d].to_vec();
+    attention::rmsnorm(&mut last, &model.final_norm, model.cfg.eps);
+    let mut logit = vec![0f32; model.cfg.vocab as usize];
+    matmul_qt(&mut logit, &last, &model.lm_head, 1);
+    Ok(logit)
+}
+
+/// Like `step`, but returns logits for EVERY new position `[S,vocab]` — teacher-forcing
+/// validation and (were MTP in scope) draft verification both need the whole range.
+pub fn step_all(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &mut KvState, ids: &[usize], pos_base: usize) -> Result<Vec<f32>, ModelError> {
+    let s = ids.len();
+    let d = model.cfg.hidden as usize;
+    let v = model.cfg.vocab as usize;
+    let mut x = embed_tokens(model, ids);
+    layers_forward(model, shards, caches, &mut x, s, pos_base, kv)?;
+
+    let mut lo = vec![0f32; s * v];
+    for si in 0..s {
+        let mut row = x[si * d..(si + 1) * d].to_vec();
+        attention::rmsnorm(&mut row, &model.final_norm, model.cfg.eps);
+        matmul_qt(&mut lo[si * v..(si + 1) * v], &row, &model.lm_head, 1);
+    }
+    Ok(lo)
+}
+
+pub fn argmax(logits: &[f32]) -> usize {
+    let mut best = 0;
+    let mut bv = logits[0];
+    for (i, &v) in logits.iter().enumerate().skip(1) {
+        if v > bv {
+            bv = v;
+            best = i;
+        }
+    }
+    best
+}
+
+/// `temperature<=0` means greedy (`argmax`); otherwise softmax(logits/temperature) truncated
+/// to the top `nucleus` cumulative probability mass (`nucleus<=0` or `>=1` disables nucleus).
+pub struct SamplingConfig {
+    pub temperature: f32,
+    pub nucleus: f32,
+}
+
+impl SamplingConfig {
+    pub fn greedy() -> SamplingConfig {
+        SamplingConfig { temperature: 0.0, nucleus: 0.0 }
+    }
+}
+
+/// xorshift64 PRNG — same constants and update as `g_rng`/`rndu` in the C, so sampling draws
+/// reproduce bit-for-bit given the same seed.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Rng {
+        Rng(seed)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 * (1.0 / 9007199254740992.0)
+    }
+}
+
+impl Default for Rng {
+    fn default() -> Rng {
+        Rng(0x9E3779B97F4A7C15)
+    }
+}
+
+/// Builds `softmax(logits/temperature)`, truncated to nucleus top-p and renormalized.
+pub fn build_distribution(logits: &[f32], sampling: &SamplingConfig) -> Vec<f32> {
+    let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let invt = 1.0 / sampling.temperature.max(1e-4);
+    let mut p: Vec<f32> = logits.iter().map(|&l| ((l - mx) * invt).exp()).collect();
+    let sum: f32 = p.iter().sum();
+    for v in p.iter_mut() {
+        *v /= sum;
+    }
+
+    if sampling.nucleus > 0.0 && sampling.nucleus < 1.0 {
+        let mut order: Vec<usize> = (0..p.len()).collect();
+        order.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap());
+        let mut cum = 0f64;
+        let mut keep = p.len();
+        for (i, &ix) in order.iter().enumerate() {
+            cum += p[ix] as f64;
+            if cum >= sampling.nucleus as f64 {
+                keep = i + 1;
+                break;
+            }
+        }
+        for &ix in &order[keep..] {
+            p[ix] = 0.0;
+        }
+        let s2: f32 = order[..keep].iter().map(|&ix| p[ix]).sum();
+        for &ix in &order[..keep] {
+            p[ix] /= s2;
+        }
+    }
+    p
+}
+
+/// Samples from a distribution built by `build_distribution`. `ban` (if given) is excluded
+/// and the remaining mass renormalized on the fly — used by speculative-decoding rejection
+/// sampling in the original; unused by `generate()` here since MTP is out of scope, but kept
+/// as a parameter since it's intrinsic to `dist_sample`'s own contract, not an MTP add-on.
+pub fn sample(dist: &[f32], rng: &mut Rng, ban: Option<usize>) -> usize {
+    let banned_mass = ban.map(|b| dist[b] as f64).unwrap_or(0.0);
+    let z = (1.0 - banned_mass).max(1e-12);
+    let u = rng.next_f64() * z;
+    let mut cum = 0f64;
+    for (i, &p) in dist.iter().enumerate() {
+        if Some(i) == ban {
+            continue;
+        }
+        cum += p as f64;
+        if cum >= u {
+            return i;
+        }
+    }
+    for i in (0..dist.len()).rev() {
+        if Some(i) != ban && dist[i] > 0.0 {
+            return i;
+        }
+    }
+    0
+}
+
+pub fn pick_token(logits: &[f32], sampling: &SamplingConfig, rng: &mut Rng, ban: Option<usize>) -> usize {
+    if sampling.temperature <= 0.0 {
+        argmax(logits)
+    } else {
+        let dist = build_distribution(logits, sampling);
+        sample(&dist, rng, ban)
+    }
+}
+
+/// Greedy/sampling autoregressive generation: forwards `prompt`, then repeatedly picks and
+/// forwards one token at a time. Returns only the newly generated tokens (not the prompt).
+#[allow(clippy::too_many_arguments)]
+pub fn generate(
+    model: &Model,
+    shards: &Shards,
+    caches: &mut ExpertCaches,
+    kv: &mut KvState,
+    prompt: &[usize],
+    n_new: usize,
+    sampling: &SamplingConfig,
+    rng: &mut Rng,
+    stop_ids: &[usize],
+) -> Result<Vec<usize>, ModelError> {
+    let mut out = Vec::with_capacity(n_new);
+    let mut logits = step(model, shards, caches, kv, prompt, 0)?;
+    let mut pos = prompt.len();
+
+    while out.len() < n_new {
+        let next = pick_token(&logits, sampling, rng, None);
+        if stop_ids.contains(&next) {
+            break;
+        }
+        out.push(next);
+        if out.len() >= n_new {
+            break;
+        }
+        logits = step(model, shards, caches, kv, &[next], pos)?;
+        pos += 1;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn xorshift(seed: &mut u32) -> f32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        ((*seed as f32 / u32::MAX as f32) - 0.5) * 2.0
+    }
+
+    fn random_vec(n: usize, seed: &mut u32) -> Vec<f32> {
+        (0..n).map(|_| xorshift(seed)).collect()
+    }
+
+    fn f32_bytes(vals: &[f32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    // ---- sampling primitives: no model needed ----
+
+    #[test]
+    fn argmax_finds_the_maximum() {
+        assert_eq!(argmax(&[1.0, 5.0, 3.0, -2.0]), 1);
+        assert_eq!(argmax(&[9.0]), 0);
+    }
+
+    #[test]
+    fn pick_token_is_greedy_argmax_at_zero_temperature() {
+        let logits = vec![0.1, 0.9, -0.3, 0.5];
+        let sampling = SamplingConfig::greedy();
+        let mut rng = Rng::new(12345);
+        for _ in 0..5 {
+            // greedy never touches the RNG, so repeated calls must all agree with argmax.
+            assert_eq!(pick_token(&logits, &sampling, &mut rng, None), argmax(&logits));
+        }
+    }
+
+    #[test]
+    fn build_distribution_sums_to_one_and_favors_larger_logits() {
+        let logits = vec![1.0, 2.0, 3.0];
+        let sampling = SamplingConfig { temperature: 1.0, nucleus: 0.0 };
+        let p = build_distribution(&logits, &sampling);
+        let sum: f32 = p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(p[0] < p[1] && p[1] < p[2]);
+    }
+
+    #[test]
+    fn build_distribution_nucleus_zeroes_out_the_low_probability_tail() {
+        // one dominant logit -> top-p=0.5 should keep only that one token.
+        let logits = vec![10.0, 0.0, 0.0, 0.0];
+        let sampling = SamplingConfig { temperature: 1.0, nucleus: 0.5 };
+        let p = build_distribution(&logits, &sampling);
+        assert!((p[0] - 1.0).abs() < 1e-4);
+        assert_eq!(p[1], 0.0);
+        assert_eq!(p[2], 0.0);
+        assert_eq!(p[3], 0.0);
+    }
+
+    #[test]
+    fn sample_excludes_the_banned_token() {
+        let dist = vec![0.5, 0.5];
+        let mut rng = Rng::new(1);
+        for _ in 0..20 {
+            assert_eq!(sample(&dist, &mut rng, Some(0)), 1);
+        }
+    }
+
+    #[test]
+    fn rng_is_deterministic_from_seed_and_stays_in_unit_range() {
+        let mut a = Rng::new(42);
+        let mut b = Rng::new(42);
+        for _ in 0..10 {
+            let (va, vb) = (a.next_f64(), b.next_f64());
+            assert_eq!(va, vb);
+            assert!((0.0..1.0).contains(&va));
+        }
+        let mut c = Rng::new(43);
+        assert_ne!(a.next_f64(), c.next_f64());
+    }
+
+    // ---- full-model fixture: 3 layers (dense, MoE+DSA-full, MoE+DSA-shared) ----
+
+    struct Dims {
+        hidden: usize,
+        heads: usize,
+        qk_nope: usize,
+        qk_rope: usize,
+        v_head: usize,
+        q_lora: usize,
+        kv_lora: usize,
+        vocab: usize,
+        dense_inter: usize,
+        n_experts: usize,
+        topk: usize,
+        moe_inter: usize,
+        n_shared: usize,
+        index_nh: usize,
+        index_hd: usize,
+        index_topk: usize,
+    }
+
+    fn dims() -> Dims {
+        Dims {
+            hidden: 6,
+            heads: 2,
+            qk_nope: 2,
+            qk_rope: 2,
+            v_head: 3,
+            q_lora: 4,
+            kv_lora: 4,
+            vocab: 10,
+            dense_inter: 5,
+            n_experts: 3,
+            topk: 2,
+            moe_inter: 4,
+            n_shared: 1,
+            index_nh: 2,
+            index_hd: 2,
+            index_topk: 2, // small on purpose: with seq_len=4 the real selection path engages
+        }
+    }
+
+    /// 3 layers: layer 0 dense, layers 1-2 MoE; DSA indexer weights only on layer 1 ("full"),
+    /// layer 2 is "shared" and must reuse layer 1's selection. All F32 (dbits=ebits=32) so
+    /// comparisons below can use a tight tolerance without quantization noise.
+    fn build_three_layer_fixture(name: &str) -> (TempDir, Dims) {
+        let dm = dims();
+        let dir = TempDir::new(name);
+        let mut seed = 5u32;
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+
+        let mut add = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, rows: usize, cols: usize| {
+            let n = if cols == 0 { rows } else { rows * cols };
+            let vals = random_vec(n, &mut seed);
+            let shape = if cols == 0 { vec![rows] } else { vec![rows, cols] };
+            let bytes = f32_bytes(&vals);
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": "F32", "shape": shape, "data_offsets": [start, end]}));
+        };
+
+        let qh = dm.qk_nope + dm.qk_rope;
+        add(&mut header, "model.embed_tokens.weight".into(), dm.vocab, dm.hidden);
+        add(&mut header, "lm_head.weight".into(), dm.vocab, dm.hidden);
+        add(&mut header, "model.norm.weight".into(), dm.hidden, 0);
+
+        for i in 0..3usize {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            add(&mut header, p("input_layernorm.weight"), dm.hidden, 0);
+            add(&mut header, p("post_attention_layernorm.weight"), dm.hidden, 0);
+            add(&mut header, p("self_attn.q_a_proj.weight"), dm.q_lora, dm.hidden);
+            add(&mut header, p("self_attn.q_a_layernorm.weight"), dm.q_lora, 0);
+            add(&mut header, p("self_attn.q_b_proj.weight"), dm.heads * qh, dm.q_lora);
+            add(&mut header, p("self_attn.kv_a_proj_with_mqa.weight"), dm.kv_lora + dm.qk_rope, dm.hidden);
+            add(&mut header, p("self_attn.kv_a_layernorm.weight"), dm.kv_lora, 0);
+            add(&mut header, p("self_attn.kv_b_proj.weight"), dm.heads * (dm.qk_nope + dm.v_head), dm.kv_lora);
+            add(&mut header, p("self_attn.o_proj.weight"), dm.hidden, dm.heads * dm.v_head);
+
+            if i == 0 {
+                add(&mut header, p("mlp.gate_proj.weight"), dm.dense_inter, dm.hidden);
+                add(&mut header, p("mlp.up_proj.weight"), dm.dense_inter, dm.hidden);
+                add(&mut header, p("mlp.down_proj.weight"), dm.hidden, dm.dense_inter);
+            } else {
+                add(&mut header, p("mlp.gate.weight"), dm.n_experts, dm.hidden);
+                add(&mut header, p("mlp.gate.e_score_correction_bias"), dm.n_experts, 0);
+                let s_i = dm.moe_inter * dm.n_shared;
+                add(&mut header, p("mlp.shared_experts.gate_proj.weight"), s_i, dm.hidden);
+                add(&mut header, p("mlp.shared_experts.up_proj.weight"), s_i, dm.hidden);
+                add(&mut header, p("mlp.shared_experts.down_proj.weight"), dm.hidden, s_i);
+                for eid in 0..dm.n_experts {
+                    add(&mut header, format!("model.layers.{i}.mlp.experts.{eid}.gate_proj.weight"), dm.moe_inter, dm.hidden);
+                    add(&mut header, format!("model.layers.{i}.mlp.experts.{eid}.up_proj.weight"), dm.moe_inter, dm.hidden);
+                    add(&mut header, format!("model.layers.{i}.mlp.experts.{eid}.down_proj.weight"), dm.hidden, dm.moe_inter);
+                }
+                if i == 1 {
+                    // "full" indexer layer: only this one gets indexer weights.
+                    let ip = |s: &str| format!("model.layers.{i}.self_attn.indexer.{s}");
+                    add(&mut header, ip("wq_b.weight"), dm.index_nh * dm.index_hd, dm.q_lora);
+                    add(&mut header, ip("wk.weight"), dm.index_hd, dm.hidden);
+                    add(&mut header, ip("weights_proj.weight"), dm.index_nh, dm.hidden);
+                    add(&mut header, ip("k_norm.weight"), dm.index_hd, 0);
+                    add(&mut header, ip("k_norm.bias"), dm.index_hd, 0);
+                }
+            }
+        }
+
+        let cfg_json = json!({
+            "hidden_size": dm.hidden, "num_hidden_layers": 3, "num_attention_heads": dm.heads,
+            "n_routed_experts": dm.n_experts, "num_experts_per_tok": dm.topk,
+            "moe_intermediate_size": dm.moe_inter, "intermediate_size": dm.dense_inter,
+            "first_k_dense_replace": 1, "q_lora_rank": dm.q_lora, "kv_lora_rank": dm.kv_lora,
+            "qk_nope_head_dim": dm.qk_nope, "qk_rope_head_dim": dm.qk_rope, "v_head_dim": dm.v_head,
+            "n_shared_experts": dm.n_shared, "vocab_size": dm.vocab, "n_group": 1, "topk_group": 1,
+            "index_topk": dm.index_topk, "index_n_heads": dm.index_nh, "index_head_dim": dm.index_hd,
+            "indexer_types": ["shared", "full", "shared"],
+        });
+        fs::write(dir.0.join("config.json"), cfg_json.to_string()).unwrap();
+
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+
+        (dir, dm)
+    }
+
+    #[test]
+    fn layers_forward_matches_manual_per_layer_composition_with_dsa_reuse() {
+        let (fixture, dm) = build_three_layer_fixture("rabbit_test_generate_layers");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        assert!(model.has_dsa, "fixture must have a complete DSA indexer for this test to mean anything");
+        assert!(model.layers[0].dsa.is_none());
+        assert!(model.layers[1].dsa.is_some());
+        assert!(model.layers[2].dsa.is_none(), "layer 2 is \"shared\" -> no indexer weights of its own");
+
+        let shards = Shards::open(&fixture.0).unwrap();
+        let s = 4; // > index_topk=2, so DSA's real selection path (not the dense no-op) engages
+        let mut seed = 77u32;
+        let x0 = random_vec(s * dm.hidden, &mut seed);
+
+        // ---- run via layers_forward (the code under test) ----
+        let mut caches_a = ExpertCaches::new(&model, 8);
+        let mut kv_a = KvState::new(&model);
+        let mut x_lf = x0.clone();
+        layers_forward(&model, &shards, &mut caches_a, &mut x_lf, s, 0, &mut kv_a).unwrap();
+
+        // ---- independent manual reference: same primitives, wiring re-derived by hand ----
+        let mut caches_b = ExpertCaches::new(&model, 8);
+        let mut kv_b = KvState::new(&model);
+        let mut x_manual = x0.clone();
+        let d = dm.hidden;
+        let mut last_selection: Option<Selection> = None;
+        for (li, layer) in model.layers.iter().enumerate() {
+            let mut nrm = x_manual.clone();
+            for si in 0..s {
+                attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.in_ln, model.cfg.eps);
+            }
+            let dsa_mode = if let Some(dsa_w) = &layer.dsa {
+                Dsa::Compute { weights: dsa_w, cache: kv_b.dsa[li].as_mut().unwrap(), force: false }
+            } else if let Some(sel) = &last_selection {
+                Dsa::Reuse(sel)
+            } else {
+                Dsa::Off
+            };
+            let mut attn_out = vec![0f32; s * d];
+            let fresh = attention::attention(&model.cfg, &layer.attn, &mut kv_b.layers[li], &nrm, s, 0, dsa_mode, Absorb::Auto, &mut attn_out);
+            if let Some(sel) = fresh {
+                last_selection = Some(sel);
+            }
+            for (xi, &ai) in x_manual.iter_mut().zip(&attn_out) {
+                *xi += ai;
+            }
+
+            let mut nrm2 = x_manual.clone();
+            for si in 0..s {
+                attention::rmsnorm(&mut nrm2[si * d..(si + 1) * d], &layer.post_ln, model.cfg.eps);
+            }
+            let mut ffn_out = vec![0f32; s * d];
+            match &layer.ffn {
+                Ffn::Dense(w) => moe::dense_mlp(w, &nrm2, s, dm.dense_inter, &mut ffn_out),
+                Ffn::Moe(w) => {
+                    let cache = caches_b.0[li].as_mut().unwrap();
+                    moe::moe(&model.cfg, w, cache, &shards, li, model.ebits, &nrm2, s, &mut ffn_out).unwrap();
+                }
+            }
+            for (xi, &fi) in x_manual.iter_mut().zip(&ffn_out) {
+                *xi += fi;
+            }
+        }
+
+        for (a, b) in x_lf.iter().zip(&x_manual) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn step_and_step_all_agree_on_the_last_position() {
+        let (fixture, dm) = build_three_layer_fixture("rabbit_test_generate_step_consistency");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let ids = vec![1usize, 2, 3];
+
+        let mut caches_a = ExpertCaches::new(&model, 8);
+        let mut kv_a = KvState::new(&model);
+        let last_only = step(&model, &shards, &mut caches_a, &mut kv_a, &ids, 0).unwrap();
+
+        let mut caches_b = ExpertCaches::new(&model, 8);
+        let mut kv_b = KvState::new(&model);
+        let all = step_all(&model, &shards, &mut caches_b, &mut kv_b, &ids, 0).unwrap();
+        let v = dm.vocab;
+        let last_row = &all[(ids.len() - 1) * v..ids.len() * v];
+
+        assert_eq!(last_only, last_row);
+    }
+
+    #[test]
+    fn generate_is_deterministic_under_greedy_sampling() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_generate_greedy_det");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let prompt = vec![1usize, 2];
+        let sampling = SamplingConfig::greedy();
+
+        let mut caches1 = ExpertCaches::new(&model, 8);
+        let mut kv1 = KvState::new(&model);
+        let mut rng1 = Rng::new(1);
+        let out1 = generate(&model, &shards, &mut caches1, &mut kv1, &prompt, 5, &sampling, &mut rng1, &[]).unwrap();
+
+        let mut caches2 = ExpertCaches::new(&model, 8);
+        let mut kv2 = KvState::new(&model);
+        let mut rng2 = Rng::new(999); // greedy never touches the RNG -> seed must not matter
+        let out2 = generate(&model, &shards, &mut caches2, &mut kv2, &prompt, 5, &sampling, &mut rng2, &[]).unwrap();
+
+        assert_eq!(out1.len(), 5);
+        assert_eq!(out1, out2);
+    }
+
+    #[test]
+    fn generate_stops_at_a_stop_id_without_emitting_it() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_generate_stop");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let prompt = vec![1usize, 2];
+        let sampling = SamplingConfig::greedy();
+
+        let mut caches = ExpertCaches::new(&model, 8);
+        let mut kv = KvState::new(&model);
+        let mut rng = Rng::new(1);
+        let unrestricted = generate(&model, &shards, &mut caches, &mut kv, &prompt, 5, &sampling, &mut rng, &[]).unwrap();
+        assert!(!unrestricted.is_empty(), "fixture should deterministically emit at least one token");
+        let stop_id = unrestricted[0];
+
+        let mut caches2 = ExpertCaches::new(&model, 8);
+        let mut kv2 = KvState::new(&model);
+        let mut rng2 = Rng::new(1);
+        let stopped = generate(&model, &shards, &mut caches2, &mut kv2, &prompt, 5, &sampling, &mut rng2, &[stop_id]).unwrap();
+
+        assert!(stopped.is_empty(), "must stop before emitting the banned first token");
+    }
+}

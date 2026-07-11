@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod config;
 pub mod expert_cache;
+pub mod generate;
 pub mod kernels;
 pub mod model;
 pub mod moe;
