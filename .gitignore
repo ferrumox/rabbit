@@ -1,4 +1,5 @@
 /target
+__pycache__/
 
 # fixtures generados localmente (oráculo tiny, tokenizer real) — se regeneran con
 # tests/oracle/make_glm_oracle.py y tools/fetch_tokenizer_fixture.py
