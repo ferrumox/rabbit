@@ -17,48 +17,110 @@
 //! ~0.3% added RMS error per matmul from the activation quantization.
 
 use crate::quant::{QT, QTKind};
+use rayon::prelude::*;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// y[S,O] = x[S,I] @ W^T, W[O,I] f32.
-pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], s: usize, i: usize, o: usize) {
+/// Every `matmul_*` below parallelizes over output rows (`oi`, 0..O) with rayon — same axis
+/// colibri's `#pragma omp parallel for` picks for its C matmul kernels, and the natural one:
+/// each `oi` reads the same `x`/activations but a disjoint row of the weight matrix, so there's
+/// no cross-row dependency. The catch is `y`'s own layout (`y[si*O+oi]`, row-major by sequence
+/// position): a fixed `oi` touches `S` elements strided by `O`, which safe Rust can't split into
+/// disjoint mutable chunks across threads. `yt`'s `[O,S]` layout (row-major by output index)
+/// makes each `oi`'s slice contiguous instead — exactly what `par_chunks_mut(s)` needs — at the
+/// cost of one sequential transpose back into `y` afterward. That transpose is O(S*O); the
+/// matmul itself is O(S*O*I), so for any realistic `I` (hidden/intermediate dims in the
+/// thousands) the transpose is noise.
+fn transpose_so(y: &mut [f32], yt: &[f32], s: usize, o: usize) {
     for oi in 0..o {
-        let wr = &w[oi * i..(oi + 1) * i];
         for si in 0..s {
-            let xs = &x[si * i..(si + 1) * i];
-            let a: f32 = xs.iter().zip(wr).map(|(a, b)| a * b).sum();
-            y[si * o + oi] = a;
+            y[si * o + oi] = yt[oi * s + si];
         }
     }
+}
+
+thread_local! {
+    /// The `yt` transpose buffer every `matmul_*` below needs, reused across calls instead of
+    /// freshly allocated each time — one of colibri's own tricks (`_Thread_local` scratch
+    /// buffers, `glm.c:458`) that a naive Rust port doesn't get for free just from adding
+    /// `rayon`. Thread-local, not a shared pool: every call into a `matmul_*` function happens
+    /// synchronously on the SAME calling thread (the generation loop never calls `matmul_qt`
+    /// reentrantly, and rayon's own worker threads — spawned transiently inside one call — never
+    /// call back into `matmul_qt` themselves), so a per-thread cell is enough to eliminate the
+    /// realloc without needing any actual pooling/locking machinery.
+    static YT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` against a `len`-element scratch buffer reused across calls on this thread — grows
+/// on first use (or whenever a bigger call comes along) and never shrinks, so steady-state
+/// generation (same shapes every layer/token) settles into zero further allocations after an
+/// initial warm-up. Callers get a raw `&mut [f32]`, not the `RefCell` itself, and always start
+/// from zero-filled — every existing caller already expected a fresh `vec![0f32; len]`.
+fn with_yt_scratch<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    YT_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0.0);
+        } else {
+            buf[..len].fill(0.0);
+        }
+        f(&mut buf[..len])
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    is_x86_feature_detected!("avx2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn has_avx2() -> bool {
+    false
+}
+
+/// y[S,O] = x[S,I] @ W^T, W[O,I] f32.
+pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], s: usize, i: usize, o: usize) {
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let wr = &w[oi * i..(oi + 1) * i];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xs = &x[si * i..(si + 1) * i];
+                *slot = xs.iter().zip(wr).map(|(a, b)| a * b).sum();
+            }
+        });
+        transpose_so(y, yt, s, o);
+    });
 }
 
 /// y[S,O] = x[S,I] @ W^T, W int8[O,I] per-row scale (dequant-on-use). Dispatches to
 /// AVX2/scalar; see the module doc for why there's no AVX-512 tier here.
 pub fn matmul_q(y: &mut [f32], x: &[f32], q: &[i8], scale: &[f32], s: usize, i: usize, o: usize) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if has_avx2() {
         return unsafe { matmul_q_avx2(y, x, q, scale, s, i, o) };
     }
     matmul_q_scalar(y, x, q, scale, s, i, o)
 }
 
 fn matmul_q_scalar(y: &mut [f32], x: &[f32], q: &[i8], scale: &[f32], s: usize, i: usize, o: usize) {
-    for oi in 0..o {
-        let w = &q[oi * i..(oi + 1) * i];
-        let sc = scale[oi];
-        for si in 0..s {
-            let xs = &x[si * i..(si + 1) * i];
-            let a: f32 = xs.iter().zip(w).map(|(&xv, &wv)| xv * wv as f32).sum();
-            y[si * o + oi] = a * sc;
-        }
-    }
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &q[oi * i..(oi + 1) * i];
+            let sc = scale[oi];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xs = &x[si * i..(si + 1) * i];
+                let a: f32 = xs.iter().zip(w).map(|(&xv, &wv)| xv * wv as f32).sum();
+                *slot = a * sc;
+            }
+        });
+        transpose_so(y, yt, s, o);
+    });
 }
 
 /// y[S,O] = x[S,I] @ W^T, W int4-packed[O,ceil(I/2)] (2 values/byte) per-row scale.
 pub fn matmul_i4(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if has_avx2() {
         return unsafe { matmul_i4_avx2(y, x, q4, scale, s, i, o) };
     }
     matmul_i4_scalar(y, x, q4, scale, s, i, o)
@@ -66,34 +128,37 @@ pub fn matmul_i4(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i
 
 fn matmul_i4_scalar(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     let rb = i.div_ceil(2);
-    for oi in 0..o {
-        let w = &q4[oi * rb..(oi + 1) * rb];
-        let sc = scale[oi];
-        for si in 0..s {
-            let xs = &x[si * i..(si + 1) * i];
-            let mut a = 0f32;
-            let mut ii = 0;
-            while ii + 1 < i {
-                let byte = w[ii >> 1];
-                let lo = (byte & 0xF) as i32 - 8;
-                let hi = (byte >> 4) as i32 - 8;
-                a += xs[ii] * lo as f32 + xs[ii + 1] * hi as f32;
-                ii += 2;
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &q4[oi * rb..(oi + 1) * rb];
+            let sc = scale[oi];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xs = &x[si * i..(si + 1) * i];
+                let mut a = 0f32;
+                let mut ii = 0;
+                while ii + 1 < i {
+                    let byte = w[ii >> 1];
+                    let lo = (byte & 0xF) as i32 - 8;
+                    let hi = (byte >> 4) as i32 - 8;
+                    a += xs[ii] * lo as f32 + xs[ii + 1] * hi as f32;
+                    ii += 2;
+                }
+                if ii < i {
+                    let byte = w[ii >> 1];
+                    let lo = (byte & 0xF) as i32 - 8;
+                    a += xs[ii] * lo as f32;
+                }
+                *slot = a * sc;
             }
-            if ii < i {
-                let byte = w[ii >> 1];
-                let lo = (byte & 0xF) as i32 - 8;
-                a += xs[ii] * lo as f32;
-            }
-            y[si * o + oi] = a * sc;
-        }
-    }
+        });
+        transpose_so(y, yt, s, o);
+    });
 }
 
 /// y[S,O] = x[S,I] @ W^T, W int2-packed[O,ceil(I/4)] (4 values/byte) per-row scale.
 pub fn matmul_i2(y: &mut [f32], x: &[f32], q2: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if has_avx2() {
         return unsafe { matmul_i2_avx2(y, x, q2, scale, s, i, o) };
     }
     matmul_i2_scalar(y, x, q2, scale, s, i, o)
@@ -101,21 +166,24 @@ pub fn matmul_i2(y: &mut [f32], x: &[f32], q2: &[u8], scale: &[f32], s: usize, i
 
 fn matmul_i2_scalar(y: &mut [f32], x: &[f32], q2: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     let rb = i.div_ceil(4);
-    for oi in 0..o {
-        let w = &q2[oi * rb..(oi + 1) * rb];
-        let sc = scale[oi];
-        for si in 0..s {
-            let xs = &x[si * i..(si + 1) * i];
-            let mut a = 0f32;
-            for ii in 0..i {
-                let byte = w[ii >> 2];
-                let sh = (ii & 3) * 2;
-                let v = ((byte >> sh) & 3) as i32 - 2;
-                a += xs[ii] * v as f32;
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &q2[oi * rb..(oi + 1) * rb];
+            let sc = scale[oi];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xs = &x[si * i..(si + 1) * i];
+                let mut a = 0f32;
+                for ii in 0..i {
+                    let byte = w[ii >> 2];
+                    let sh = (ii & 3) * 2;
+                    let v = ((byte >> sh) & 3) as i32 - 2;
+                    a += xs[ii] * v as f32;
+                }
+                *slot = a * sc;
             }
-            y[si * o + oi] = a * sc;
-        }
-    }
+        });
+        transpose_so(y, yt, s, o);
+    });
 }
 
 /// Quantizes one activation row to int8 (absmax/127, Q8_0-style) for the IDOT kernels.
@@ -337,46 +405,52 @@ mod simd {
 
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn matmul_q_avx2(y: &mut [f32], x: &[f32], q: &[i8], scale: &[f32], s: usize, i: usize, o: usize) {
-        unsafe {
-            for oi in 0..o {
+        with_yt_scratch(o * s, |yt| {
+            yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
                 let w = &q[oi * i..(oi + 1) * i];
                 let sc = scale[oi];
-                for si in 0..s {
+                for (si, slot) in row.iter_mut().enumerate() {
                     let xs = &x[si * i..(si + 1) * i];
-                    y[si * o + oi] = dot_q8_f32_avx2(w, xs) * sc;
+                    // Safety: caller of `matmul_q_avx2` already verified AVX2 at the dispatch
+                    // site (`matmul_q`); that's a whole-machine capability, not per-thread
+                    // state, so it still holds inside this rayon worker closure.
+                    *slot = unsafe { dot_q8_f32_avx2(w, xs) } * sc;
                 }
-            }
-        }
+            });
+            transpose_so(y, yt, s, o);
+        });
     }
 
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn matmul_i4_avx2(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
-        unsafe {
-            let rb = i.div_ceil(2);
-            for oi in 0..o {
+        let rb = i.div_ceil(2);
+        with_yt_scratch(o * s, |yt| {
+            yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
                 let w = &q4[oi * rb..(oi + 1) * rb];
                 let sc = scale[oi];
-                for si in 0..s {
+                for (si, slot) in row.iter_mut().enumerate() {
                     let xs = &x[si * i..(si + 1) * i];
-                    y[si * o + oi] = dot_i4_f32_avx2(w, xs, i) * sc;
+                    *slot = unsafe { dot_i4_f32_avx2(w, xs, i) } * sc;
                 }
-            }
-        }
+            });
+            transpose_so(y, yt, s, o);
+        });
     }
 
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn matmul_i2_avx2(y: &mut [f32], x: &[f32], q2: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
-        unsafe {
-            let rb = i.div_ceil(4);
-            for oi in 0..o {
+        let rb = i.div_ceil(4);
+        with_yt_scratch(o * s, |yt| {
+            yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
                 let w = &q2[oi * rb..(oi + 1) * rb];
                 let sc = scale[oi];
-                for si in 0..s {
+                for (si, slot) in row.iter_mut().enumerate() {
                     let xs = &x[si * i..(si + 1) * i];
-                    y[si * o + oi] = dot_i2_f32_avx2(w, xs, i) * sc;
+                    *slot = unsafe { dot_i2_f32_avx2(w, xs, i) } * sc;
                 }
-            }
-        }
+            });
+            transpose_so(y, yt, s, o);
+        });
     }
 
     /// int8·int8 dot, AVX2: the sign trick (|w| unsigned × x·sign(w) signed) — safe because
@@ -533,27 +607,33 @@ pub use simd::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx51
 // helpers for matmul_qt, so a wrapper struct would be indirection with no real caller benefit.
 #[allow(clippy::too_many_arguments)]
 fn matmul_q_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q: &[i8], scale: &[f32], s: usize, i: usize, o: usize) {
-    for oi in 0..o {
-        let w = &q[oi * i..(oi + 1) * i];
-        let sc = scale[oi];
-        for si in 0..s {
-            let xrow = &xq[si * i..(si + 1) * i];
-            y[si * o + oi] = dot_i8i8(w, xrow, i) as f32 * sc * sx[si];
-        }
-    }
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &q[oi * i..(oi + 1) * i];
+            let sc = scale[oi];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xrow = &xq[si * i..(si + 1) * i];
+                *slot = dot_i8i8(w, xrow, i) as f32 * sc * sx[si];
+            }
+        });
+        transpose_so(y, yt, s, o);
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
 fn matmul_i4_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     let rb = i.div_ceil(2);
-    for oi in 0..o {
-        let w = &q4[oi * rb..(oi + 1) * rb];
-        let sc = scale[oi];
-        for si in 0..s {
-            let xrow = &xq[si * i..(si + 1) * i];
-            y[si * o + oi] = dot_i4i8(w, xrow, i) as f32 * sc * sx[si];
-        }
-    }
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &q4[oi * rb..(oi + 1) * rb];
+            let sc = scale[oi];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xrow = &xq[si * i..(si + 1) * i];
+                *slot = dot_i4i8(w, xrow, i) as f32 * sc * sx[si];
+            }
+        });
+        transpose_so(y, yt, s, o);
+    });
 }
 
 /// x86 default from `glm.c`'s `g_i4s`: without ARM SDOT, int4 IDOT only pays off at S>=2 —

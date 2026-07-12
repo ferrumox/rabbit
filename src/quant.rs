@@ -18,6 +18,34 @@ fn lrint(x: f32) -> i32 {
     x.round_ties_even() as i32
 }
 
+/// `QT::from_packed`'s `data`/`scale` didn't match any of the three packed byte-count formulas
+/// for the given `[rows,cols]` — a mismatched or corrupt `.qs` sidecar file.
+#[derive(Debug)]
+pub struct PackedFormatError {
+    pub data_len: usize,
+    pub scale_len: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl std::fmt::Display for PackedFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "packed container for [{},{}]: {} data bytes / {} scales don't match int8 ({}), int4 ({}), or int2 ({}) row counts",
+            self.rows,
+            self.cols,
+            self.data_len,
+            self.scale_len,
+            self.rows * self.cols,
+            self.rows * self.cols.div_ceil(2),
+            self.rows * self.cols.div_ceil(4),
+        )
+    }
+}
+
+impl std::error::Error for PackedFormatError {}
+
 /// A quantized `[rows, cols]` weight matrix in one of four formats, chosen by `bits`.
 pub struct QT {
     pub rows: usize,
@@ -72,6 +100,30 @@ impl QT {
             QTKind::I4 { .. } => self.rows * self.cols.div_ceil(2) + self.rows * 4,
             QTKind::I2 { .. } => self.rows * self.cols.div_ceil(4) + self.rows * 4,
         }
+    }
+
+    /// Wraps already-quantized bytes — colibri's `name.qs` pre-quantized container (see
+    /// `qt_from_disk` in `glm.c`): `data` is the packed int8/int4/int2 payload straight off
+    /// disk (no `quantize_rows`/`pack_int4`/`pack_int2` work), `scale` is its per-row F32
+    /// scale, also read straight off disk. Format is inferred from `data.len()` against the
+    /// three possible byte counts for `[rows,cols]` — same probe as `qt_from_disk`'s `fmt`
+    /// (`nb==O*I` -> int8, `nb==O*ceil(I/2)` -> int4, else int2), except this returns an
+    /// error instead of silently assuming int2 when nothing matches (a mismatched/corrupt
+    /// `.qs` file deserves a message, not a wrong guess).
+    pub fn from_packed(rows: usize, cols: usize, bits: u8, data: Vec<u8>, scale: Vec<f32>) -> Result<QT, PackedFormatError> {
+        if scale.len() != rows {
+            return Err(PackedFormatError { data_len: data.len(), scale_len: scale.len(), rows, cols });
+        }
+        let kind = if data.len() == rows * cols {
+            QTKind::I8 { data: data.into_iter().map(|b| b as i8).collect(), scale }
+        } else if data.len() == rows * cols.div_ceil(2) {
+            QTKind::I4 { data, scale }
+        } else if data.len() == rows * cols.div_ceil(4) {
+            QTKind::I2 { data, scale }
+        } else {
+            return Err(PackedFormatError { data_len: data.len(), scale_len: scale.len(), rows, cols });
+        };
+        Ok(QT { rows, cols, bits, kind })
     }
 
     /// Dequantizes row `row` into a fresh `Vec<f32>` of length `cols` — port of `embed_row`
@@ -213,6 +265,45 @@ mod tests {
             QTKind::F32(data) => assert_eq!(data, &w),
             _ => panic!("expected F32"),
         }
+    }
+
+    #[test]
+    fn from_packed_round_trips_int8_and_int4_containers() {
+        for bits in [8u8, 4] {
+            let rows = 5;
+            let cols = 11; // not a multiple of 2 -> exercises int4's tail nibble too
+            let w = random_matrix(rows, cols, bits as u32 * 17 + 1);
+            let mut original = QT::alloc(rows, cols, bits, false);
+            original.fill(&w);
+
+            let (data, scale) = match &original.kind {
+                QTKind::I8 { data, scale } => (data.iter().map(|&v| v as u8).collect::<Vec<u8>>(), scale.clone()),
+                QTKind::I4 { data, scale } => (data.clone(), scale.clone()),
+                _ => panic!("expected I8 or I4"),
+            };
+
+            let rebuilt = QT::from_packed(rows, cols, bits, data, scale).unwrap();
+            for r in 0..rows {
+                assert_eq!(rebuilt.row_f32(r), original.row_f32(r), "bits={bits} row={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn from_packed_rejects_a_byte_count_matching_no_format() {
+        let Err(err) = QT::from_packed(4, 9, 8, vec![0u8; 7], vec![0.0; 4]) else {
+            panic!("expected an error");
+        };
+        assert_eq!(err.rows, 4);
+        assert_eq!(err.cols, 9);
+    }
+
+    #[test]
+    fn from_packed_rejects_a_mismatched_scale_length() {
+        let Err(err) = QT::from_packed(4, 9, 8, vec![0u8; 4 * 9], vec![0.0; 3]) else {
+            panic!("expected an error");
+        };
+        assert_eq!(err.scale_len, 3);
     }
 
     #[test]
