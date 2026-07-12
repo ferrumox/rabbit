@@ -359,6 +359,7 @@ dependencies = [
  "criterion",
  "io-uring",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
 ]
