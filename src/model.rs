@@ -530,4 +530,35 @@ mod tests {
             _ => panic!("expected F32"),
         }
     }
+
+    /// The "native" claim: `qt_load` needs ZERO FP8-specific code of its own — an FP8-sourced
+    /// tensor (`F8_E4M3` dtype + `{name}_scale_inv`, the real GLM-5.2-FP8 checkpoint's own
+    /// format) loads through the exact same `read_f32` call as F32/BF16/F16 already did, and
+    /// gets quantized to `bits` exactly like any other source. This is what actually lets
+    /// rabbit read a real checkpoint without a separate conversion step first.
+    #[test]
+    fn qt_load_reads_a_real_fp8_checkpoint_tensor_natively() {
+        let dir = TempDir::new("rabbit_test_qt_load_fp8_native");
+        let rows = 2;
+        let cols = 3;
+        // 1.0, -1.0, 0.0, 1.0, 1.0, -1.0 (see f8e4m3_decodes_known_bit_patterns in
+        // safetensors.rs), one block covers this whole tiny tensor.
+        let fp8_bytes = vec![0x38u8, 0xB8, 0x00, 0x38, 0x38, 0xB8];
+        let scale = 10.0f32;
+        write_minimal_safetensors(
+            &dir.0,
+            &[
+                ("w.weight", "F8_E4M3", vec![rows, cols], fp8_bytes),
+                ("w.weight_scale_inv", "F32", vec![1, 1], f32_bytes(&[scale])),
+            ],
+        );
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let t = qt_load(&shards, "w.weight", rows, cols, 32).unwrap(); // bits=32 -> F32, exact
+        let expected = [1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0].map(|v| v * scale);
+        match &t.kind {
+            crate::quant::QTKind::F32(data) => assert_eq!(data, &expected),
+            _ => panic!("expected F32"),
+        }
+    }
 }

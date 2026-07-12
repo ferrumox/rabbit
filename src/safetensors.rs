@@ -20,6 +20,11 @@ pub enum DType {
     F32,
     /// raw bytes: our own quantized int4/int8/int2 containers.
     U8,
+    /// 8-bit float, e4m3fn (1 sign, 4 exponent bits [bias 7], 3 mantissa bits, no infinities —
+    /// `S.1111.111` is NaN instead). The real GLM-5.2-FP8 release stores weights this way,
+    /// paired with a `{name}_scale_inv` block-scale tensor (128x128 blocks) — see
+    /// `read_f32`'s doc for how that pairing is resolved.
+    F8E4M3,
 }
 
 impl DType {
@@ -29,6 +34,7 @@ impl DType {
             "F16" => Ok(DType::F16),
             "F32" => Ok(DType::F32),
             "U8" | "I8" => Ok(DType::U8),
+            "F8_E4M3" | "float8_e4m3fn" => Ok(DType::F8E4M3),
             other => Err(SafetensorsError::UnknownDtype(other.to_string())),
         }
     }
@@ -37,9 +43,52 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::Bf16 | DType::F16 => 2,
-            DType::U8 => 1,
+            DType::U8 | DType::F8E4M3 => 1,
         }
     }
+}
+
+/// Decodes one e4m3fn byte to f32 — see `DType::F8E4M3`'s doc for the bit layout. Subnormals
+/// (`exp==0`): `mantissa/8 * 2^-6`. Normals: `(1+mantissa/8) * 2^(exp-7)`, max finite `448.0`
+/// at `exp=15,mantissa=6` (mantissa=7 there is reserved for NaN, the "fn" — finite, no
+/// infinity — variant's one deviation from a "denser" plain e4m3 that would go up to 480).
+fn f8e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let exp = (b >> 3) & 0xF;
+    let mant = (b & 0x7) as f32;
+    let magnitude = if exp == 0 {
+        mant * 2f32.powi(-9)
+    } else if exp == 0xF && b & 0x7 == 0x7 {
+        return f32::NAN;
+    } else {
+        (1.0 + mant / 8.0) * 2f32.powi(exp as i32 - 7)
+    };
+    if sign == 1 { -magnitude } else { magnitude }
+}
+
+/// Applies FP8 block-scale dequant to already-read raw FP8 bytes and an already-read scale
+/// vector — the math half of `Shards::read_f32`'s automatic FP8 handling, factored out for
+/// callers that fetch the raw bytes themselves (e.g. `expert_cache.rs`'s `io_uring` batch
+/// loader, which reads tensor bytes via its own ring instead of `Shards::read_f32`).
+/// `scale_name` is only used to label a length-mismatch error.
+pub fn dequant_fp8_blockscale(raw: &[u8], rows: u64, cols: u64, scale: &[f32], scale_name: &str) -> Result<Vec<f32>, SafetensorsError> {
+    const BLOCK: u64 = 128;
+    let sc_cols = cols.div_ceil(BLOCK);
+    let expected_sc_len = rows.div_ceil(BLOCK) * sc_cols;
+    if scale.len() as u64 != expected_sc_len {
+        let msg = format!("{scale_name}: expected {expected_sc_len} block scales for a [{rows},{cols}] tensor, got {}", scale.len());
+        return Err(SafetensorsError::BadHeader(msg));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for r in 0..rows {
+        let block_row = r / BLOCK;
+        for c in 0..cols {
+            let block_col = c / BLOCK;
+            let s = scale[(block_row * sc_cols + block_col) as usize];
+            out.push(f8e4m3_to_f32(raw[(r * cols + c) as usize]) * s);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +100,9 @@ pub struct Tensor {
     pub nbytes: u64,
     pub dtype: DType,
     pub numel: u64,
+    /// as declared in the safetensors header — needed (not just `numel`) to apply FP8 block
+    /// scale, which depends on the 2D block structure, not just the flattened element count.
+    pub shape: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -140,6 +192,10 @@ fn decode_floats(raw: &[u8], dtype: DType, out: &mut Vec<f32>) {
         DType::F16 => {
             out.extend(raw.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))));
         }
+        // plain per-element decode, no block scale applied — `read_f32` special-cases
+        // F8E4M3 separately (it needs the tensor's shape and a companion scale tensor,
+        // neither of which this raw-bytes-in function has access to).
+        DType::F8E4M3 => out.extend(raw.iter().map(|&b| f8e4m3_to_f32(b))),
         DType::U8 => unreachable!("decode_floats called on a raw U8 container"),
     }
 }
@@ -199,9 +255,10 @@ impl Shards {
                     .get("shape")
                     .and_then(Value::as_array)
                     .ok_or_else(|| SafetensorsError::BadHeader(format!("{name}: missing shape")))?;
+                let shape: Vec<u64> = shape.iter().filter_map(Value::as_u64).collect();
                 // product() of an empty iterator is 1 (multiplicative identity), which is
                 // also the correct numel for a 0-dim (scalar) tensor.
-                let numel = shape.iter().filter_map(Value::as_u64).product::<u64>();
+                let numel = shape.iter().product::<u64>();
 
                 tensors.push(Tensor {
                     name: name.clone(),
@@ -210,6 +267,7 @@ impl Shards {
                     nbytes: b0 - a0,
                     dtype,
                     numel,
+                    shape,
                 });
                 index.insert(name.clone(), tensors.len() - 1);
             }
@@ -255,11 +313,18 @@ impl Shards {
         }
     }
 
-    /// reads a tensor and converts it to f32 regardless of its on-disk dtype.
-    /// `drop_cache = true` advises the kernel to discard the pages afterwards (streaming
-    /// experts: we never want to reread stale ones from cache).
+    /// reads a tensor and converts it to f32 regardless of its on-disk dtype. `F8E4M3`
+    /// tensors are additionally dequantized with their companion `{name}_scale_inv`
+    /// block-scale tensor (128x128 blocks) — the real GLM-5.2-FP8 release's own format, so
+    /// every caller of `read_f32` (`model.rs`'s `qt_load`, `expert_cache.rs`'s sequential
+    /// loader, ...) can load a raw FP8 checkpoint with zero changes of their own. `drop_cache
+    /// = true` advises the kernel to discard the pages afterwards (streaming experts: we
+    /// never want to reread stale ones from cache).
     pub fn read_f32(&self, name: &str, drop_cache: bool) -> Result<Vec<f32>, SafetensorsError> {
         let t = self.find(name).ok_or_else(|| SafetensorsError::MissingTensor(name.to_string()))?;
+        if t.dtype == DType::F8E4M3 {
+            return self.read_f32_fp8_blockscale(name, drop_cache);
+        }
         let mut raw = vec![0u8; t.nbytes as usize];
         read_exact_at(&self.files[t.file_index], t.offset, &mut raw)?;
         let mut out = Vec::with_capacity(t.numel as usize);
@@ -268,6 +333,29 @@ impl Shards {
             self.fadvise_dontneed(t.file_index, t.offset, t.nbytes);
         }
         Ok(out)
+    }
+
+    /// Dequantizes an FP8 (e4m3fn) weight tensor using its `{name}_scale_inv` sidecar: one
+    /// scale per 128x128 block, broadcast to every element in that block (cropped at the
+    /// tensor's actual edges when `rows`/`cols` isn't a multiple of 128) — `f32 =
+    /// f8e4m3_to_f32(byte) * scale[row/128, col/128]`. Requires a 2D shape; every FP8 tensor
+    /// in the real checkpoint is a 2D weight matrix (biases/norms are release in bf16/f32).
+    fn read_f32_fp8_blockscale(&self, name: &str, drop_cache: bool) -> Result<Vec<f32>, SafetensorsError> {
+        let t = self.find(name).ok_or_else(|| SafetensorsError::MissingTensor(name.to_string()))?;
+        if t.shape.len() != 2 {
+            return Err(SafetensorsError::BadHeader(format!("{name}: FP8 tensor must be 2D, got shape {:?}", t.shape)));
+        }
+        let (rows, cols) = (t.shape[0], t.shape[1]);
+
+        let mut raw = vec![0u8; t.nbytes as usize];
+        read_exact_at(&self.files[t.file_index], t.offset, &mut raw)?;
+        if drop_cache {
+            self.fadvise_dontneed(t.file_index, t.offset, t.nbytes);
+        }
+
+        let scale_name = format!("{name}_scale_inv");
+        let sc = self.read_f32(&scale_name, drop_cache)?;
+        dequant_fp8_blockscale(&raw, rows, cols, &sc, &scale_name)
     }
 
     /// reads a tensor's raw bytes with no dtype conversion — for our own pre-quantized U8
@@ -483,5 +571,70 @@ mod tests {
         assert_eq!(v, vec![7.0, 8.0]);
         shards.prefetch("a");
         shards.prefetch("does.not.exist"); // no-op, must not panic
+    }
+
+    #[test]
+    fn f8e4m3_decodes_known_bit_patterns() {
+        assert_eq!(f8e4m3_to_f32(0x00), 0.0); // +0 (subnormal, mantissa=0)
+        assert_eq!(f8e4m3_to_f32(0x38), 1.0); // 0_0111_000: (1+0/8)*2^0
+        assert_eq!(f8e4m3_to_f32(0xB8), -1.0); // sign bit set -> -1.0
+        assert_eq!(f8e4m3_to_f32(0x7E), 448.0); // 0_1111_110: max finite e4m3fn value
+        assert!(f8e4m3_to_f32(0x7F).is_nan()); // 0_1111_111: reserved for NaN
+        // subnormal: mantissa=1, exp=0 -> 1 * 2^-9
+        assert!((f8e4m3_to_f32(0x01) - 2f32.powi(-9)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn read_f32_dequantizes_fp8_with_a_single_block_scale() {
+        let dir = TempDir::new("rabbit_test_st_fp8_single_block");
+        // 2x3, well inside one 128x128 block -> one scale value covers the whole tensor.
+        let fp8_bytes = vec![0x38, 0xB8, 0x00, 0x38, 0x38, 0xB8]; // 1.0,-1.0,0.0,1.0,1.0,-1.0
+        let scale = 3.5f32;
+        let shard = build_safetensors(&[
+            ("w", "F8_E4M3", vec![2, 3], fp8_bytes),
+            ("w_scale_inv", "F32", vec![1, 1], f32_bytes(&[scale])),
+        ]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let got = shards.read_f32("w", false).unwrap();
+        let expected = [1.0, -1.0, 0.0, 1.0, 1.0, -1.0].map(|v: f32| v * scale);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn read_f32_dequantizes_fp8_across_multiple_row_blocks() {
+        let dir = TempDir::new("rabbit_test_st_fp8_multi_block");
+        // 130 rows x 1 col -> spans row-block 0 (rows 0..128) and row-block 1 (rows 128..130),
+        // each with its own scale; every FP8 byte is the same (0x38 = 1.0) so the ONLY thing
+        // that can vary per row is which block's scale got applied.
+        let rows = 130usize;
+        let fp8_bytes = vec![0x38u8; rows]; // every element decodes to 1.0 before scaling
+        let block0_scale = 2.0f32;
+        let block1_scale = 100.0f32;
+        let shard = build_safetensors(&[
+            ("w", "F8_E4M3", vec![rows, 1], fp8_bytes),
+            ("w_scale_inv", "F32", vec![2, 1], f32_bytes(&[block0_scale, block1_scale])),
+        ]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let got = shards.read_f32("w", false).unwrap();
+        assert_eq!(got.len(), rows);
+        for (r, &v) in got.iter().enumerate() {
+            let expected = if r < 128 { block0_scale } else { block1_scale };
+            assert_eq!(v, expected, "row {r}");
+        }
+    }
+
+    #[test]
+    fn read_f32_errors_when_fp8_scale_inv_is_missing() {
+        let dir = TempDir::new("rabbit_test_st_fp8_no_scale");
+        let shard = build_safetensors(&[("w", "F8_E4M3", vec![1, 2], vec![0x38, 0x38])]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let err = shards.read_f32("w", false).unwrap_err();
+        assert!(matches!(err, SafetensorsError::MissingTensor(_)));
     }
 }

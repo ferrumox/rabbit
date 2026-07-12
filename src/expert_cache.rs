@@ -44,7 +44,7 @@ use crate::safetensors::Shards;
 #[cfg(target_os = "linux")]
 mod uring_load {
     use super::{Cfg, ExpertSlot, ModelError, QT};
-    use crate::safetensors::{SafetensorsError, Shards, TensorLocation};
+    use crate::safetensors::{DType, SafetensorsError, Shards, TensorLocation, dequant_fp8_blockscale};
     use io_uring::{IoUring, opcode, types};
 
     struct Req {
@@ -58,6 +58,12 @@ mod uring_load {
         /// `read_f32` up front rather than folded into the batched `io_uring` reads, which
         /// exist to amortize the *big* per-expert tensors, not a few-KB sidecar.
         packed_scale: Option<Vec<f32>>,
+        /// `Some(scale)` when `loc.dtype == F8E4M3` (mutually exclusive with `packed_scale` —
+        /// a tensor is never both `.qs`-packed and raw FP8): the `{name}_scale_inv` 128x128
+        /// block-scale sidecar, fetched up front the same way `packed_scale` is, so the raw
+        /// bytes `io_uring` reads back can be dequantized correctly instead of falling through
+        /// to `Shards::decode_f32`'s *unscaled* per-element FP8 decode.
+        fp8_scale: Option<Vec<f32>>,
     }
 
     /// A persistent `io_uring` instance, reused across every `load_batch` call for as long as
@@ -106,8 +112,14 @@ mod uring_load {
                 let name = p(suf);
                 let qs_name = format!("{name}.qs");
                 let packed_scale = if shards.has(&qs_name) { Some(shards.read_f32(&qs_name, false)?) } else { None };
-                let loc = shards.tensor_location(&name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name)))?;
-                reqs.push(Req { rows, cols, loc, packed_scale });
+                let loc = shards.tensor_location(&name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name.clone())))?;
+                let fp8_scale = if packed_scale.is_none() && loc.dtype == DType::F8E4M3 {
+                    let scale_name = format!("{name}_scale_inv");
+                    Some(shards.read_f32(&scale_name, false)?)
+                } else {
+                    None
+                };
+                reqs.push(Req { rows, cols, loc, packed_scale, fp8_scale });
             }
         }
 
@@ -178,7 +190,12 @@ mod uring_load {
             return QT::from_packed(req.rows, req.cols, bits, raw.to_vec(), scale.clone())
                 .map_err(|source| ModelError::PackedFormat { name: "expert tensor (.qs)".to_string(), source });
         }
-        let w = Shards::decode_f32(raw, req.loc.dtype);
+        let w = if let Some(scale) = &req.fp8_scale {
+            dequant_fp8_blockscale(raw, req.rows as u64, req.cols as u64, scale, "expert tensor (fp8 scale_inv)")
+                .map_err(ModelError::Safetensors)?
+        } else {
+            Shards::decode_f32(raw, req.loc.dtype)
+        };
         let mut t = QT::alloc(req.rows, req.cols, bits, false);
         t.fill(&w);
         Ok(t)
@@ -607,5 +624,74 @@ mod tests {
         let mut sequential_cache = ExpertCache::new(4);
         sequential_cache.get_or_load(&shards, &cfg, 0, eid, 8).unwrap();
         check(sequential_cache.get(eid).unwrap());
+    }
+
+    /// Both `ensure_loaded` (`io_uring`) and `get_or_load` (sequential, via `qt_load` ->
+    /// `read_f32`'s automatic FP8 handling) must apply the same FP8 block-scale dequant to a
+    /// raw `F8_E4M3` expert tensor and its `{name}_scale_inv` sidecar — this is the regression
+    /// test for the gap where `io_uring`'s `qt_from_raw` used to call `Shards::decode_f32`
+    /// directly, which decodes FP8 bytes WITHOUT applying any scale at all.
+    #[test]
+    fn fp8_backed_expert_tensors_dequantize_identically_on_both_paths() {
+        let dir = TempDir::new("rabbit_test_ecache_fp8_parity");
+        let moe_inter = 3;
+        let hidden = 5;
+        // 0x38 = 1.0, 0xB8 = -1.0 in e4m3fn (see safetensors.rs's f8e4m3 tests) — every
+        // element decodes to +-1.0 before scaling, so a wrong (unscaled) path is trivially
+        // distinguishable from a correctly-scaled one.
+        let fp8_pattern = |n: usize| -> Vec<u8> { (0..n).map(|i| if i % 2 == 0 { 0x38 } else { 0xB8 }).collect() };
+        // every tensor here is well inside one 128x128 block -> exactly one scale value.
+        let gate_bytes = fp8_pattern(moe_inter * hidden);
+        let gate_scale = vec![2.0f32];
+        let up_bytes = fp8_pattern(moe_inter * hidden);
+        let up_scale = vec![3.0f32];
+        let down_bytes = fp8_pattern(hidden * moe_inter);
+        let down_scale = vec![4.0f32];
+
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, dtype: &str, shape: Vec<usize>, bytes: Vec<u8>| {
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": dtype, "shape": shape, "data_offsets": [start, end]}));
+        };
+        let eid = 0;
+        for (suf, rows, cols, bytes, scale) in [
+            ("gate_proj", moe_inter, hidden, &gate_bytes, &gate_scale),
+            ("up_proj", moe_inter, hidden, &up_bytes, &up_scale),
+            ("down_proj", hidden, moe_inter, &down_bytes, &down_scale),
+        ] {
+            let name = format!("model.layers.0.mlp.experts.{eid}.{suf}.weight");
+            push(&mut header, name.clone(), "F8_E4M3", vec![rows, cols], bytes.clone());
+            push(&mut header, format!("{name}_scale_inv"), "F32", vec![1, 1], f32_bytes(scale));
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+
+        let shards = Shards::open(&dir.0).unwrap();
+        let cfg = tiny_cfg(1, moe_inter as i32, hidden as i32);
+
+        let mut batch_cache = ExpertCache::new(4);
+        batch_cache.ensure_loaded(&shards, &cfg, 0, &[eid], 32).unwrap();
+        let batch_slot = batch_cache.get(eid).unwrap();
+
+        let mut sequential_cache = ExpertCache::new(4);
+        sequential_cache.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
+        let sequential_slot = sequential_cache.get(eid).unwrap();
+
+        assert_eq!(qt_values(&batch_slot.gate), qt_values(&sequential_slot.gate), "gate_proj");
+        assert_eq!(qt_values(&batch_slot.up), qt_values(&sequential_slot.up), "up_proj");
+        assert_eq!(qt_values(&batch_slot.down), qt_values(&sequential_slot.down), "down_proj");
+
+        // and the scale was actually applied, not silently skipped -> magnitude ~2.0/3.0/4.0,
+        // not ~1.0 (which is what the pre-fix bug's unscaled decode would have produced).
+        let gate_vals = qt_values(&batch_slot.gate);
+        assert!(gate_vals.iter().any(|&v| v.abs() > 1.5), "gate scale (2.0) doesn't look applied: {gate_vals:?}");
     }
 }
