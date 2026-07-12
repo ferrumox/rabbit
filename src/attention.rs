@@ -21,6 +21,7 @@
 use crate::config::Cfg;
 use crate::kernels::{matmul_qt, qt_addrow, qt_matvec_rows};
 use crate::model::{AttnWeights, DsaWeights};
+use rayon::prelude::*;
 
 pub fn rmsnorm(v: &mut [f32], w: &[f32], eps: f32) {
     let n = v.len() as f64;
@@ -388,13 +389,30 @@ pub fn attention(
     };
 
     // 3) attention proper: weight-absorbed decode path, or dense reconstruction path.
+    // From here on `kv` is only ever read (`l_row`/`r_row`/`l_range`) -- its one mutation
+    // (`kv.push`) already happened in step 1 above. Reborrowing as `&KvCache` lets the
+    // absorbed branch's per-head rayon closure below capture a `Sync` shared reference instead
+    // of fighting the `&mut KvCache` parameter's exclusivity; `KvCache` has no interior
+    // mutability (just `Vec<f32>`/`usize` fields) so this is sound.
+    let kv: &KvCache = &*kv;
     let use_absorb = matches!(absorb, Absorb::Always) || matches!(absorb, Absorb::Auto if s <= 4);
     if use_absorb && kv_lora <= 512 {
         for si in 0..s {
             let pos = pos_base + si;
             let positions = positions_for(si, pos);
             let nt = positions.len();
-            for hh in 0..h {
+            // Heads are independent: each reads shared `q`/`kv` and writes only its own
+            // disjoint `vh`-wide slice of `ctx` -- no cross-head reduction anywhere, so
+            // parallelizing this axis changes execution ORDER but not any floating-point
+            // reassociation within a head's own math (bit-identical to the sequential
+            // version). This sweeps up `qt_addrow`/`qt_matvec_rows` (fixed O(kv_lora)/
+            // O(vh*kv_lora) cost, independent of context length) together with the score/clat
+            // loops below (O(nt*kv_lora), the part that actually scales with how many tokens
+            // are in the KV cache) -- see `rabbit-plan.md`'s Fase 12 entry for why parallelizing
+            // `qt_addrow`/`qt_matvec_rows` in isolation would have been the wrong, fine-grained
+            // axis instead.
+            let ctx_row = &mut ctx[si * h * vh..(si + 1) * h * vh];
+            ctx_row.par_chunks_mut(vh).enumerate().for_each(|(hh, ctx_slot)| {
                 let qp = &q[si * h * qh + hh * qh..si * h * qh + (hh + 1) * qh];
                 let qr = &qp[qk_nope..qk_nope + qk_rope];
                 let rbase = hh * (qk_nope + vh);
@@ -422,9 +440,8 @@ pub fn attention(
                         clat[i] += a * lt[i];
                     }
                 }
-                let ctx_slot = &mut ctx[(si * h + hh) * vh..(si * h + hh + 1) * vh];
                 qt_matvec_rows(&w.kv_b, rbase + qk_nope, vh, &clat, ctx_slot);
-            }
+            });
         }
     } else {
         let kvb_dim = h * (qk_nope + vh);
