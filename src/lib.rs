@@ -14,3 +14,4 @@ pub mod safetensors;
 pub mod server;
 pub mod tokenizer;
 mod unicode_tables;
+pub mod usage_cache;

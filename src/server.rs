@@ -215,6 +215,16 @@ fn handle_chat_completions(mut request: Request, session: &mut Session, cfg: &Se
         Ok(v) => v,
         Err(e) => return respond_err(request, ApiError::from(e)),
     };
+
+    // Not a violation of "stateless across requests" (Fase 11): the usage cache isn't
+    // conversation memory visible to API clients, it's an internal performance-tuning file —
+    // same distinction colibrì's own `run_serve` makes when it accumulates `.coli_usage`.
+    if session.usage_cache_enabled
+        && let Err(e) = session.caches.save_usage(&session.model_dir)
+    {
+        eprintln!("usage cache: failed to save: {e}");
+    }
+
     let finish_reason = if hit_stop { "stop" } else { "length" };
     let body = json!({
         "id": id, "object": "chat.completion", "created": created, "model": cfg.model_id,
@@ -284,6 +294,15 @@ fn stream_chat_completion(request: Request, session: &mut Session, kv: &mut KvSt
             // else: incomplete multi-byte sequence so far, keep buffering for the next token.
         }
     });
+
+    // Save regardless of whether the client disconnected mid-stream or generation itself
+    // errored below -- the router already ran and the counters already bumped either way. Same
+    // "not conversation state" rationale as the non-streaming path above.
+    if session.usage_cache_enabled
+        && let Err(e) = session.caches.save_usage(&session.model_dir)
+    {
+        eprintln!("usage cache: failed to save: {e}");
+    }
 
     if io_failed {
         eprintln!("stream: client disconnected mid-response");

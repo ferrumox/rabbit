@@ -17,7 +17,9 @@
 //!   cumulative-weight threshold instead of always using all `K`.
 //! - **`LOOKA`/`SPEC`/`PILOT` instrumentation and cross-layer prefetch bookkeeping**: research
 //!   counters and disk-readahead hints with zero effect on the computed output.
-//! - **Persistent learning cache updates** (`eusage`/`eheat`): out of scope for this stage.
+//! - **Live re-pin heat** (`eheat`/`REPIN`): still out of scope (see `expert_cache.rs`'s module
+//!   doc). The PERSISTENT half (`eusage` -> `ExpertCache::record_selection`, Fase 13) is now
+//!   ported — see the top-k loop below.
 //!
 //! Expert dispatch is also simplified vs the C's block-of-64 batching — see
 //! `expert_cache.rs`'s module doc for why that's a pure performance cut.
@@ -136,6 +138,13 @@ pub fn moe(
     let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
 
     let routing = route(cfg, w, x, s);
+    // Persistent usage histogram (colibrì's `eusage[layer][eid]++`): once per top-k selection,
+    // before any cache resolution -- reflects the router's decision, not cache hit/miss.
+    for choices in &routing.choices {
+        for &(eid, _) in choices {
+            cache.record_selection(eid);
+        }
+    }
     for v in out[..s * d].iter_mut() {
         *v = 0.0;
     }
@@ -487,6 +496,73 @@ mod tests {
         }
         // sanity: every expert really was touched (topk==n_experts), not a vacuous pass.
         assert_eq!(cache.misses, n_experts as u64);
+    }
+
+    /// Fase 13's pin tier is purely a bookkeeping/performance mechanism: whether an expert
+    /// happens to already be resident via `pin_expert` (rather than getting there through the
+    /// ordinary LRU miss path) must never change `moe()`'s numeric output — same invariant this
+    /// module already relies on for io_uring vs. sequential loading.
+    #[test]
+    fn moe_output_is_identical_whether_or_not_an_expert_is_pre_pinned() {
+        let n_experts = 3;
+        let moe_inter = 4;
+        let hidden = 5;
+        let n_shared = 1;
+        let mut seed = 42;
+
+        let dir = TempDir::new("rabbit_test_moe_pin_invariance");
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        for eid in 0..n_experts {
+            let gate = random_vec(moe_inter * hidden, &mut seed);
+            let up = random_vec(moe_inter * hidden, &mut seed);
+            let down = random_vec(hidden * moe_inter, &mut seed);
+            for (suf, rows, cols, vals) in [
+                ("gate_proj", moe_inter, hidden, &gate),
+                ("up_proj", moe_inter, hidden, &up),
+                ("down_proj", hidden, moe_inter, &down),
+            ] {
+                let name = format!("model.layers.0.mlp.experts.{eid}.{suf}.weight");
+                let bytes = f32_bytes(vals);
+                let start = data.len() as u64;
+                data.extend_from_slice(&bytes);
+                let end = data.len() as u64;
+                header.insert(name, json!({"dtype": "F32", "shape": [rows, cols], "data_offsets": [start, end]}));
+            }
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out_bytes = Vec::new();
+        out_bytes.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out_bytes.extend_from_slice(&header_bytes);
+        out_bytes.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out_bytes).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let cfg = tiny_cfg(n_experts as i32, n_experts as i32, moe_inter as i32, hidden as i32, n_shared as i32, false);
+        let w = MoeWeights {
+            router: random_vec(n_experts * hidden, &mut seed),
+            router_bias: random_vec(n_experts, &mut seed),
+            sh_gate: random_qt_f32(moe_inter * n_shared, hidden, &mut seed),
+            sh_up: random_qt_f32(moe_inter * n_shared, hidden, &mut seed),
+            sh_down: random_qt_f32(hidden, moe_inter * n_shared, &mut seed),
+        };
+        let s = 2;
+        let x = random_vec(s * hidden, &mut seed);
+
+        let mut cache_unpinned = ExpertCache::new(n_experts);
+        let mut out_unpinned = vec![0f32; s * hidden];
+        moe(&cfg, &w, &mut cache_unpinned, &shards, 0, 32, &x, s, &mut out_unpinned).unwrap();
+
+        let mut cache_pinned = ExpertCache::new(n_experts);
+        cache_pinned.mark_pin_candidates(std::iter::once(0usize)); // lazy: promotes on moe()'s own first load of it
+        let mut out_pinned = vec![0f32; s * hidden];
+        moe(&cfg, &w, &mut cache_pinned, &shards, 0, 32, &x, s, &mut out_pinned).unwrap();
+        assert!(cache_pinned.is_pinned(0), "topk==n_experts guarantees moe() touched expert 0, so it must have been promoted");
+
+        for (a, b) in out_unpinned.iter().zip(&out_pinned) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
     }
 
     /// Regression test: a batch whose unique-expert count exceeds the cache's capacity used

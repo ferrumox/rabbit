@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
-[--session <path>] [--host H] [--port N] [--api-key K]";
+[--session <path>] [--no-usage-cache] [--host H] [--port N] [--api-key K]";
 
 struct Args {
     model_dir: PathBuf,
@@ -28,6 +28,7 @@ struct Args {
     ebits: u8,
     cache_capacity: usize,
     session: Option<PathBuf>,
+    no_usage_cache: bool,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -47,6 +48,7 @@ fn parse_args() -> Result<Args, String> {
     let mut ebits = 4u8;
     let mut cache_capacity = 64usize;
     let mut session = None;
+    let mut no_usage_cache = false;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut api_key = None;
@@ -68,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
             "--ebits" => ebits = next("--ebits")?.parse().map_err(|e| format!("--ebits: {e}"))?,
             "--expert-cache" => cache_capacity = next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?,
             "--session" => session = Some(PathBuf::from(next("--session")?)),
+            "--no-usage-cache" => no_usage_cache = true,
             "--host" => host = next("--host")?,
             "--port" => port = next("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--api-key" => api_key = Some(next("--api-key")?),
@@ -97,6 +100,7 @@ fn parse_args() -> Result<Args, String> {
         ebits,
         cache_capacity,
         session,
+        no_usage_cache,
         host,
         port,
         api_key,
@@ -113,6 +117,7 @@ fn load_args(args: &Args) -> LoadArgs {
         dbits: args.dbits,
         ebits: args.ebits,
         cache_capacity: args.cache_capacity,
+        no_usage_cache: args.no_usage_cache,
     }
 }
 
@@ -142,6 +147,12 @@ fn run_single_shot(args: &Args, prompt: &str) -> Result<(), Box<dyn std::error::
     let elapsed = t1.elapsed().as_secs_f32();
     println!("{text}");
     eprintln!("\n{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
+
+    if sess.usage_cache_enabled
+        && let Err(e) = sess.caches.save_usage(&sess.model_dir)
+    {
+        eprintln!("(no se pudo guardar el usage cache: {e})");
+    }
     Ok(())
 }
 
@@ -214,6 +225,12 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             && let Err(e) = kv.save(from_pos, pos, path)
         {
             eprintln!("(no se pudo guardar la sesión: {e})");
+        }
+
+        if sess.usage_cache_enabled
+            && let Err(e) = sess.caches.save_usage(&sess.model_dir)
+        {
+            eprintln!("(no se pudo guardar el usage cache: {e})");
         }
 
         println!("{}\n", reply.trim());
