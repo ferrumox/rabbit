@@ -66,13 +66,15 @@ mod uring_load {
         fp8_scale: Option<Vec<f32>>,
     }
 
-    /// A persistent `io_uring` instance, reused across every `load_batch` call for as long as
+    /// A persistent `io_uring` instance, reused across every `submit_batch` call for as long as
     /// the owning `ExpertCache` lives. Creating a ring isn't free (`io_uring_setup` + mmap'ing
     /// the shared SQ/CQ memory) — the first version of this phase created a fresh one per
     /// call and the `cargo bench` numbers came out SLOWER than plain sequential `pread`,
     /// entirely from that per-call setup cost swallowing the syscall-count savings. `capacity`
-    /// is fixed at creation (io_uring rings don't resize); `load_batch` submits in chunks when
-    /// a batch is larger than that.
+    /// is fixed at creation (io_uring rings don't resize) — sized to `cache_capacity * 3` (see
+    /// `new_ring`), so a batch chunked to `ExpertCache::capacity()` (as `moe.rs` always does)
+    /// fits in exactly one submission round; `submit_batch` falls back to a synchronous load
+    /// for any batch that doesn't fit, rather than submitting it across multiple rounds.
     pub(super) struct Ring {
         io: IoUring,
         capacity: usize,
@@ -88,19 +90,39 @@ mod uring_load {
     /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity (3
     /// tensors/expert). Returns `None` if `io_uring` isn't usable on this host (the
     /// `io_uring_disabled` sysctl, a seccomp profile blocking the syscalls, ...) — every
-    /// `load_batch` call then falls back to sequential `pread`, same as a hard per-call
+    /// `submit_batch` call then falls back to a synchronous load, same as a hard per-call
     /// failure would.
     pub(super) fn new_ring(cache_capacity: usize) -> Option<Ring> {
         Ring::new(cache_capacity * 3).ok()
     }
 
-    /// Loads every expert in `misses` (3 tensors each: gate/up/down) via `io_uring`,
-    /// submitted in as few rounds as `ring`'s fixed capacity allows. Falls back to the
-    /// sequential loader if `ring` is `None` (see `new_ring`) or a submission fails outright.
-    pub(super) fn load_batch(ring: &mut Option<Ring>, shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64) -> Result<Vec<ExpertSlot>, ModelError> {
-        let Some(r) = ring.as_mut() else {
-            return super::sequential_fallback(shards, cfg, layer, misses, bits, used);
-        };
+    /// A batch of expert reads submitted to `ring` but not yet awaited — `complete_batch` must
+    /// be called (on the SAME `ring`) before the data is valid to decode. Holds the owned
+    /// buffers the in-flight SQEs point at, so they can't be dropped out from under the kernel
+    /// before completion.
+    pub(super) struct Pending {
+        reqs: Vec<Req>,
+        bufs: Vec<Vec<u8>>,
+        eids: Vec<usize>,
+    }
+
+    impl Pending {
+        /// The expert ids this batch covers — cheap to clone (just `usize`s), used by
+        /// `ExpertCache::finish_loading` to retry via `sequential_fallback` if
+        /// `complete_batch` reports an I/O error, without needing to hold onto the (already
+        /// consumed) `Pending` itself.
+        pub(super) fn eids_for_fallback(&self) -> Vec<usize> {
+            self.eids.clone()
+        }
+    }
+
+    /// Submits reads for every tensor in `misses` (3/expert) WITHOUT waiting for completion.
+    /// Returns `Ok(None)` — not an error — when the ring is unavailable, the batch doesn't fit
+    /// in one submission round, or the submission itself fails; every one of these just means
+    /// "the caller should fall back to a synchronous load for this batch," same as a hard
+    /// `load_batch` failure always meant before this split existed.
+    pub(super) fn submit_batch(ring: &mut Option<Ring>, shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize]) -> Result<Option<Pending>, ModelError> {
+        let Some(r) = ring.as_mut() else { return Ok(None) };
 
         let i = cfg.moe_inter as usize;
         let d = cfg.hidden as usize;
@@ -123,66 +145,75 @@ mod uring_load {
             }
         }
 
-        let mut bufs: Vec<Vec<u8>> = reqs.iter().map(|req| vec![0u8; req.loc.nbytes as usize]).collect();
-
-        if submit_chunked(r, &reqs, &mut bufs).is_err() {
-            return super::sequential_fallback(shards, cfg, layer, misses, bits, used);
+        if reqs.len() > r.capacity {
+            return Ok(None);
         }
 
-        // group the 3 reads per expert back into one ExpertSlot each, in `misses` order.
-        let mut out = Vec::with_capacity(misses.len());
-        for (chunk, &eid) in misses.iter().enumerate() {
+        let mut bufs: Vec<Vec<u8>> = reqs.iter().map(|req| vec![0u8; req.loc.nbytes as usize]).collect();
+
+        {
+            let mut sq = r.io.submission();
+            for (local, req) in reqs.iter().enumerate() {
+                let buf = &mut bufs[local];
+                let read_e = opcode::Read::new(types::Fd(req.loc.fd), buf.as_mut_ptr(), buf.len() as u32).offset(req.loc.offset).build().user_data(local as u64);
+                // Safety: `buf` stays alive (owned by the returned `Pending`, held by the
+                // caller) until `complete_batch` reaps this SQE's completion, satisfying the
+                // lifetime requirement; `push` never fails since we just checked the batch
+                // fits within the ring's own capacity.
+                unsafe {
+                    sq.push(&read_e).expect("checked batch fits ring capacity above");
+                }
+            }
+        }
+        if r.io.submit().is_err() {
+            return Ok(None);
+        }
+
+        Ok(Some(Pending { reqs, bufs, eids: misses.to_vec() }))
+    }
+
+    /// Waits for every read `submit_batch` started, validates each one's byte count, and
+    /// decodes the results into `ExpertSlot`s — the other half of `submit_batch`'s split,
+    /// called on the same `ring` (`submit_batch` only returns `Some` when the ring exists, so
+    /// this never needs its own "ring unavailable" fallback).
+    pub(super) fn complete_batch(ring: &mut Ring, pending: Pending, bits: u8, used: u64) -> Result<Vec<ExpertSlot>, std::io::Error> {
+        let Pending { reqs, bufs, eids } = pending;
+
+        ring.io.submit_and_wait(reqs.len())?;
+
+        let mut results = vec![None; reqs.len()];
+        for cqe in ring.io.completion() {
+            results[cqe.user_data() as usize] = Some(cqe.result());
+        }
+        for (local, req) in reqs.iter().enumerate() {
+            match results[local] {
+                Some(n) if n as u64 == req.loc.nbytes => {}
+                Some(n) if n >= 0 => {
+                    let msg = format!("expert read: short read ({n}/{} bytes)", req.loc.nbytes);
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
+                }
+                Some(n) => return Err(std::io::Error::from_raw_os_error(-n)),
+                None => return Err(std::io::Error::other("expert read: no completion queue entry")),
+            }
+        }
+
+        // group the 3 reads per expert back into one ExpertSlot each, in `eids` order. A
+        // decode error here (bad `.qs`/FP8 format) is a real data problem, not a transient I/O
+        // one, so retrying via `sequential_fallback` (as `finish_loading` does on any error
+        // from this function) wouldn't help — same bytes, same format problem — but folding it
+        // into the same I/O-error path here is simpler than threading a second error type
+        // through, and `finish_loading`'s fallback fails the same way through `qt_load`
+        // instead: same end result either way.
+        let mut out = Vec::with_capacity(eids.len());
+        for (chunk, &eid) in eids.iter().enumerate() {
             let base = chunk * 3;
-            let gate = qt_from_raw(&bufs[base], &reqs[base], bits)?;
-            let up = qt_from_raw(&bufs[base + 1], &reqs[base + 1], bits)?;
-            let down = qt_from_raw(&bufs[base + 2], &reqs[base + 2], bits)?;
+            let decode = |buf: &[u8], req: &Req| qt_from_raw(buf, req, bits).map_err(|e| std::io::Error::other(e.to_string()));
+            let gate = decode(&bufs[base], &reqs[base])?;
+            let up = decode(&bufs[base + 1], &reqs[base + 1])?;
+            let down = decode(&bufs[base + 2], &reqs[base + 2])?;
             out.push(ExpertSlot { eid, gate, up, down, used });
         }
         Ok(out)
-    }
-
-    /// Submits `reqs` on `ring` in chunks no larger than its fixed capacity, fully draining
-    /// each chunk's completions (and checking every read's byte count) before submitting the
-    /// next — so the ring is always back to empty when this returns, ready for the next call.
-    fn submit_chunked(ring: &mut Ring, reqs: &[Req], bufs: &mut [Vec<u8>]) -> Result<(), std::io::Error> {
-        for start in (0..reqs.len()).step_by(ring.capacity) {
-            let end = (start + ring.capacity).min(reqs.len());
-            let chunk = &reqs[start..end];
-            let chunk_bufs = &mut bufs[start..end];
-
-            {
-                let mut sq = ring.io.submission();
-                for (local, req) in chunk.iter().enumerate() {
-                    let buf = &mut chunk_bufs[local];
-                    let read_e = opcode::Read::new(types::Fd(req.loc.fd), buf.as_mut_ptr(), buf.len() as u32).offset(req.loc.offset).build().user_data(local as u64);
-                    // Safety: `buf` stays alive (owned by `bufs`, held by the caller) until
-                    // this chunk's completions are fully reaped below, satisfying the SQE's
-                    // lifetime requirement; `push` never fails since the chunk never exceeds
-                    // the ring's own capacity.
-                    unsafe {
-                        sq.push(&read_e).expect("chunk sized to ring capacity");
-                    }
-                }
-            }
-            ring.io.submit_and_wait(chunk.len())?;
-
-            let mut results = vec![None; chunk.len()];
-            for cqe in ring.io.completion() {
-                results[cqe.user_data() as usize] = Some(cqe.result());
-            }
-            for (local, req) in chunk.iter().enumerate() {
-                match results[local] {
-                    Some(n) if n as u64 == req.loc.nbytes => {}
-                    Some(n) if n >= 0 => {
-                        let msg = format!("expert read: short read ({n}/{} bytes)", req.loc.nbytes);
-                        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
-                    }
-                    Some(n) => return Err(std::io::Error::from_raw_os_error(-n)),
-                    None => return Err(std::io::Error::other("expert read: no completion queue entry")),
-                }
-            }
-        }
-        Ok(())
     }
 
     fn qt_from_raw(raw: &[u8], req: &Req, bits: u8) -> Result<QT, ModelError> {
@@ -210,6 +241,21 @@ pub struct ExpertSlot {
     used: u64,
 }
 
+/// A batch of experts `ExpertCache::begin_loading` started resolving — opaque to callers other
+/// than "pass this to `finish_loading`". See that pair's doc for why this split exists.
+pub struct PendingExpertLoad(LoadKind);
+
+enum LoadKind {
+    /// Every requested id was already cached — nothing to wait for.
+    Nothing,
+    /// Loaded synchronously at `begin_loading` time already (non-Linux, or the ring was
+    /// unavailable/the batch didn't fit in one round) — `finish_loading` just inserts these.
+    Sync(Vec<ExpertSlot>),
+    /// Submitted to the `io_uring` ring but not yet awaited.
+    #[cfg(target_os = "linux")]
+    Async(uring_load::Pending),
+}
+
 /// A fixed-capacity, per-layer LRU cache of `ExpertSlot`s. Real usage holds one of these per
 /// MoE layer (`layers_forward`), living for the whole generation session — which matters here
 /// specifically because the `io_uring` ring (Linux) is created once in `new` and reused for
@@ -220,12 +266,13 @@ pub struct ExpertCache {
     clock: u64,
     pub hits: u64,
     pub misses: u64,
-    /// Cumulative wall time spent actually loading missed experts from disk (the
-    /// `load_batch`/`sequential_fallback` call in `ensure_loaded`, not `get_or_load` — that
-    /// path is only used directly by tests/benches). A diagnostic counter, not used by any
-    /// dispatch logic — see `ExpertCaches::io_time` in `generate.rs` for why it exists: telling
-    /// apart "still I/O-bound" from "already compute-bound" before investing in either kind of
-    /// further optimization.
+    /// Cumulative wall time spent actually loading missed experts from disk — the synchronous
+    /// load in `begin_loading` (non-Linux, or no ring) plus the wait in `finish_loading`
+    /// (`io_uring`'s `complete_batch`), not `get_or_load` — that path is only used directly by
+    /// tests/benches. A diagnostic counter, not used by any dispatch logic — see
+    /// `ExpertCaches::hit_miss_totals` in `generate.rs` for why it exists: telling apart "still
+    /// I/O-bound" from "already compute-bound" before investing in either kind of further
+    /// optimization.
     pub load_nanos: u64,
     #[cfg(target_os = "linux")]
     ring: Option<uring_load::Ring>,
@@ -302,6 +349,19 @@ impl ExpertCache {
     /// wants one `&ExpertSlot` at a time anyway, and returning several `&mut self`-derived
     /// references from one call would fight the borrow checker for no real benefit.
     pub fn ensure_loaded(&mut self, shards: &Shards, cfg: &Cfg, layer: usize, eids: &[usize], bits: u8) -> Result<(), ModelError> {
+        let pending = self.begin_loading(shards, cfg, layer, eids, bits)?;
+        self.finish_loading(pending, shards, cfg, layer, bits)
+    }
+
+    /// Begins resolving every expert in `eids`: hits are touched immediately (same LRU
+    /// bookkeeping `ensure_loaded` always did); misses are either fully loaded synchronously
+    /// right now (non-Linux, or the `io_uring` ring unavailable/the batch too big for one
+    /// submission round) or SUBMITTED to the ring WITHOUT waiting for completion. Splitting
+    /// this out from `ensure_loaded` lets a caller (`moe.rs`) do independent work — the shared
+    /// expert's matmuls don't depend on which ROUTED experts are loaded — while the disk read
+    /// is in flight, instead of blocking on it up front. Must be paired with `finish_loading`
+    /// on the same `eids`/`bits` before looking any of them up via `get`.
+    pub fn begin_loading(&mut self, shards: &Shards, cfg: &Cfg, layer: usize, eids: &[usize], bits: u8) -> Result<PendingExpertLoad, ModelError> {
         self.clock += 1;
         let mut misses = Vec::new();
         for &eid in eids {
@@ -313,16 +373,42 @@ impl ExpertCache {
             }
         }
         if misses.is_empty() {
-            return Ok(());
+            return Ok(PendingExpertLoad(LoadKind::Nothing));
         }
         self.misses += misses.len() as u64;
 
-        let load_t = std::time::Instant::now();
         #[cfg(target_os = "linux")]
-        let loaded = uring_load::load_batch(&mut self.ring, shards, cfg, layer, &misses, bits, self.clock)?;
-        #[cfg(not(target_os = "linux"))]
+        if let Some(pending) = uring_load::submit_batch(&mut self.ring, shards, cfg, layer, &misses)? {
+            return Ok(PendingExpertLoad(LoadKind::Async(pending)));
+        }
+
+        let load_t = std::time::Instant::now();
         let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock)?;
         self.load_nanos += load_t.elapsed().as_nanos() as u64;
+        Ok(PendingExpertLoad(LoadKind::Sync(loaded)))
+    }
+
+    /// Waits for (if `begin_loading` submitted an async read) and inserts every expert that
+    /// call started resolving. `shards`/`cfg`/`layer`/`bits` must match the `begin_loading`
+    /// call this `pending` came from — only needed for the rare fallback path (an `io_uring`
+    /// completion error retries as a plain synchronous read of the same misses).
+    pub fn finish_loading(&mut self, pending: PendingExpertLoad, shards: &Shards, cfg: &Cfg, layer: usize, bits: u8) -> Result<(), ModelError> {
+        let loaded = match pending.0 {
+            LoadKind::Nothing => return Ok(()),
+            LoadKind::Sync(v) => v,
+            #[cfg(target_os = "linux")]
+            LoadKind::Async(p) => {
+                let eids_for_fallback = p.eids_for_fallback();
+                let load_t = std::time::Instant::now();
+                let ring = self.ring.as_mut().expect("Async pending implies the ring existed when begin_loading submitted it");
+                let result = uring_load::complete_batch(ring, p, bits, self.clock);
+                self.load_nanos += load_t.elapsed().as_nanos() as u64;
+                match result {
+                    Ok(v) => v,
+                    Err(_) => sequential_fallback(shards, cfg, layer, &eids_for_fallback, bits, self.clock)?,
+                }
+            }
+        };
 
         for slot in loaded {
             self.insert(slot);
@@ -352,8 +438,8 @@ impl ExpertCache {
     }
 }
 
-/// Used both as `ensure_loaded`'s non-Linux fallback and as `uring_load::load_batch`'s
-/// fallback when the ring itself can't be created.
+/// Used as `begin_loading`'s non-Linux (or ring-unavailable) synchronous path, and as
+/// `finish_loading`'s fallback when `uring_load::complete_batch` reports an I/O error.
 fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64) -> Result<Vec<ExpertSlot>, ModelError> {
     misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used)).collect()
 }
@@ -538,6 +624,45 @@ mod tests {
             assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up_proj");
             assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down_proj");
         }
+    }
+
+    /// `begin_loading` + `finish_loading` (the split that lets `moe.rs` overlap a chunk's disk
+    /// read with independent compute) must produce the exact same cache contents, hit/miss
+    /// counts, and LRU eviction behavior as `ensure_loaded` — which is now defined as exactly
+    /// that pair called back to back, but this pins the contract explicitly rather than relying
+    /// on that implementation detail.
+    #[test]
+    fn begin_then_finish_loading_matches_ensure_loaded() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_split_load", 5, 6, 8);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(5, 6, 8);
+        let eids: Vec<usize> = (0..5).collect();
+
+        let mut split_cache = ExpertCache::new(8);
+        let pending = split_cache.begin_loading(&shards, &cfg, 0, &eids, 32).unwrap();
+        // the whole point: real "independent work" could happen here, between begin and finish.
+        split_cache.finish_loading(pending, &shards, &cfg, 0, 32).unwrap();
+
+        let mut plain_cache = ExpertCache::new(8);
+        plain_cache.ensure_loaded(&shards, &cfg, 0, &eids, 32).unwrap();
+
+        assert_eq!(split_cache.hits, plain_cache.hits);
+        assert_eq!(split_cache.misses, plain_cache.misses);
+        assert_eq!(split_cache.len(), plain_cache.len());
+        for &eid in &eids {
+            let a = split_cache.get(eid).unwrap();
+            let b = plain_cache.get(eid).unwrap();
+            assert_eq!(qt_values(&a.gate), qt_values(&b.gate), "expert {eid} gate_proj");
+            assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up_proj");
+            assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down_proj");
+        }
+
+        // a batch that's entirely cache hits must short-circuit through `LoadKind::Nothing`
+        // cleanly, not touch disk or misscount.
+        let pending2 = split_cache.begin_loading(&shards, &cfg, 0, &eids, 32).unwrap();
+        split_cache.finish_loading(pending2, &shards, &cfg, 0, 32).unwrap();
+        assert_eq!(split_cache.hits, plain_cache.hits + eids.len() as u64);
+        assert_eq!(split_cache.misses, plain_cache.misses);
     }
 
     #[test]

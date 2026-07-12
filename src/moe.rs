@@ -151,46 +151,24 @@ pub fn moe(
     // one `ensure_loaded(uniq)` call.
     let uniq = unique_experts(&routing);
     let chunk_size = cache.capacity().max(1);
-    for chunk in uniq.chunks(chunk_size) {
-        cache.ensure_loaded(shards, cfg, layer, chunk, ebits)?;
+    let mut chunks = uniq.chunks(chunk_size);
 
-        for &eid in chunk {
-            let rows: Vec<(usize, f32)> = routing
-                .choices
-                .iter()
-                .enumerate()
-                .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
-                .collect();
-            if rows.is_empty() {
-                continue;
-            }
-            let nr = rows.len();
+    // Overlap the FIRST chunk's disk read with the shared expert's compute: the shared expert
+    // is always active regardless of routing, so its matmuls don't depend on which ROUTED
+    // experts end up loaded — `begin_loading` submits that chunk's `io_uring` reads without
+    // waiting, we compute the shared expert's VALUE while that read is in flight, and only
+    // then call `finish_loading` to wait for it. This changes nothing about the RESULT (the
+    // shared expert's contribution is still added to `out` in the same relative position,
+    // after every routed expert's — see below), only when its otherwise-idle wait time gets
+    // spent on independent CPU work instead. Later chunks (rare — only when a batch's unique
+    // expert count exceeds `cache.capacity()`) don't get this treatment: there's no more
+    // independent work left to overlap them with once the shared expert is already computed.
+    let first_chunk = chunks.next();
+    let pending = match first_chunk {
+        Some(chunk) => Some(cache.begin_loading(shards, cfg, layer, chunk, ebits)?),
+        None => None,
+    };
 
-            let mut xg = vec![0f32; nr * d];
-            for (r, &(si, _)) in rows.iter().enumerate() {
-                xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
-            }
-
-            let slot = cache.get(eid).expect("just ensured loaded above");
-            let mut gg = vec![0f32; nr * i];
-            let mut uu = vec![0f32; nr * i];
-            matmul_qt(&mut gg, &xg, &slot.gate, nr);
-            matmul_qt(&mut uu, &xg, &slot.up, nr);
-            for z in 0..nr * i {
-                gg[z] = siluf(gg[z]) * uu[z];
-            }
-            let mut hh = vec![0f32; nr * d];
-            matmul_qt(&mut hh, &gg, &slot.down, nr);
-
-            for (r, &(si, wgt)) in rows.iter().enumerate() {
-                for dd in 0..d {
-                    out[si * d + dd] += wgt * hh[r * d + dd];
-                }
-            }
-        }
-    }
-
-    // shared expert: unweighted, one matmul over all S rows (always active, every token).
     let mut sg = vec![0f32; s * s_i];
     let mut su = vec![0f32; s * s_i];
     matmul_qt(&mut sg, x, &w.sh_gate, s);
@@ -200,11 +178,65 @@ pub fn moe(
     }
     let mut hh = vec![0f32; s * d];
     matmul_qt(&mut hh, &sg, &w.sh_down, s);
+
+    if let (Some(chunk), Some(pending)) = (first_chunk, pending) {
+        cache.finish_loading(pending, shards, cfg, layer, ebits)?;
+        apply_expert_chunk(cache, chunk, &routing, x, d, i, out);
+    }
+    for chunk in chunks {
+        cache.ensure_loaded(shards, cfg, layer, chunk, ebits)?;
+        apply_expert_chunk(cache, chunk, &routing, x, d, i, out);
+    }
+
+    // shared expert's contribution, added last — same relative accumulation order into `out`
+    // as before this overlap existed (every routed expert's contribution, then this one),
+    // even though its VALUE (`hh`) was computed earlier above.
     for z in 0..s * d {
         out[z] += hh[z];
     }
 
     Ok(())
+}
+
+/// Computes and accumulates every routed expert in `chunk`'s contribution into `out`. Every
+/// id in `chunk` must already be resident in `cache` (via `ensure_loaded`, or
+/// `begin_loading`+`finish_loading`) before calling this.
+#[allow(clippy::too_many_arguments)]
+fn apply_expert_chunk(cache: &ExpertCache, chunk: &[usize], routing: &Routing, x: &[f32], d: usize, i: usize, out: &mut [f32]) {
+    for &eid in chunk {
+        let rows: Vec<(usize, f32)> = routing
+            .choices
+            .iter()
+            .enumerate()
+            .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let nr = rows.len();
+
+        let mut xg = vec![0f32; nr * d];
+        for (r, &(si, _)) in rows.iter().enumerate() {
+            xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
+        }
+
+        let slot = cache.get(eid).expect("just ensured loaded above");
+        let mut gg = vec![0f32; nr * i];
+        let mut uu = vec![0f32; nr * i];
+        matmul_qt(&mut gg, &xg, &slot.gate, nr);
+        matmul_qt(&mut uu, &xg, &slot.up, nr);
+        for z in 0..nr * i {
+            gg[z] = siluf(gg[z]) * uu[z];
+        }
+        let mut hh = vec![0f32; nr * d];
+        matmul_qt(&mut hh, &gg, &slot.down, nr);
+
+        for (r, &(si, wgt)) in rows.iter().enumerate() {
+            for dd in 0..d {
+                out[si * d + dd] += wgt * hh[r * d + dd];
+            }
+        }
+    }
 }
 
 #[cfg(test)]
