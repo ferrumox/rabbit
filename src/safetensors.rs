@@ -32,6 +32,14 @@ impl DType {
             other => Err(SafetensorsError::UnknownDtype(other.to_string())),
         }
     }
+
+    fn byte_size(self) -> usize {
+        match self {
+            DType::F32 => 4,
+            DType::Bf16 | DType::F16 => 2,
+            DType::U8 => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +305,37 @@ impl Shards {
         }
         Ok(out)
     }
+
+    /// Raw location of a tensor — file descriptor + absolute byte range + on-disk dtype —
+    /// for a caller doing its own I/O (Fase 8's io_uring batch expert loader) instead of
+    /// going through the synchronous `read_at` calls `read_f32`/`read_raw` use internally.
+    pub fn tensor_location(&self, name: &str) -> Option<TensorLocation> {
+        let t = self.find(name)?;
+        Some(TensorLocation {
+            fd: self.files[t.file_index].as_raw_fd(),
+            offset: t.offset,
+            nbytes: t.nbytes,
+            dtype: t.dtype,
+        })
+    }
+
+    /// Decodes bytes read by external I/O (matching a `TensorLocation`) into `f32`s, using
+    /// the exact same dtype conversion `read_f32` uses — so a caller with its own I/O
+    /// mechanism still gets bf16/f16/f32 handled uniformly, not just f32.
+    pub fn decode_f32(raw: &[u8], dtype: DType) -> Vec<f32> {
+        let mut out = Vec::with_capacity(raw.len() / dtype.byte_size());
+        decode_floats(raw, dtype, &mut out);
+        out
+    }
+}
+
+/// File descriptor + absolute byte range + dtype for one tensor — see `Shards::tensor_location`.
+#[derive(Debug, Clone, Copy)]
+pub struct TensorLocation {
+    pub fd: std::os::unix::io::RawFd,
+    pub offset: u64,
+    pub nbytes: u64,
+    pub dtype: DType,
 }
 
 #[cfg(test)]
@@ -394,6 +433,32 @@ mod tests {
 
         let bf16 = shards.read_f32("bf16.weight", false).unwrap();
         assert_eq!(bf16, vec![1.5, 3.0]);
+    }
+
+    #[test]
+    fn tensor_location_plus_decode_f32_matches_read_f32() {
+        let dir = TempDir::new("rabbit_test_st_location");
+        let shard = build_safetensors(&[
+            ("dense.weight", "F32", vec![2, 3], f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            ("half.weight", "F16", vec![2], vec![0x00, 0x3C, 0x00, 0xC0]),
+        ]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        for name in ["dense.weight", "half.weight"] {
+            let loc = shards.tensor_location(name).unwrap();
+            let mut raw = vec![0u8; loc.nbytes as usize];
+            use std::os::unix::fs::FileExt;
+            let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(loc.fd) };
+            file.read_exact_at(&mut raw, loc.offset).unwrap();
+            std::mem::forget(file); // borrowed fd: must not close it on drop
+
+            let via_location = Shards::decode_f32(&raw, loc.dtype);
+            let via_read_f32 = shards.read_f32(name, false).unwrap();
+            assert_eq!(via_location, via_read_f32, "{name}");
+        }
+
+        assert!(shards.tensor_location("does.not.exist").is_none());
     }
 
     #[test]
