@@ -1,7 +1,10 @@
 //! Persistent expert-usage histogram (`.rabbit_usage`, colibrì's `.coli_usage` equivalent) —
 //! how many times each `(layer, expert)` pair got routed to, accumulated across process
 //! restarts. `generate.rs`'s `ExpertCaches::warm_start` reads this at startup to decide which
-//! experts are worth eagerly pinning; `save_usage` writes it back at turn/response boundaries.
+//! experts are worth PIN CANDIDATES (`expert_cache.rs`'s `ExpertCache::mark_pin_candidates`) —
+//! marked, not eagerly loaded; see that module's doc for why lazy/sticky promotion replaced
+//! colibrì's eager `pin_load` here. `save_usage` writes this file back at turn/response
+//! boundaries.
 //!
 //! Plain text, not a binary format like `kv_session.rs`: this file is small (at most
 //! `moe_layers * n_experts` sparse rows), written once per turn (not per token), and

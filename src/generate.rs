@@ -77,13 +77,16 @@ impl ExpertCaches {
 
     /// Reads `<model_dir>/.rabbit_usage` (if any), seeds every MoE layer's usage counters from
     /// it, and — if the persisted total selection count (`hist`, summed across ALL layers)
-    /// reaches `usage_cache::HIST_THRESHOLD` — eagerly pins each layer's top
-    /// `usage_cache::pin_budget(cache_capacity, confidence)` historically-hottest experts.
-    /// Colibrì's `usage_load` + `pin_load`, adapted to rabbit's count-based (not GB-based)
-    /// cache capacity. Every failure (missing/corrupt file, an individual expert's tensors
-    /// missing from `shards`) is logged to stderr and skipped — this never returns an error and
-    /// must never prevent a session from starting.
-    pub fn warm_start(&mut self, shards: &Shards, cfg: &Cfg, model_dir: &Path, cache_capacity: usize, ebits: u8) -> WarmStartStats {
+    /// reaches `usage_cache::HIST_THRESHOLD` — marks each layer's top
+    /// `usage_cache::pin_budget(cache_capacity, confidence)` historically-hottest experts as
+    /// pin CANDIDATES (`ExpertCache::mark_pin_candidates`). Nothing is loaded here: a real
+    /// measured comparison against the real checkpoint showed colibrì's eager `pin_load` design
+    /// (loading candidates synchronously right here) makes `--prompt`'s one-shot wall-clock
+    /// time WORSE, not better — see `expert_cache.rs`'s module doc for the full story. Instead
+    /// each candidate gets promoted into the pinned tier lazily, the first time this session
+    /// actually loads it. Never returns an error and must never prevent a session from starting
+    /// (a missing/corrupt usage file just means nothing gets marked).
+    pub fn warm_start(&mut self, model_dir: &Path, cache_capacity: usize) -> WarmStartStats {
         let loaded = usage_cache::load(&usage_cache::usage_path(model_dir));
         let hist: u64 = loaded.values().sum();
 
@@ -98,25 +101,21 @@ impl ExpertCaches {
         }
 
         if hist < usage_cache::HIST_THRESHOLD {
-            return WarmStartStats { hist, confidence: usage_cache::confidence(hist), pinned: 0 };
+            return WarmStartStats { hist, confidence: usage_cache::confidence(hist), pin_candidates: 0 };
         }
 
         let confidence = usage_cache::confidence(hist);
         let budget = usage_cache::pin_budget(cache_capacity, confidence);
-        let mut pinned = 0;
-        for (li, cache_opt) in self.0.iter_mut().enumerate() {
+        let mut pin_candidates = 0;
+        for cache_opt in self.0.iter_mut() {
             let Some(cache) = cache_opt else { continue };
             let mut top: Vec<(usize, u64)> = cache.usage_counts().collect();
             top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             top.truncate(budget);
-            for (eid, _) in top {
-                match cache.pin_expert(shards, cfg, li, eid, ebits) {
-                    Ok(()) => pinned += 1,
-                    Err(e) => eprintln!("usage cache: failed to pin layer {li} expert {eid}: {e:?}"),
-                }
-            }
+            pin_candidates += top.len();
+            cache.mark_pin_candidates(top.into_iter().map(|(eid, _)| eid));
         }
-        WarmStartStats { hist, confidence, pinned }
+        WarmStartStats { hist, confidence, pin_candidates }
     }
 
     /// Writes every MoE layer's current usage counters back to `<model_dir>/.rabbit_usage`,
@@ -132,12 +131,13 @@ impl ExpertCaches {
     }
 }
 
-/// Result of `ExpertCaches::warm_start` — how much history existed and how many experts ended
-/// up eagerly pinned, for the caller to log a one-line startup summary.
+/// Result of `ExpertCaches::warm_start` — how much history existed and how many experts got
+/// marked as pin candidates (not yet loaded — see `warm_start`'s doc), for the caller to log a
+/// one-line startup summary.
 pub struct WarmStartStats {
     pub hist: u64,
     pub confidence: f32,
-    pub pinned: usize,
+    pub pin_candidates: usize,
 }
 
 fn embed_tokens(model: &Model, ids: &[usize]) -> Vec<f32> {
@@ -950,50 +950,56 @@ mod tests {
         }
     }
 
-    // ---- ExpertCaches::warm_start / save_usage (Fase 13's persistent usage cache) ----
+    // ---- ExpertCaches::warm_start / save_usage (Fase 14's persistent usage cache) ----
 
     #[test]
-    fn warm_start_below_threshold_seeds_counters_but_does_not_pin() {
+    fn warm_start_below_threshold_seeds_counters_but_marks_no_pin_candidates() {
         let (fixture, _dm) = build_three_layer_fixture("rabbit_test_warm_start_below_threshold");
         let model = Model::load(&fixture.0, 32, 32).unwrap();
-        let shards = Shards::open(&fixture.0).unwrap();
         let dir = TempDir::new("rabbit_test_warm_start_below_threshold_file");
         let usage_path = crate::usage_cache::usage_path(&dir.0);
         // well under HIST_THRESHOLD (5000)
         crate::usage_cache::save(&usage_path, vec![(1usize, 0usize, 10u64), (1, 1, 5)].into_iter()).unwrap();
 
         let mut caches = ExpertCaches::new(&model, 8);
-        let stats = caches.warm_start(&shards, &model.cfg, &dir.0, 8, model.ebits);
+        let stats = caches.warm_start(&dir.0, 8);
 
         assert_eq!(stats.hist, 15);
-        assert_eq!(stats.pinned, 0, "must not auto-pin below the confidence threshold");
+        assert_eq!(stats.pin_candidates, 0, "must not mark pin candidates below the confidence threshold");
         assert!(!caches.0[1].as_ref().unwrap().is_pinned(0));
 
         let counts: std::collections::HashMap<usize, u64> = caches.0[1].as_ref().unwrap().usage_counts().collect();
-        assert_eq!(counts.get(&0), Some(&10), "counters must still be seeded even without pinning");
+        assert_eq!(counts.get(&0), Some(&10), "counters must still be seeded even without marking candidates");
         assert_eq!(counts.get(&1), Some(&5));
     }
 
     #[test]
-    fn warm_start_above_threshold_pins_top_experts_per_layer_and_matches_pin_budget() {
+    fn warm_start_above_threshold_marks_candidates_matching_budget_which_promote_on_first_load() {
         let (fixture, _dm) = build_three_layer_fixture("rabbit_test_warm_start_above_threshold");
         let model = Model::load(&fixture.0, 32, 32).unwrap();
         let shards = Shards::open(&fixture.0).unwrap();
         let dir = TempDir::new("rabbit_test_warm_start_above_threshold_file");
         let usage_path = crate::usage_cache::usage_path(&dir.0);
         // layer 1 (MoE + DSA-full): two nonzero entries, totalling 200_000 -> confidence 1.0.
-        // layer 2 (MoE + DSA-shared) gets none, so it must end up with zero pinned.
+        // layer 2 (MoE + DSA-shared) gets none, so it must end up with zero candidates.
         crate::usage_cache::save(&usage_path, vec![(1usize, 0usize, 150_000u64), (1, 1, 50_000)].into_iter()).unwrap();
 
         let cache_capacity = 8;
         let mut caches = ExpertCaches::new(&model, cache_capacity);
-        let stats = caches.warm_start(&shards, &model.cfg, &dir.0, cache_capacity, model.ebits);
+        let stats = caches.warm_start(&dir.0, cache_capacity);
 
         assert_eq!(stats.hist, 200_000);
         assert!((stats.confidence - 1.0).abs() < 1e-6);
-        // budget = floor(8 * 0.5 * 1.0) = 4, but only 2 nonzero entries exist for layer 1 -> 2 pinned.
-        assert_eq!(stats.pinned, 2);
+        // budget = floor(8 * 0.5 * 1.0) = 4, but only 2 nonzero entries exist for layer 1 -> 2 candidates.
+        assert_eq!(stats.pin_candidates, 2);
 
+        // lazy: marking candidates must not load anything.
+        assert!(!caches.0[1].as_ref().unwrap().is_pinned(0));
+        assert_eq!(caches.0[1].as_ref().unwrap().pinned_len(), 0);
+
+        // the first real load of each marked candidate promotes it.
+        caches.0[1].as_mut().unwrap().get_or_load(&shards, &model.cfg, 1, 0, model.ebits).unwrap();
+        caches.0[1].as_mut().unwrap().get_or_load(&shards, &model.cfg, 1, 1, model.ebits).unwrap();
         let layer1 = caches.0[1].as_ref().unwrap();
         assert!(layer1.is_pinned(0));
         assert!(layer1.is_pinned(1));
@@ -1007,7 +1013,6 @@ mod tests {
     fn save_usage_then_warm_start_round_trips_live_counters_across_a_fresh_caches_instance() {
         let (fixture, _dm) = build_three_layer_fixture("rabbit_test_usage_roundtrip");
         let model = Model::load(&fixture.0, 32, 32).unwrap();
-        let shards = Shards::open(&fixture.0).unwrap();
         let dir = TempDir::new("rabbit_test_usage_roundtrip_file");
 
         let mut caches_a = ExpertCaches::new(&model, 8);
@@ -1017,7 +1022,7 @@ mod tests {
         caches_a.save_usage(&dir.0).unwrap();
 
         let mut caches_b = ExpertCaches::new(&model, 8);
-        let stats = caches_b.warm_start(&shards, &model.cfg, &dir.0, 8, model.ebits);
+        let stats = caches_b.warm_start(&dir.0, 8);
         assert_eq!(stats.hist, 3);
 
         let counts: std::collections::HashMap<usize, u64> = caches_b.0[1].as_ref().unwrap().usage_counts().collect();

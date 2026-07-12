@@ -51,9 +51,12 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
     let mut caches = ExpertCaches::new(&model, args.cache_capacity);
     let usage_cache_enabled = !args.no_usage_cache;
     if usage_cache_enabled {
-        let stats = caches.warm_start(&shards, &model.cfg, &args.model_dir, args.cache_capacity, model.ebits);
-        if stats.pinned > 0 {
-            eprintln!("usage cache: {} historical selections, confidence {:.2}, {} experts pinned", stats.hist, stats.confidence, stats.pinned);
+        let stats = caches.warm_start(&args.model_dir, args.cache_capacity);
+        if stats.pin_candidates > 0 {
+            eprintln!(
+                "usage cache: {} historical selections, confidence {:.2}, {} pin candidates marked",
+                stats.hist, stats.confidence, stats.pin_candidates
+            );
         } else if stats.hist > 0 {
             eprintln!("usage cache: {} historical selections (below auto-pin threshold)", stats.hist);
         }

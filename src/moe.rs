@@ -555,9 +555,10 @@ mod tests {
         moe(&cfg, &w, &mut cache_unpinned, &shards, 0, 32, &x, s, &mut out_unpinned).unwrap();
 
         let mut cache_pinned = ExpertCache::new(n_experts);
-        cache_pinned.pin_expert(&shards, &cfg, 0, 0, 32).unwrap(); // pre-pin one expert before moe() ever sees it
+        cache_pinned.mark_pin_candidates(std::iter::once(0usize)); // lazy: promotes on moe()'s own first load of it
         let mut out_pinned = vec![0f32; s * hidden];
         moe(&cfg, &w, &mut cache_pinned, &shards, 0, 32, &x, s, &mut out_pinned).unwrap();
+        assert!(cache_pinned.is_pinned(0), "topk==n_experts guarantees moe() touched expert 0, so it must have been promoted");
 
         for (a, b) in out_unpinned.iter().zip(&out_pinned) {
             assert!((a - b).abs() < 1e-6, "{a} vs {b}");
