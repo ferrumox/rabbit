@@ -220,6 +220,13 @@ pub struct ExpertCache {
     clock: u64,
     pub hits: u64,
     pub misses: u64,
+    /// Cumulative wall time spent actually loading missed experts from disk (the
+    /// `load_batch`/`sequential_fallback` call in `ensure_loaded`, not `get_or_load` — that
+    /// path is only used directly by tests/benches). A diagnostic counter, not used by any
+    /// dispatch logic — see `ExpertCaches::io_time` in `generate.rs` for why it exists: telling
+    /// apart "still I/O-bound" from "already compute-bound" before investing in either kind of
+    /// further optimization.
+    pub load_nanos: u64,
     #[cfg(target_os = "linux")]
     ring: Option<uring_load::Ring>,
 }
@@ -241,6 +248,7 @@ impl ExpertCache {
             clock: 0,
             hits: 0,
             misses: 0,
+            load_nanos: 0,
             #[cfg(target_os = "linux")]
             ring: uring_load::new_ring(capacity),
         }
@@ -309,10 +317,12 @@ impl ExpertCache {
         }
         self.misses += misses.len() as u64;
 
+        let load_t = std::time::Instant::now();
         #[cfg(target_os = "linux")]
         let loaded = uring_load::load_batch(&mut self.ring, shards, cfg, layer, &misses, bits, self.clock)?;
         #[cfg(not(target_os = "linux"))]
         let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock)?;
+        self.load_nanos += load_t.elapsed().as_nanos() as u64;
 
         for slot in loaded {
             self.insert(slot);

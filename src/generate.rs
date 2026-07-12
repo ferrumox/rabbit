@@ -51,11 +51,12 @@ impl ExpertCaches {
         ExpertCaches(v)
     }
 
-    /// Summed `hits`/`misses` across every MoE layer's cache — a coarse signal for whether
-    /// generation time is still dominated by disk loads (misses climbing every step) or has
-    /// become compute-bound (hits dominating, misses flat).
-    pub fn hit_miss_totals(&self) -> (u64, u64) {
-        self.0.iter().flatten().fold((0, 0), |(h, m), c| (h + c.hits, m + c.misses))
+    /// Summed `hits`/`misses`/`load_nanos` across every MoE layer's cache — a coarse signal
+    /// for whether generation time is still dominated by disk loads (misses climbing, I/O time
+    /// a large share of the step) or has become compute-bound (hits dominating, I/O time small
+    /// relative to the step's wall time).
+    pub fn hit_miss_totals(&self) -> (u64, u64, u64) {
+        self.0.iter().flatten().fold((0, 0, 0), |(h, m, n), c| (h + c.hits, m + c.misses, n + c.load_nanos))
     }
 }
 

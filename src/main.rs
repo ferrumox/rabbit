@@ -98,8 +98,12 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("prefill ({} tokens)...", prompt_ids.len());
     let mut step_t = std::time::Instant::now();
     let mut logits = generate::step(&model, &shards, &mut caches, &mut kv, &prompt_ids, 0)?;
-    let (h, m) = caches.hit_miss_totals();
-    eprintln!("  prefill done in {:.1}s (expert cache: {h} hits, {m} misses)", step_t.elapsed().as_secs_f32());
+    let (h, m, mut io_ns) = caches.hit_miss_totals();
+    eprintln!(
+        "  prefill done in {:.1}s (expert cache: {h} hits, {m} misses, {:.1}s in disk I/O)",
+        step_t.elapsed().as_secs_f32(),
+        io_ns as f64 / 1e9
+    );
     let mut pos = prompt_ids.len();
 
     let mut out_ids = Vec::with_capacity(args.max_tokens);
@@ -112,14 +116,18 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         if out_ids.len() >= args.max_tokens {
             break;
         }
+        let io_ns_before = io_ns;
         step_t = std::time::Instant::now();
         logits = generate::step(&model, &shards, &mut caches, &mut kv, &[next], pos)?;
-        let (h, m) = caches.hit_miss_totals();
+        let step_elapsed = step_t.elapsed().as_secs_f32();
+        let (h, m, io_ns_now) = caches.hit_miss_totals();
+        io_ns = io_ns_now;
         eprintln!(
-            "  token {}/{} in {:.1}s (expert cache: {h} hits, {m} misses)",
+            "  token {}/{} in {:.1}s ({:.1}s in disk I/O this step; expert cache totals: {h} hits, {m} misses)",
             out_ids.len() + 1,
             args.max_tokens,
-            step_t.elapsed().as_secs_f32()
+            step_elapsed,
+            (io_ns - io_ns_before) as f64 / 1e9
         );
         pos += 1;
     }
