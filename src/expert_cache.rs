@@ -1,14 +1,36 @@
 //! Port of `expert_load`/`ESlot`/the LRU cache slots inside `moe()` — a bounded, per-layer
 //! cache of loaded routed-expert weights.
 //!
+//! Fase 8 replaces the hot path — resolving a whole batch of cache-miss experts —  with one
+//! `io_uring` submission (Linux only) instead of `3 * misses.len()` sequential `pread` calls:
+//! "un puñado de syscalls en vez de N hilos bloqueados en pread" per the plan. This is a pure
+//! I/O-mechanism change, not a logic change — `ensure_loaded` and `get_or_load` decode and
+//! quantize the exact same bytes either way, so `moe.rs`'s output is unaffected; see
+//! `tests/teacher_forcing.rs`, still 32/32 after this phase.
+//!
+//! `benches/expert_load.rs` measures this on the dev machine and — honestly — `io_uring`
+//! comes out slower there, because the benchmark's fixture ends up page-cache-hot after the
+//! first read. `io_uring`'s win is collapsing blocking syscalls that would otherwise wait on
+//! real (cold) disk latency; there's nothing to collapse when the data is already in RAM. See
+//! that file's doc comment for the full explanation — it's real disk streaming (the actual
+//! 750GB/21,504-expert target) this phase is built for, which this dev box's page cache can't
+//! reproduce in a quick local benchmark.
+//!
 //! Scope cuts vs the original, all purely performance (never correctness) concerns, so the
 //! output of `moe.rs` is identical with or without them — any expert fetch, cache hit or disk
 //! load, returns the mathematically same weights:
 //! - No **pin slots** (`m->pin[layer]`): a deployment feature (`pin_load`/`repin_pass`) for
 //!   keeping specific hot experts permanently resident on real hardware, orthogonal to LRU.
-//! - No **block-of-64 batching / async readahead** (`expert_prefetch`'s `WILLNEED` hint): the
-//!   C bounds its per-block scratch array and overlaps disk reads with compute for the
-//!   21,504-expert real model; the tiny oracle's 8 experts/layer make this a no-op either way.
+//! - No **block-of-64 cap** on a single batch: the C bounds its per-round scratch array at 64
+//!   unique experts partly because a fixed-size C array needs a compile-time bound; `Vec` (and
+//!   one io_uring ring sized to the batch) doesn't need one. A batch this large only happens
+//!   with `S`x`topk` distinct experts in one forward, which stays well under 64 for realistic
+//!   batch sizes even on the real 21,504-expert model.
+//! - No **O_DIRECT**: colibri's own default is buffered reads too (`g_direct=0` — "su questo
+//!   host... il buffered liscio e' risultato il migliore"); O_DIRECT needs page-aligned
+//!   buffers/offsets/lengths, which is real complexity for a benefit the original's own
+//!   measurements don't reliably show. The `io_uring` win here is purely about collapsing N
+//!   syscalls into ~1, which buffered reads already get.
 //! - No **`.qs` pre-quantized fast path**: same cut as `model.rs`'s `qt_load` — out of scope
 //!   for this whole port stage (see `rabbit-plan.md`).
 //! - No **persistent learning cache** (`.coli_usage`/`eusage`/`eheat`): explicitly out of
@@ -19,6 +41,137 @@ use crate::model::{ModelError, qt_load};
 use crate::quant::QT;
 use crate::safetensors::Shards;
 
+#[cfg(target_os = "linux")]
+mod uring_load {
+    use super::{Cfg, ExpertSlot, ModelError, QT};
+    use crate::safetensors::{SafetensorsError, Shards, TensorLocation};
+    use io_uring::{IoUring, opcode, types};
+
+    struct Req {
+        rows: usize,
+        cols: usize,
+        loc: TensorLocation,
+    }
+
+    /// A persistent `io_uring` instance, reused across every `load_batch` call for as long as
+    /// the owning `ExpertCache` lives. Creating a ring isn't free (`io_uring_setup` + mmap'ing
+    /// the shared SQ/CQ memory) — the first version of this phase created a fresh one per
+    /// call and the `cargo bench` numbers came out SLOWER than plain sequential `pread`,
+    /// entirely from that per-call setup cost swallowing the syscall-count savings. `capacity`
+    /// is fixed at creation (io_uring rings don't resize); `load_batch` submits in chunks when
+    /// a batch is larger than that.
+    pub(super) struct Ring {
+        io: IoUring,
+        capacity: usize,
+    }
+
+    impl Ring {
+        fn new(entries: usize) -> std::io::Result<Ring> {
+            let capacity = entries.max(1).next_power_of_two();
+            Ok(Ring { io: IoUring::new(capacity as u32)?, capacity })
+        }
+    }
+
+    /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity (3
+    /// tensors/expert). Returns `None` if `io_uring` isn't usable on this host (the
+    /// `io_uring_disabled` sysctl, a seccomp profile blocking the syscalls, ...) — every
+    /// `load_batch` call then falls back to sequential `pread`, same as a hard per-call
+    /// failure would.
+    pub(super) fn new_ring(cache_capacity: usize) -> Option<Ring> {
+        Ring::new(cache_capacity * 3).ok()
+    }
+
+    /// Loads every expert in `misses` (3 tensors each: gate/up/down) via `io_uring`,
+    /// submitted in as few rounds as `ring`'s fixed capacity allows. Falls back to the
+    /// sequential loader if `ring` is `None` (see `new_ring`) or a submission fails outright.
+    pub(super) fn load_batch(ring: &mut Option<Ring>, shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64) -> Result<Vec<ExpertSlot>, ModelError> {
+        let Some(r) = ring.as_mut() else {
+            return super::sequential_fallback(shards, cfg, layer, misses, bits, used);
+        };
+
+        let i = cfg.moe_inter as usize;
+        let d = cfg.hidden as usize;
+
+        let mut reqs = Vec::with_capacity(misses.len() * 3);
+        for &eid in misses {
+            let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
+            for (suf, rows, cols) in [("gate_proj", i, d), ("up_proj", i, d), ("down_proj", d, i)] {
+                let name = p(suf);
+                let loc = shards.tensor_location(&name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name)))?;
+                reqs.push(Req { rows, cols, loc });
+            }
+        }
+
+        let mut bufs: Vec<Vec<u8>> = reqs.iter().map(|req| vec![0u8; req.loc.nbytes as usize]).collect();
+
+        if submit_chunked(r, &reqs, &mut bufs).is_err() {
+            return super::sequential_fallback(shards, cfg, layer, misses, bits, used);
+        }
+
+        // group the 3 reads per expert back into one ExpertSlot each, in `misses` order.
+        let mut out = Vec::with_capacity(misses.len());
+        for (chunk, &eid) in misses.iter().enumerate() {
+            let base = chunk * 3;
+            let gate = qt_from_raw(&bufs[base], &reqs[base], bits);
+            let up = qt_from_raw(&bufs[base + 1], &reqs[base + 1], bits);
+            let down = qt_from_raw(&bufs[base + 2], &reqs[base + 2], bits);
+            out.push(ExpertSlot { eid, gate, up, down, used });
+        }
+        Ok(out)
+    }
+
+    /// Submits `reqs` on `ring` in chunks no larger than its fixed capacity, fully draining
+    /// each chunk's completions (and checking every read's byte count) before submitting the
+    /// next — so the ring is always back to empty when this returns, ready for the next call.
+    fn submit_chunked(ring: &mut Ring, reqs: &[Req], bufs: &mut [Vec<u8>]) -> Result<(), std::io::Error> {
+        for start in (0..reqs.len()).step_by(ring.capacity) {
+            let end = (start + ring.capacity).min(reqs.len());
+            let chunk = &reqs[start..end];
+            let chunk_bufs = &mut bufs[start..end];
+
+            {
+                let mut sq = ring.io.submission();
+                for (local, req) in chunk.iter().enumerate() {
+                    let buf = &mut chunk_bufs[local];
+                    let read_e = opcode::Read::new(types::Fd(req.loc.fd), buf.as_mut_ptr(), buf.len() as u32).offset(req.loc.offset).build().user_data(local as u64);
+                    // Safety: `buf` stays alive (owned by `bufs`, held by the caller) until
+                    // this chunk's completions are fully reaped below, satisfying the SQE's
+                    // lifetime requirement; `push` never fails since the chunk never exceeds
+                    // the ring's own capacity.
+                    unsafe {
+                        sq.push(&read_e).expect("chunk sized to ring capacity");
+                    }
+                }
+            }
+            ring.io.submit_and_wait(chunk.len())?;
+
+            let mut results = vec![None; chunk.len()];
+            for cqe in ring.io.completion() {
+                results[cqe.user_data() as usize] = Some(cqe.result());
+            }
+            for (local, req) in chunk.iter().enumerate() {
+                match results[local] {
+                    Some(n) if n as u64 == req.loc.nbytes => {}
+                    Some(n) if n >= 0 => {
+                        let msg = format!("expert read: short read ({n}/{} bytes)", req.loc.nbytes);
+                        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
+                    }
+                    Some(n) => return Err(std::io::Error::from_raw_os_error(-n)),
+                    None => return Err(std::io::Error::other("expert read: no completion queue entry")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn qt_from_raw(raw: &[u8], req: &Req, bits: u8) -> QT {
+        let w = Shards::decode_f32(raw, req.loc.dtype);
+        let mut t = QT::alloc(req.rows, req.cols, bits, false);
+        t.fill(&w);
+        t
+    }
+}
+
 pub struct ExpertSlot {
     pub eid: usize,
     pub gate: QT,
@@ -28,18 +181,30 @@ pub struct ExpertSlot {
 }
 
 /// A fixed-capacity, per-layer LRU cache of `ExpertSlot`s. Real usage holds one of these per
-/// MoE layer (`layers_forward`, a later phase); Fase 5 only needs the primitive.
+/// MoE layer (`layers_forward`), living for the whole generation session — which matters here
+/// specifically because the `io_uring` ring (Linux) is created once in `new` and reused for
+/// every `ensure_loaded` call over that lifetime; see `uring_load::Ring`'s doc for why.
 pub struct ExpertCache {
     capacity: usize,
     slots: Vec<ExpertSlot>,
     clock: u64,
     pub hits: u64,
     pub misses: u64,
+    #[cfg(target_os = "linux")]
+    ring: Option<uring_load::Ring>,
 }
 
 impl ExpertCache {
     pub fn new(capacity: usize) -> ExpertCache {
-        ExpertCache { capacity, slots: Vec::new(), clock: 0, hits: 0, misses: 0 }
+        ExpertCache {
+            capacity,
+            slots: Vec::new(),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+            #[cfg(target_os = "linux")]
+            ring: uring_load::new_ring(capacity),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -48,6 +213,14 @@ impl ExpertCache {
 
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// Drops every cached slot (next lookup for any id is a miss) without tearing down the
+    /// `io_uring` ring — for benchmarking/testing load performance repeatedly against the
+    /// same long-lived cache, which is the realistic shape (a fresh `ExpertCache` per
+    /// forward pass would pay ring setup cost every call; see `uring_load::Ring`'s doc).
+    pub fn clear(&mut self) {
+        self.slots.clear();
     }
 
     /// Returns the slot for `eid`, loading it from disk on a miss. On a miss at capacity,
@@ -71,9 +244,52 @@ impl ExpertCache {
 
         self.misses += 1;
         let fresh = load_expert(shards, cfg, layer, eid, bits, self.clock)?;
+        self.insert(fresh);
+        Ok(self.slots.iter().find(|s| s.eid == eid).unwrap())
+    }
+
+    /// Ensures every expert in `eids` is present in the cache — hits are just touched
+    /// (`used = clock`), misses are loaded via one batched `io_uring` submission (Linux) or
+    /// sequential `pread`s (elsewhere), then inserted with the same LRU eviction as
+    /// `get_or_load`. Look up results afterward with `get` — `moe.rs`'s per-row dispatch loop
+    /// wants one `&ExpertSlot` at a time anyway, and returning several `&mut self`-derived
+    /// references from one call would fight the borrow checker for no real benefit.
+    pub fn ensure_loaded(&mut self, shards: &Shards, cfg: &Cfg, layer: usize, eids: &[usize], bits: u8) -> Result<(), ModelError> {
+        self.clock += 1;
+        let mut misses = Vec::new();
+        for &eid in eids {
+            if let Some(pos) = self.slots.iter().position(|s| s.eid == eid) {
+                self.hits += 1;
+                self.slots[pos].used = self.clock;
+            } else if !misses.contains(&eid) {
+                misses.push(eid);
+            }
+        }
+        if misses.is_empty() {
+            return Ok(());
+        }
+        self.misses += misses.len() as u64;
+
+        #[cfg(target_os = "linux")]
+        let loaded = uring_load::load_batch(&mut self.ring, shards, cfg, layer, &misses, bits, self.clock)?;
+        #[cfg(not(target_os = "linux"))]
+        let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock)?;
+
+        for slot in loaded {
+            self.insert(slot);
+        }
+        Ok(())
+    }
+
+    /// Looks up an already-cached slot without touching LRU state or loading anything —
+    /// pairs with `ensure_loaded`, which the caller runs first for a whole batch.
+    pub fn get(&self, eid: usize) -> Option<&ExpertSlot> {
+        self.slots.iter().find(|s| s.eid == eid)
+    }
+
+    fn insert(&mut self, slot: ExpertSlot) {
         if self.slots.len() < self.capacity {
-            self.slots.push(fresh);
-            Ok(self.slots.last().unwrap())
+            self.slots.push(slot);
         } else {
             let lru = self
                 .slots
@@ -82,10 +298,15 @@ impl ExpertCache {
                 .min_by_key(|(_, s)| s.used)
                 .map(|(i, _)| i)
                 .expect("capacity > 0 implies at least one slot once full");
-            self.slots[lru] = fresh;
-            Ok(&self.slots[lru])
+            self.slots[lru] = slot;
         }
     }
+}
+
+/// Used both as `ensure_loaded`'s non-Linux fallback and as `uring_load::load_batch`'s
+/// fallback when the ring itself can't be created.
+fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64) -> Result<Vec<ExpertSlot>, ModelError> {
+    misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used)).collect()
 }
 
 fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, used: u64) -> Result<ExpertSlot, ModelError> {
@@ -237,5 +458,74 @@ mod tests {
         let misses_before = cache.misses;
         cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
         assert_eq!(cache.misses, misses_before + 1);
+    }
+
+    fn qt_values(t: &QT) -> Vec<f32> {
+        (0..t.rows).flat_map(|r| t.row_f32(r)).collect()
+    }
+
+    /// The whole point of Fase 8: `ensure_loaded` (batched `io_uring`, Linux) and
+    /// `get_or_load` (sequential `pread`) must decode the exact same bytes — same dequantized
+    /// weight values, not just matching shapes — for every expert in a batch.
+    #[test]
+    fn ensure_loaded_matches_sequential_get_or_load_values() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_batch_values", 5, 6, 8);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(5, 6, 8);
+        let eids: Vec<usize> = (0..5).collect();
+
+        let mut batch_cache = ExpertCache::new(8);
+        batch_cache.ensure_loaded(&shards, &cfg, 0, &eids, 32).unwrap();
+
+        let mut sequential_cache = ExpertCache::new(8);
+        for &eid in &eids {
+            sequential_cache.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
+        }
+
+        for &eid in &eids {
+            let a = batch_cache.get(eid).unwrap();
+            let b = sequential_cache.get(eid).unwrap();
+            assert_eq!(qt_values(&a.gate), qt_values(&b.gate), "expert {eid} gate_proj");
+            assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up_proj");
+            assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down_proj");
+        }
+    }
+
+    #[test]
+    fn ensure_loaded_counts_hits_and_misses_and_dedupes_repeated_ids() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_batch_counts", 3, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(3, 4, 6);
+        let mut cache = ExpertCache::new(8);
+
+        // duplicate id 0 within the same (empty-cache) batch must still count as ONE miss,
+        // not two — moe.rs's own batch-union step already dedupes before calling this, so
+        // this is a defensive guarantee on the API itself, not something real callers hit.
+        cache.ensure_loaded(&shards, &cfg, 0, &[0, 1, 0], 32).unwrap();
+        assert_eq!(cache.misses, 2);
+        assert_eq!(cache.hits, 0); // nothing was cached yet when this batch started
+        assert_eq!(cache.len(), 2);
+
+        cache.ensure_loaded(&shards, &cfg, 0, &[0, 1, 2], 32).unwrap();
+        assert_eq!(cache.misses, 3); // 2 was the only new one
+        assert_eq!(cache.hits, 2); // 0 and 1 from the batch above, hit again
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn ensure_loaded_evicts_lru_same_as_get_or_load() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_batch_lru", 4, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(4, 4, 6);
+        let mut cache = ExpertCache::new(2);
+
+        cache.ensure_loaded(&shards, &cfg, 0, &[0, 1], 32).unwrap(); // slots=[0,1]
+        cache.get(0).unwrap(); // touch is via ensure_loaded's hit path, not this lookup
+        cache.ensure_loaded(&shards, &cfg, 0, &[0], 32).unwrap(); // hit -> 0 touched last
+        cache.ensure_loaded(&shards, &cfg, 0, &[2], 32).unwrap(); // miss at capacity -> evict 1
+
+        assert!(cache.get(0).is_some());
+        assert!(cache.get(2).is_some());
+        assert!(cache.get(1).is_none(), "expert 1 should have been evicted (least recently used)");
     }
 }

@@ -140,7 +140,14 @@ pub fn moe(
         *v = 0.0;
     }
 
-    for eid in unique_experts(&routing) {
+    // Fase 8: resolve the WHOLE batch of cache misses in one `ensure_loaded` call — on Linux
+    // that's one `io_uring` submission for every miss expert's 3 tensors, instead of the
+    // `get_or_load` loop's `pread`-per-tensor, per-expert. Everything below reads back via
+    // `cache.get`, which never touches disk (every id here is now cached, hit or miss alike).
+    let uniq = unique_experts(&routing);
+    cache.ensure_loaded(shards, cfg, layer, &uniq, ebits)?;
+
+    for eid in uniq {
         let rows: Vec<(usize, f32)> = routing
             .choices
             .iter()
@@ -157,7 +164,7 @@ pub fn moe(
             xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
         }
 
-        let slot = cache.get_or_load(shards, cfg, layer, eid, ebits)?;
+        let slot = cache.get(eid).expect("just ensured loaded above");
         let mut gg = vec![0f32; nr * i];
         let mut uu = vec![0f32; nr * i];
         matmul_qt(&mut gg, &xg, &slot.gate, nr);
