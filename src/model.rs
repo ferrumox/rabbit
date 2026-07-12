@@ -4,15 +4,15 @@
 //! stage only reaches expert *offsets* (Fase 5's `expert_load`/`expert_cache.rs` reads them on
 //! demand from disk), matching the streaming architecture's whole reason to exist.
 //!
-//! Scope cut vs `qt_from_disk`: the original also has a fast path for tensors pre-quantized
-//! by `convert_fp8_to_int4.py` (a `name.qs` sibling holding ready-packed int8/int4/int2 +
-//! scale, read raw with no runtime requantization). That converter is out of scope for this
-//! whole port stage (see `rabbit-plan.md`), so every tensor here always takes the "plain f32
-//! tensor -> quantize at load time" branch — which is also the only branch the tiny oracle
-//! (plain `safetensors`, no `.qs` siblings) ever exercises.
+//! `qt_load` mirrors `qt_from_disk`'s fast path: if `{name}.qs` exists, `name` already holds
+//! our own packed int8/int4/int2 bytes (written by an external converter — `tools/convert.rs`,
+//! or the community's pre-converted checkpoints for colibri itself) and `.qs` holds the
+//! per-row F32 scale, so the tensor is wrapped via `QT::from_packed` with no quantization
+//! work at load time. Otherwise it falls back to the plain path (read as f32/bf16/f16/FP8,
+//! quantize at load) — the only branch the tiny oracle (no `.qs` siblings) ever exercises.
 
 use crate::config::{Cfg, ConfigError};
-use crate::quant::QT;
+use crate::quant::{PackedFormatError, QT};
 use crate::safetensors::{SafetensorsError, Shards};
 use std::fmt;
 use std::path::Path;
@@ -87,6 +87,7 @@ pub enum ModelError {
     Config(ConfigError),
     Safetensors(SafetensorsError),
     ShapeMismatch { name: String, expected: usize, got: usize },
+    PackedFormat { name: String, source: PackedFormatError },
 }
 
 impl fmt::Display for ModelError {
@@ -97,6 +98,7 @@ impl fmt::Display for ModelError {
             ModelError::ShapeMismatch { name, expected, got } => {
                 write!(f, "{name}: expected {expected} elements, got {got}")
             }
+            ModelError::PackedFormat { name, source } => write!(f, "{name}.qs: {source}"),
         }
     }
 }
@@ -120,8 +122,16 @@ fn ld(shards: &Shards, name: &str) -> Result<Vec<f32>, ModelError> {
 }
 
 /// `pub(crate)`: `expert_cache.rs` reuses this to load a routed expert's gate/up/down tensors
-/// the same way every other dense-resident tensor is loaded (see the module doc's scope cut).
+/// the same way every other dense-resident tensor is loaded.
 pub(crate) fn qt_load(shards: &Shards, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
+    let qs_name = format!("{name}.qs");
+    if shards.has(&qs_name) {
+        let data = shards.read_raw(name, false)?;
+        let scale = shards.read_f32(&qs_name, false)?;
+        return QT::from_packed(rows, cols, bits, data, scale)
+            .map_err(|source| ModelError::PackedFormat { name: name.to_string(), source });
+    }
+
     let w = shards.read_f32(name, false)?;
     if w.len() != rows * cols {
         return Err(ModelError::ShapeMismatch { name: name.to_string(), expected: rows * cols, got: w.len() });
@@ -454,5 +464,70 @@ mod tests {
         assert!(matches!(m.layers[0].attn.q_a.kind, crate::quant::QTKind::I8 { .. }));
         // io_bits = dbits>=8 ? 16 : dbits -> embed/lm_head stay F32 even at dbits=8.
         assert!(matches!(m.embed.kind, crate::quant::QTKind::F32(_)));
+    }
+
+    fn write_minimal_safetensors(dir: &std::path::Path, entries: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in entries {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            let end = data.len() as u64;
+            header.insert(name.to_string(), json!({"dtype": dtype, "shape": shape, "data_offsets": [start, end]}));
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.join("model.safetensors"), out).unwrap();
+    }
+
+    /// `qt_load` must wrap a `.qs`-backed tensor as-is (bit-identical to what's on disk), not
+    /// re-quantize it — the whole point of the fast path being *fast*. Hand-picks int8 bytes
+    /// that a real `quantize_rows` pass on ANY f32 source would be astronomically unlikely to
+    /// reproduce by coincidence, so an exact match is strong evidence no requantization ran.
+    #[test]
+    fn qt_load_wraps_a_qs_sidecar_without_requantizing() {
+        let dir = TempDir::new("rabbit_test_qt_load_qs_int8");
+        let rows = 2;
+        let cols = 5;
+        let packed: Vec<u8> = vec![7, 200, 3, 250, 9, 11, 13, 15, 17, 19]; // arbitrary, not derived from any f32 source
+        let scale = [0.5f32, 2.25];
+        write_minimal_safetensors(
+            &dir.0,
+            &[
+                ("w.weight", "U8", vec![rows * cols], packed.clone()),
+                ("w.weight.qs", "F32", vec![rows], f32_bytes(&scale)),
+            ],
+        );
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let t = qt_load(&shards, "w.weight", rows, cols, 8).unwrap();
+        match &t.kind {
+            crate::quant::QTKind::I8 { data, scale: got_scale } => {
+                let raw_i8: Vec<i8> = packed.iter().map(|&b| b as i8).collect();
+                assert_eq!(data, &raw_i8, "packed bytes must pass through unchanged, not be requantized");
+                assert_eq!(got_scale, &scale);
+            }
+            _ => panic!("expected I8 (byte count matches rows*cols)"),
+        }
+    }
+
+    #[test]
+    fn qt_load_falls_back_to_the_plain_path_without_a_qs_sidecar() {
+        let dir = TempDir::new("rabbit_test_qt_load_no_qs");
+        let rows = 2;
+        let cols = 3;
+        let w = [1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0];
+        write_minimal_safetensors(&dir.0, &[("w.weight", "F32", vec![rows, cols], f32_bytes(&w))]);
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let t = qt_load(&shards, "w.weight", rows, cols, 32).unwrap(); // bits=32 -> exact F32 passthrough
+        match &t.kind {
+            crate::quant::QTKind::F32(data) => assert_eq!(data, &w),
+            _ => panic!("expected F32"),
+        }
     }
 }

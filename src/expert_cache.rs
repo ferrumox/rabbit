@@ -51,6 +51,13 @@ mod uring_load {
         rows: usize,
         cols: usize,
         loc: TensorLocation,
+        /// `Some(scale)` when a `{name}.qs` sibling exists: `loc` then points at already-
+        /// packed int8/int4/int2 bytes (colibri's pre-quantized container, see `model.rs`'s
+        /// `qt_load`) to wrap as-is via `QT::from_packed`, not raw f32/bf16/FP8 to decode and
+        /// requantize. The scale itself is tiny (`rows` floats) — fetched with a plain
+        /// `read_f32` up front rather than folded into the batched `io_uring` reads, which
+        /// exist to amortize the *big* per-expert tensors, not a few-KB sidecar.
+        packed_scale: Option<Vec<f32>>,
     }
 
     /// A persistent `io_uring` instance, reused across every `load_batch` call for as long as
@@ -97,8 +104,10 @@ mod uring_load {
             let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
             for (suf, rows, cols) in [("gate_proj", i, d), ("up_proj", i, d), ("down_proj", d, i)] {
                 let name = p(suf);
+                let qs_name = format!("{name}.qs");
+                let packed_scale = if shards.has(&qs_name) { Some(shards.read_f32(&qs_name, false)?) } else { None };
                 let loc = shards.tensor_location(&name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name)))?;
-                reqs.push(Req { rows, cols, loc });
+                reqs.push(Req { rows, cols, loc, packed_scale });
             }
         }
 
@@ -112,9 +121,9 @@ mod uring_load {
         let mut out = Vec::with_capacity(misses.len());
         for (chunk, &eid) in misses.iter().enumerate() {
             let base = chunk * 3;
-            let gate = qt_from_raw(&bufs[base], &reqs[base], bits);
-            let up = qt_from_raw(&bufs[base + 1], &reqs[base + 1], bits);
-            let down = qt_from_raw(&bufs[base + 2], &reqs[base + 2], bits);
+            let gate = qt_from_raw(&bufs[base], &reqs[base], bits)?;
+            let up = qt_from_raw(&bufs[base + 1], &reqs[base + 1], bits)?;
+            let down = qt_from_raw(&bufs[base + 2], &reqs[base + 2], bits)?;
             out.push(ExpertSlot { eid, gate, up, down, used });
         }
         Ok(out)
@@ -164,11 +173,15 @@ mod uring_load {
         Ok(())
     }
 
-    fn qt_from_raw(raw: &[u8], req: &Req, bits: u8) -> QT {
+    fn qt_from_raw(raw: &[u8], req: &Req, bits: u8) -> Result<QT, ModelError> {
+        if let Some(scale) = &req.packed_scale {
+            return QT::from_packed(req.rows, req.cols, bits, raw.to_vec(), scale.clone())
+                .map_err(|source| ModelError::PackedFormat { name: "expert tensor (.qs)".to_string(), source });
+        }
         let w = Shards::decode_f32(raw, req.loc.dtype);
         let mut t = QT::alloc(req.rows, req.cols, bits, false);
         t.fill(&w);
-        t
+        Ok(t)
     }
 }
 
@@ -527,5 +540,72 @@ mod tests {
         assert!(cache.get(0).is_some());
         assert!(cache.get(2).is_some());
         assert!(cache.get(1).is_none(), "expert 1 should have been evicted (least recently used)");
+    }
+
+    /// Both `ensure_loaded` (the `io_uring` batch path on Linux) and `get_or_load`
+    /// (sequential, via `qt_load`) must wrap a `.qs`-backed expert tensor as-is, not
+    /// requantize it — hand-picked bytes an actual quantization pass would be astronomically
+    /// unlikely to reproduce by coincidence, so an exact match is strong evidence of that.
+    #[test]
+    fn qs_backed_expert_tensors_pass_through_unquantized_on_both_paths() {
+        let dir = TempDir::new("rabbit_test_ecache_qs_passthrough");
+        let moe_inter = 3;
+        let hidden = 5;
+        // int8: byte count == moe_inter*hidden for gate/up, hidden*moe_inter for down.
+        let gate_bytes: Vec<u8> = (0..moe_inter * hidden).map(|i| (i * 37 + 11) as u8).collect();
+        let gate_scale = vec![0.25f32; moe_inter];
+        let up_bytes: Vec<u8> = (0..moe_inter * hidden).map(|i| (i * 53 + 5) as u8).collect();
+        let up_scale = vec![0.75f32; moe_inter];
+        let down_bytes: Vec<u8> = (0..hidden * moe_inter).map(|i| (i * 61 + 3) as u8).collect();
+        let down_scale = vec![1.5f32; hidden];
+
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, dtype: &str, shape: Vec<usize>, bytes: Vec<u8>| {
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": dtype, "shape": shape, "data_offsets": [start, end]}));
+        };
+        let eid = 0;
+        for (suf, rows, cols, bytes, scale) in [
+            ("gate_proj", moe_inter, hidden, &gate_bytes, &gate_scale),
+            ("up_proj", moe_inter, hidden, &up_bytes, &up_scale),
+            ("down_proj", hidden, moe_inter, &down_bytes, &down_scale),
+        ] {
+            let name = format!("model.layers.0.mlp.experts.{eid}.{suf}.weight");
+            push(&mut header, name.clone(), "U8", vec![rows * cols], bytes.clone());
+            push(&mut header, format!("{name}.qs"), "F32", vec![rows], f32_bytes(scale));
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+
+        let shards = Shards::open(&dir.0).unwrap();
+        let cfg = tiny_cfg(1, moe_inter as i32, hidden as i32);
+
+        let check = |slot: &ExpertSlot| {
+            let crate::quant::QTKind::I8 { data, scale } = &slot.gate.kind else { panic!("expected I8 gate") };
+            assert_eq!(data, &gate_bytes.iter().map(|&b| b as i8).collect::<Vec<i8>>());
+            assert_eq!(scale, &gate_scale);
+            let crate::quant::QTKind::I8 { data, scale } = &slot.up.kind else { panic!("expected I8 up") };
+            assert_eq!(data, &up_bytes.iter().map(|&b| b as i8).collect::<Vec<i8>>());
+            assert_eq!(scale, &up_scale);
+            let crate::quant::QTKind::I8 { data, scale } = &slot.down.kind else { panic!("expected I8 down") };
+            assert_eq!(data, &down_bytes.iter().map(|&b| b as i8).collect::<Vec<i8>>());
+            assert_eq!(scale, &down_scale);
+        };
+
+        let mut batch_cache = ExpertCache::new(4);
+        batch_cache.ensure_loaded(&shards, &cfg, 0, &[eid], 8).unwrap();
+        check(batch_cache.get(eid).unwrap());
+
+        let mut sequential_cache = ExpertCache::new(4);
+        sequential_cache.get_or_load(&shards, &cfg, 0, eid, 8).unwrap();
+        check(sequential_cache.get(eid).unwrap());
     }
 }
