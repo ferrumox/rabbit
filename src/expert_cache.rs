@@ -225,6 +225,15 @@ pub struct ExpertCache {
 }
 
 impl ExpertCache {
+    /// The most unique experts `ensure_loaded` can keep simultaneously resident. Callers that
+    /// dispatch a batch of experts (`moe.rs`) must chunk any set larger than this — a single
+    /// `ensure_loaded` call filling the cache past capacity evicts its OWN earlier insertions
+    /// (every slot inserted within one call shares the same LRU timestamp, so ties break by
+    /// insertion order) before the caller gets a chance to read them back via `get`.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn new(capacity: usize) -> ExpertCache {
         ExpertCache {
             capacity,

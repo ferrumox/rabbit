@@ -140,44 +140,52 @@ pub fn moe(
         *v = 0.0;
     }
 
-    // Fase 8: resolve the WHOLE batch of cache misses in one `ensure_loaded` call — on Linux
-    // that's one `io_uring` submission for every miss expert's 3 tensors, instead of the
-    // `get_or_load` loop's `pread`-per-tensor, per-expert. Everything below reads back via
-    // `cache.get`, which never touches disk (every id here is now cached, hit or miss alike).
+    // Fase 8: resolve cache misses via `ensure_loaded` — on Linux that's one `io_uring`
+    // submission per chunk for every miss expert's 3 tensors, instead of the `get_or_load`
+    // loop's `pread`-per-tensor, per-expert. Chunked at `cache.capacity()`: a single
+    // `ensure_loaded` call can't keep more than `capacity` experts resident at once (past
+    // that, its own LRU eviction would reclaim earlier insertions from the SAME call before
+    // this loop gets to read them back), so a batch whose unique-expert count exceeds
+    // capacity — a long prompt's prefill with a high `topk`, easily hundreds of unique ids
+    // across a real 256-expert layer — must be dispatched in capacity-sized groups instead of
+    // one `ensure_loaded(uniq)` call.
     let uniq = unique_experts(&routing);
-    cache.ensure_loaded(shards, cfg, layer, &uniq, ebits)?;
+    let chunk_size = cache.capacity().max(1);
+    for chunk in uniq.chunks(chunk_size) {
+        cache.ensure_loaded(shards, cfg, layer, chunk, ebits)?;
 
-    for eid in uniq {
-        let rows: Vec<(usize, f32)> = routing
-            .choices
-            .iter()
-            .enumerate()
-            .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let nr = rows.len();
+        for &eid in chunk {
+            let rows: Vec<(usize, f32)> = routing
+                .choices
+                .iter()
+                .enumerate()
+                .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let nr = rows.len();
 
-        let mut xg = vec![0f32; nr * d];
-        for (r, &(si, _)) in rows.iter().enumerate() {
-            xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
-        }
+            let mut xg = vec![0f32; nr * d];
+            for (r, &(si, _)) in rows.iter().enumerate() {
+                xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
+            }
 
-        let slot = cache.get(eid).expect("just ensured loaded above");
-        let mut gg = vec![0f32; nr * i];
-        let mut uu = vec![0f32; nr * i];
-        matmul_qt(&mut gg, &xg, &slot.gate, nr);
-        matmul_qt(&mut uu, &xg, &slot.up, nr);
-        for z in 0..nr * i {
-            gg[z] = siluf(gg[z]) * uu[z];
-        }
-        let mut hh = vec![0f32; nr * d];
-        matmul_qt(&mut hh, &gg, &slot.down, nr);
+            let slot = cache.get(eid).expect("just ensured loaded above");
+            let mut gg = vec![0f32; nr * i];
+            let mut uu = vec![0f32; nr * i];
+            matmul_qt(&mut gg, &xg, &slot.gate, nr);
+            matmul_qt(&mut uu, &xg, &slot.up, nr);
+            for z in 0..nr * i {
+                gg[z] = siluf(gg[z]) * uu[z];
+            }
+            let mut hh = vec![0f32; nr * d];
+            matmul_qt(&mut hh, &gg, &slot.down, nr);
 
-        for (r, &(si, wgt)) in rows.iter().enumerate() {
-            for dd in 0..d {
-                out[si * d + dd] += wgt * hh[r * d + dd];
+            for (r, &(si, wgt)) in rows.iter().enumerate() {
+                for dd in 0..d {
+                    out[si * d + dd] += wgt * hh[r * d + dd];
+                }
             }
         }
     }
@@ -447,5 +455,117 @@ mod tests {
         }
         // sanity: every expert really was touched (topk==n_experts), not a vacuous pass.
         assert_eq!(cache.misses, n_experts as u64);
+    }
+
+    /// Regression test: a batch whose unique-expert count exceeds the cache's capacity used
+    /// to panic (`cache.get(eid).expect("just ensured loaded above")`) because a single
+    /// `ensure_loaded` call filling the cache past capacity evicted its own earlier
+    /// insertions — every slot inserted within one call shares the same LRU timestamp, so the
+    /// eviction tie-break (lowest `used`, first element wins) reclaimed experts from the SAME
+    /// batch before this function's own loop got to read them back. `topk == n_experts` here
+    /// guarantees every token activates all 8 experts, so `uniq.len() == 8` against a cache of
+    /// capacity 3 — `moe()` must chunk internally and still produce the exact same output as
+    /// the uncapped `moe_output_matches_independent_full_expert_sum_when_topk_equals_n_experts`
+    /// reference.
+    #[test]
+    fn moe_output_is_correct_when_batch_unique_experts_exceed_cache_capacity() {
+        let n_experts = 8;
+        let moe_inter = 4;
+        let hidden = 5;
+        let n_shared = 1;
+        let mut seed = 21;
+
+        let dir = TempDir::new("rabbit_test_moe_cache_smaller_than_batch");
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut expert_weights = Vec::new();
+        for eid in 0..n_experts {
+            let gate = random_vec(moe_inter * hidden, &mut seed);
+            let up = random_vec(moe_inter * hidden, &mut seed);
+            let down = random_vec(hidden * moe_inter, &mut seed);
+            for (suf, rows, cols, vals) in [
+                ("gate_proj", moe_inter, hidden, &gate),
+                ("up_proj", moe_inter, hidden, &up),
+                ("down_proj", hidden, moe_inter, &down),
+            ] {
+                let name = format!("model.layers.0.mlp.experts.{eid}.{suf}.weight");
+                let bytes = f32_bytes(vals);
+                let start = data.len() as u64;
+                data.extend_from_slice(&bytes);
+                let end = data.len() as u64;
+                header.insert(name, json!({"dtype": "F32", "shape": [rows, cols], "data_offsets": [start, end]}));
+            }
+            expert_weights.push((gate, up, down));
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out_bytes = Vec::new();
+        out_bytes.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out_bytes.extend_from_slice(&header_bytes);
+        out_bytes.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out_bytes).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let cfg = tiny_cfg(n_experts as i32, n_experts as i32, moe_inter as i32, hidden as i32, n_shared as i32, false);
+        let w = MoeWeights {
+            router: random_vec(n_experts * hidden, &mut seed),
+            router_bias: random_vec(n_experts, &mut seed),
+            sh_gate: random_qt_f32(moe_inter * n_shared, hidden, &mut seed),
+            sh_up: random_qt_f32(moe_inter * n_shared, hidden, &mut seed),
+            sh_down: random_qt_f32(hidden, moe_inter * n_shared, &mut seed),
+        };
+        let s = 3;
+        let x = random_vec(s * hidden, &mut seed);
+
+        // capacity (3) < uniq.len() (8, since topk==n_experts) -> forces moe() to chunk.
+        let mut cache = ExpertCache::new(3);
+        let mut out = vec![0f32; s * hidden];
+        moe(&cfg, &w, &mut cache, &shards, 0, 32, &x, s, &mut out).unwrap();
+
+        let routing = route(&cfg, &w, &x, s);
+        let mut expected = vec![0f32; s * hidden];
+        for si in 0..s {
+            let xs = &x[si * hidden..(si + 1) * hidden];
+            for &(eid, wgt) in &routing.choices[si] {
+                let (gate_vals, up_vals, down_vals) = &expert_weights[eid];
+                let mut gate_qt = QT::alloc(moe_inter, hidden, 32, false);
+                gate_qt.fill(gate_vals);
+                let mut up_qt = QT::alloc(moe_inter, hidden, 32, false);
+                up_qt.fill(up_vals);
+                let mut down_qt = QT::alloc(hidden, moe_inter, 32, false);
+                down_qt.fill(down_vals);
+
+                let mut g = vec![0f32; moe_inter];
+                let mut u = vec![0f32; moe_inter];
+                matmul_qt(&mut g, xs, &gate_qt, 1);
+                matmul_qt(&mut u, xs, &up_qt, 1);
+                let gated: Vec<f32> = g.iter().zip(&u).map(|(&gv, &uv)| siluf(gv) * uv).collect();
+                let mut d_out = vec![0f32; hidden];
+                matmul_qt(&mut d_out, &gated, &down_qt, 1);
+                for dd in 0..hidden {
+                    expected[si * hidden + dd] += wgt * d_out[dd];
+                }
+            }
+        }
+        let mut sg = vec![0f32; s * moe_inter * n_shared];
+        let mut su = vec![0f32; s * moe_inter * n_shared];
+        matmul_qt(&mut sg, &x, &w.sh_gate, s);
+        matmul_qt(&mut su, &x, &w.sh_up, s);
+        for z in 0..s * moe_inter * n_shared {
+            sg[z] = siluf(sg[z]) * su[z];
+        }
+        let mut sh = vec![0f32; s * hidden];
+        matmul_qt(&mut sh, &sg, &w.sh_down, s);
+        for z in 0..s * hidden {
+            expected[z] += sh[z];
+        }
+
+        for (a, b) in out.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+        // every one of the 8 experts had to be loaded at least once, despite the cache only
+        // ever holding 3 at a time.
+        assert_eq!(cache.misses, n_experts as u64);
+        assert_eq!(cache.len(), 3);
     }
 }
