@@ -35,6 +35,19 @@ impl KvState {
         let dsa = model.layers.iter().map(|l| l.dsa.as_ref().map(|_| DsaCache::new(index_hd))).collect();
         KvState { layers, dsa }
     }
+
+    pub(crate) fn layers(&self) -> &[KvCache] {
+        &self.layers
+    }
+
+    pub(crate) fn dsa(&self) -> &[Option<DsaCache>] {
+        &self.dsa
+    }
+
+    /// Reconstructs a `KvState` from raw saved per-layer caches — `kv_session.rs`'s load path.
+    pub(crate) fn from_raw(layers: Vec<KvCache>, dsa: Vec<Option<DsaCache>>) -> KvState {
+        KvState { layers, dsa }
+    }
 }
 
 /// One `ExpertCache` per MoE layer (`None` for dense layers) — owned by the caller so it
@@ -700,5 +713,173 @@ mod tests {
         let stopped = generate(&model, &shards, &mut caches2, &mut kv2, &prompt, 5, &sampling, &mut rng2, &[stop_id]).unwrap();
 
         assert!(stopped.is_empty(), "must stop before emitting the banned first token");
+    }
+
+    // ---- kv_session.rs: save/load round-tripping (reuses the 3-layer dense/MoE+DSA fixture) ----
+
+    use crate::kv_session::LoadError;
+
+    #[test]
+    fn kv_session_round_trip_gives_bit_identical_continuation() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_kv_session_roundtrip");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let prompt = vec![1usize, 2, 3];
+        let next_id = 4usize;
+
+        // continuous path: never touches disk.
+        let mut caches_a = ExpertCaches::new(&model, 8);
+        let mut kv_a = KvState::new(&model);
+        step_all(&model, &shards, &mut caches_a, &mut kv_a, &prompt, 0).unwrap();
+        let pos = prompt.len();
+        let continuous = step(&model, &shards, &mut caches_a, &mut kv_a, &[next_id], pos).unwrap();
+
+        // save/reload path: build the identical prompt-only state, save it, drop it, cold-load,
+        // then continue with the same next token.
+        let mut caches_b = ExpertCaches::new(&model, 8);
+        let mut kv_b = KvState::new(&model);
+        step_all(&model, &shards, &mut caches_b, &mut kv_b, &prompt, 0).unwrap();
+        let dir = TempDir::new("rabbit_test_kv_session_roundtrip_file");
+        let path = dir.0.join("session.kv");
+        kv_b.save(0, pos, &path).unwrap();
+        drop(kv_b);
+
+        let (mut kv_c, loaded_pos) = KvState::load(&path, &model).unwrap();
+        assert_eq!(loaded_pos, pos);
+        let mut caches_c = ExpertCaches::new(&model, 8);
+        let reloaded = step(&model, &shards, &mut caches_c, &mut kv_c, &[next_id], loaded_pos).unwrap();
+
+        assert_eq!(continuous, reloaded, "save/load round trip must be bit-identical to uninterrupted continuation");
+    }
+
+    #[test]
+    fn kv_session_two_partial_saves_equal_one_combined_save() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_kv_session_append");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let prompt = vec![1usize, 2, 3, 4, 5];
+
+        // Build the KV state via ONE forward pass -- this test is about kv_session.rs's
+        // append format, not about the model's own prefill semantics (splitting the forward
+        // pass itself would also split `layers_forward`'s `is_first_call`-gated DSA-indexer
+        // computation, which is a real behavior difference, not a persistence bug).
+        let mut caches = ExpertCaches::new(&model, 8);
+        let mut kv = KvState::new(&model);
+        step_all(&model, &shards, &mut caches, &mut kv, &prompt, 0).unwrap();
+        let total = prompt.len();
+
+        // path A: one combined save covering the whole prompt.
+        let dir_a = TempDir::new("rabbit_test_kv_session_append_a");
+        let path_a = dir_a.0.join("session.kv");
+        kv.save(0, total, &path_a).unwrap();
+
+        // path B: two partial saves of the SAME state, split mid-conversation.
+        let split = 2;
+        let dir_b = TempDir::new("rabbit_test_kv_session_append_b");
+        let path_b = dir_b.0.join("session.kv");
+        kv.save(0, split, &path_b).unwrap();
+        kv.save(split, total, &path_b).unwrap();
+
+        let (kv_loaded_a, pos_a) = KvState::load(&path_a, &model).unwrap();
+        let (kv_loaded_b, pos_b) = KvState::load(&path_b, &model).unwrap();
+        assert_eq!(pos_a, total);
+        assert_eq!(pos_a, pos_b);
+
+        for (la, lb) in kv_loaded_a.layers().iter().zip(kv_loaded_b.layers().iter()) {
+            assert_eq!(la.l_range(0, pos_a), lb.l_range(0, pos_b));
+            assert_eq!(la.r_range(0, pos_a), lb.r_range(0, pos_b));
+        }
+        for (da, db) in kv_loaded_a.dsa().iter().zip(kv_loaded_b.dsa().iter()) {
+            match (da, db) {
+                (Some(da), Some(db)) => assert_eq!(da.k_range(0, pos_a), db.k_range(0, pos_b)),
+                (None, None) => {}
+                _ => panic!("dsa presence disagrees between the two save strategies"),
+            }
+        }
+    }
+
+    #[test]
+    fn kv_session_load_errors_on_bad_magic() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_kv_session_bad_magic_model");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+
+        let dir = TempDir::new("rabbit_test_kv_session_bad_magic_file");
+        let path = dir.0.join("session.kv");
+        fs::write(&path, b"not a rabbit kv session file at all").unwrap();
+
+        let err = match KvState::load(&path, &model) {
+            Err(e) => e,
+            Ok(_) => panic!("load must fail on a bad-magic file"),
+        };
+        assert!(matches!(err, LoadError::BadMagic));
+    }
+
+    #[test]
+    fn kv_session_load_errors_on_dimension_mismatch() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_kv_session_dim_mismatch_model");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+
+        // hand-craft a header claiming a different kv_lora than the model actually has,
+        // mirroring kv_session.rs's format spec directly -- same approach
+        // `build_three_layer_fixture` uses to fabricate a fake safetensors file by hand.
+        let dir = TempDir::new("rabbit_test_kv_session_dim_mismatch_file");
+        let path = dir.0.join("session.kv");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RBTKVSN1");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(model.layers.len() as u32).to_le_bytes());
+        for layer in &model.layers {
+            let bad_kv_lora = model.cfg.kv_lora as u32 + 1;
+            bytes.extend_from_slice(&bad_kv_lora.to_le_bytes());
+            bytes.extend_from_slice(&(model.cfg.qk_rope as u32).to_le_bytes());
+            if layer.dsa.is_some() {
+                bytes.push(1);
+                bytes.extend_from_slice(&(model.cfg.index_hd as u32).to_le_bytes());
+            } else {
+                bytes.push(0);
+            }
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match KvState::load(&path, &model) {
+            Err(e) => e,
+            Ok(_) => panic!("load must fail on a dimension mismatch"),
+        };
+        assert!(matches!(err, LoadError::ConfigMismatch { field: "kv_lora", .. }));
+    }
+
+    #[test]
+    fn kv_session_load_recovers_from_a_truncated_trailing_record() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_kv_session_truncated_model");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+
+        let mut caches = ExpertCaches::new(&model, 8);
+        let mut kv = KvState::new(&model);
+        let dir = TempDir::new("rabbit_test_kv_session_truncated_file");
+        let path = dir.0.join("session.kv");
+
+        let first = vec![1usize, 2, 3];
+        step_all(&model, &shards, &mut caches, &mut kv, &first, 0).unwrap();
+        kv.save(0, first.len(), &path).unwrap();
+        let pos_after_first = first.len();
+
+        let second = vec![4usize, 5];
+        step_all(&model, &shards, &mut caches, &mut kv, &second, pos_after_first).unwrap();
+        kv.save(pos_after_first, pos_after_first + second.len(), &path).unwrap();
+
+        // chop a few bytes off the very end -- guaranteed to land inside the second record's
+        // payload (it's the last thing written), never on a clean record boundary.
+        let full_len = fs::metadata(&path).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_len - 5).unwrap();
+        drop(file);
+
+        let (recovered, pos) = KvState::load(&path, &model).unwrap();
+        assert_eq!(pos, pos_after_first, "must discard the truncated trailing record, keeping only the complete one");
+
+        for (a, b) in recovered.layers().iter().zip(kv.layers().iter()) {
+            assert_eq!(a.l_range(0, pos_after_first), b.l_range(0, pos_after_first));
+        }
     }
 }

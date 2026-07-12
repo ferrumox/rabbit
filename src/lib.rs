@@ -6,6 +6,7 @@ pub mod config;
 pub mod expert_cache;
 pub mod generate;
 pub mod kernels;
+pub mod kv_session;
 pub mod model;
 pub mod moe;
 pub mod quant;
