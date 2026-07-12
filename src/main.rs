@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
-[--host H] [--port N] [--api-key K]";
+[--session <path>] [--host H] [--port N] [--api-key K]";
 
 struct Args {
     model_dir: PathBuf,
@@ -27,6 +27,7 @@ struct Args {
     dbits: u8,
     ebits: u8,
     cache_capacity: usize,
+    session: Option<PathBuf>,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -45,6 +46,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dbits = 4u8;
     let mut ebits = 4u8;
     let mut cache_capacity = 64usize;
+    let mut session = None;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut api_key = None;
@@ -65,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
             "--dbits" => dbits = next("--dbits")?.parse().map_err(|e| format!("--dbits: {e}"))?,
             "--ebits" => ebits = next("--ebits")?.parse().map_err(|e| format!("--ebits: {e}"))?,
             "--expert-cache" => cache_capacity = next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?,
+            "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--host" => host = next("--host")?,
             "--port" => port = next("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--api-key" => api_key = Some(next("--api-key")?),
@@ -75,6 +78,9 @@ fn parse_args() -> Result<Args, String> {
 
     if [chat, serve, prompt.is_some()].iter().filter(|&&x| x).count() != 1 {
         return Err(format!("exactly one of --prompt, --chat, or --serve is required\n\n{USAGE}"));
+    }
+    if session.is_some() && !chat {
+        return Err(format!("--session is only valid with --chat\n\n{USAGE}"));
     }
 
     Ok(Args {
@@ -90,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
         dbits,
         ebits,
         cache_capacity,
+        session,
         host,
         port,
         api_key,
@@ -144,9 +151,18 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("rabbit chat{think_tag_note} — escribí un mensaje y Enter. :reset reinicia la conversación, :quit sale.\n");
 
-    let mut kv = KvState::new(&sess.model);
-    let mut pos = 0usize;
-    let mut first = true;
+    let (mut kv, mut pos) = match &args.session {
+        Some(path) if path.exists() => {
+            let (kv, pos) = KvState::load(path, &sess.model)?;
+            println!("(sesión retomada de {}: {pos} tokens de contexto)\n", path.display());
+            (kv, pos)
+        }
+        _ => (KvState::new(&sess.model), 0usize),
+    };
+    let mut first = pos == 0;
+    // becomes false if a `:reset` fails to delete the session file — keeps the interactive
+    // session alive instead of killing it, but stops appending under a stale position.
+    let mut session_persists = true;
     let stdin = std::io::stdin();
 
     loop {
@@ -169,6 +185,15 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             kv = KvState::new(&sess.model);
             pos = 0;
             first = true;
+            if let Some(path) = &args.session
+                && path.exists()
+                && let Err(e) = std::fs::remove_file(path)
+            {
+                eprintln!(
+                    "(no se pudo borrar el archivo de sesión, se desactiva la persistencia para el resto de esta corrida: {e})"
+                );
+                session_persists = false;
+            }
             println!("(conversación reiniciada)\n");
             continue;
         }
@@ -177,11 +202,20 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         first = false;
         let turn_ids: Vec<usize> = sess.tokenizer.encode(&turn_text).into_iter().map(|id| id as usize).collect();
 
+        let from_pos = pos;
         let t1 = std::time::Instant::now();
         let (reply, new_pos, n) = chat::generate_reply(&mut sess, &mut kv, &turn_ids, pos, print_progress)?;
         let elapsed = t1.elapsed().as_secs_f32();
         eprintln!("{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
         pos = new_pos;
+
+        if session_persists
+            && let Some(path) = &args.session
+            && let Err(e) = kv.save(from_pos, pos, path)
+        {
+            eprintln!("(no se pudo guardar la sesión: {e})");
+        }
+
         println!("{}\n", reply.trim());
     }
     Ok(())

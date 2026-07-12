@@ -109,9 +109,30 @@ impl KvCache {
     }
 
     /// contiguous `L` rows for positions `[from, to)` — one matmul input for reconstructing
-    /// `k_nope`/`v` over a whole range at once (the dense path's whole point).
-    fn l_range(&self, from: usize, to: usize) -> &[f32] {
+    /// `k_nope`/`v` over a whole range at once (the dense path's whole point). `pub(crate)`
+    /// (widened from private) so `kv_session.rs`'s save path can read out exactly the new rows
+    /// a save needs without exposing `l` itself.
+    pub(crate) fn l_range(&self, from: usize, to: usize) -> &[f32] {
         &self.l[from * self.kv_lora..to * self.kv_lora]
+    }
+
+    /// `l_range`'s counterpart for `R`.
+    pub(crate) fn r_range(&self, from: usize, to: usize) -> &[f32] {
+        &self.r[from * self.qk_rope..to * self.qk_rope]
+    }
+
+    pub(crate) fn kv_lora(&self) -> usize {
+        self.kv_lora
+    }
+
+    pub(crate) fn qk_rope(&self) -> usize {
+        self.qk_rope
+    }
+
+    /// Reconstructs a `KvCache` from raw saved rows — `kv_session.rs`'s load path, the mirror
+    /// of `new` (which starts empty) for restoring one that already has history.
+    pub(crate) fn from_raw(kv_lora: usize, qk_rope: usize, l: Vec<f32>, r: Vec<f32>) -> KvCache {
+        KvCache { kv_lora, qk_rope, l, r }
     }
 }
 
@@ -141,6 +162,20 @@ impl DsaCache {
 
     fn row(&self, pos: usize) -> &[f32] {
         &self.k[pos * self.hd..(pos + 1) * self.hd]
+    }
+
+    pub(crate) fn hd(&self) -> usize {
+        self.hd
+    }
+
+    /// `KvCache::l_range`'s counterpart for the DSA indexer's key cache.
+    pub(crate) fn k_range(&self, from: usize, to: usize) -> &[f32] {
+        &self.k[from * self.hd..to * self.hd]
+    }
+
+    /// Reconstructs a `DsaCache` from raw saved rows — mirrors `KvCache::from_raw`.
+    pub(crate) fn from_raw(hd: usize, k: Vec<f32>) -> DsaCache {
+        DsaCache { hd, k }
     }
 }
 
