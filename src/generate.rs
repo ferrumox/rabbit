@@ -18,6 +18,9 @@ use crate::kernels::matmul_qt;
 use crate::model::{Ffn, Model, ModelError};
 use crate::moe;
 use crate::safetensors::Shards;
+use crate::usage_cache;
+use std::collections::HashMap;
+use std::path::Path;
 
 /// Per-layer KV state for one generation session: compressed MLA latents (`KvCache`) for
 /// every layer, plus the DSA indexer's key cache (`DsaCache`) for layers that have one.
@@ -71,6 +74,70 @@ impl ExpertCaches {
     pub fn hit_miss_totals(&self) -> (u64, u64, u64) {
         self.0.iter().flatten().fold((0, 0, 0), |(h, m, n), c| (h + c.hits, m + c.misses, n + c.load_nanos))
     }
+
+    /// Reads `<model_dir>/.rabbit_usage` (if any), seeds every MoE layer's usage counters from
+    /// it, and — if the persisted total selection count (`hist`, summed across ALL layers)
+    /// reaches `usage_cache::HIST_THRESHOLD` — eagerly pins each layer's top
+    /// `usage_cache::pin_budget(cache_capacity, confidence)` historically-hottest experts.
+    /// Colibrì's `usage_load` + `pin_load`, adapted to rabbit's count-based (not GB-based)
+    /// cache capacity. Every failure (missing/corrupt file, an individual expert's tensors
+    /// missing from `shards`) is logged to stderr and skipped — this never returns an error and
+    /// must never prevent a session from starting.
+    pub fn warm_start(&mut self, shards: &Shards, cfg: &Cfg, model_dir: &Path, cache_capacity: usize, ebits: u8) -> WarmStartStats {
+        let loaded = usage_cache::load(&usage_cache::usage_path(model_dir));
+        let hist: u64 = loaded.values().sum();
+
+        let mut per_layer: HashMap<usize, Vec<(usize, u64)>> = HashMap::new();
+        for (&(li, eid), &count) in &loaded {
+            per_layer.entry(li).or_default().push((eid, count));
+        }
+        for (li, cache_opt) in self.0.iter_mut().enumerate() {
+            if let (Some(cache), Some(entries)) = (cache_opt, per_layer.remove(&li)) {
+                cache.seed_usage(entries.into_iter());
+            }
+        }
+
+        if hist < usage_cache::HIST_THRESHOLD {
+            return WarmStartStats { hist, confidence: usage_cache::confidence(hist), pinned: 0 };
+        }
+
+        let confidence = usage_cache::confidence(hist);
+        let budget = usage_cache::pin_budget(cache_capacity, confidence);
+        let mut pinned = 0;
+        for (li, cache_opt) in self.0.iter_mut().enumerate() {
+            let Some(cache) = cache_opt else { continue };
+            let mut top: Vec<(usize, u64)> = cache.usage_counts().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            top.truncate(budget);
+            for (eid, _) in top {
+                match cache.pin_expert(shards, cfg, li, eid, ebits) {
+                    Ok(()) => pinned += 1,
+                    Err(e) => eprintln!("usage cache: failed to pin layer {li} expert {eid}: {e:?}"),
+                }
+            }
+        }
+        WarmStartStats { hist, confidence, pinned }
+    }
+
+    /// Writes every MoE layer's current usage counters back to `<model_dir>/.rabbit_usage`,
+    /// overwriting the previous snapshot (see `usage_cache::save`'s doc for why a full
+    /// overwrite, not an append, is fine here). Call at turn/response boundaries only — never
+    /// inside the decode loop.
+    pub fn save_usage(&self, model_dir: &Path) -> std::io::Result<()> {
+        let path = usage_cache::usage_path(model_dir);
+        let entries = self.0.iter().enumerate().flat_map(|(li, c)| {
+            c.as_ref().into_iter().flat_map(move |cache| cache.usage_counts().map(move |(eid, count)| (li, eid, count)))
+        });
+        usage_cache::save(&path, entries)
+    }
+}
+
+/// Result of `ExpertCaches::warm_start` — how much history existed and how many experts ended
+/// up eagerly pinned, for the caller to log a one-line startup summary.
+pub struct WarmStartStats {
+    pub hist: u64,
+    pub confidence: f32,
+    pub pinned: usize,
 }
 
 fn embed_tokens(model: &Model, ids: &[usize]) -> Vec<f32> {
@@ -881,5 +948,80 @@ mod tests {
         for (a, b) in recovered.layers().iter().zip(kv.layers().iter()) {
             assert_eq!(a.l_range(0, pos_after_first), b.l_range(0, pos_after_first));
         }
+    }
+
+    // ---- ExpertCaches::warm_start / save_usage (Fase 13's persistent usage cache) ----
+
+    #[test]
+    fn warm_start_below_threshold_seeds_counters_but_does_not_pin() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_warm_start_below_threshold");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let dir = TempDir::new("rabbit_test_warm_start_below_threshold_file");
+        let usage_path = crate::usage_cache::usage_path(&dir.0);
+        // well under HIST_THRESHOLD (5000)
+        crate::usage_cache::save(&usage_path, vec![(1usize, 0usize, 10u64), (1, 1, 5)].into_iter()).unwrap();
+
+        let mut caches = ExpertCaches::new(&model, 8);
+        let stats = caches.warm_start(&shards, &model.cfg, &dir.0, 8, model.ebits);
+
+        assert_eq!(stats.hist, 15);
+        assert_eq!(stats.pinned, 0, "must not auto-pin below the confidence threshold");
+        assert!(!caches.0[1].as_ref().unwrap().is_pinned(0));
+
+        let counts: std::collections::HashMap<usize, u64> = caches.0[1].as_ref().unwrap().usage_counts().collect();
+        assert_eq!(counts.get(&0), Some(&10), "counters must still be seeded even without pinning");
+        assert_eq!(counts.get(&1), Some(&5));
+    }
+
+    #[test]
+    fn warm_start_above_threshold_pins_top_experts_per_layer_and_matches_pin_budget() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_warm_start_above_threshold");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let dir = TempDir::new("rabbit_test_warm_start_above_threshold_file");
+        let usage_path = crate::usage_cache::usage_path(&dir.0);
+        // layer 1 (MoE + DSA-full): two nonzero entries, totalling 200_000 -> confidence 1.0.
+        // layer 2 (MoE + DSA-shared) gets none, so it must end up with zero pinned.
+        crate::usage_cache::save(&usage_path, vec![(1usize, 0usize, 150_000u64), (1, 1, 50_000)].into_iter()).unwrap();
+
+        let cache_capacity = 8;
+        let mut caches = ExpertCaches::new(&model, cache_capacity);
+        let stats = caches.warm_start(&shards, &model.cfg, &dir.0, cache_capacity, model.ebits);
+
+        assert_eq!(stats.hist, 200_000);
+        assert!((stats.confidence - 1.0).abs() < 1e-6);
+        // budget = floor(8 * 0.5 * 1.0) = 4, but only 2 nonzero entries exist for layer 1 -> 2 pinned.
+        assert_eq!(stats.pinned, 2);
+
+        let layer1 = caches.0[1].as_ref().unwrap();
+        assert!(layer1.is_pinned(0));
+        assert!(layer1.is_pinned(1));
+        assert_eq!(layer1.pinned_len(), 2);
+
+        let layer2 = caches.0[2].as_ref().unwrap();
+        assert_eq!(layer2.pinned_len(), 0, "a layer with no usage history must not get anything pinned");
+    }
+
+    #[test]
+    fn save_usage_then_warm_start_round_trips_live_counters_across_a_fresh_caches_instance() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_usage_roundtrip");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let dir = TempDir::new("rabbit_test_usage_roundtrip_file");
+
+        let mut caches_a = ExpertCaches::new(&model, 8);
+        caches_a.0[1].as_mut().unwrap().record_selection(0);
+        caches_a.0[1].as_mut().unwrap().record_selection(0);
+        caches_a.0[1].as_mut().unwrap().record_selection(2);
+        caches_a.save_usage(&dir.0).unwrap();
+
+        let mut caches_b = ExpertCaches::new(&model, 8);
+        let stats = caches_b.warm_start(&shards, &model.cfg, &dir.0, 8, model.ebits);
+        assert_eq!(stats.hist, 3);
+
+        let counts: std::collections::HashMap<usize, u64> = caches_b.0[1].as_ref().unwrap().usage_counts().collect();
+        assert_eq!(counts.get(&0), Some(&2));
+        assert_eq!(counts.get(&2), Some(&1));
     }
 }

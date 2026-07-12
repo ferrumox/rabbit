@@ -17,6 +17,7 @@ pub struct LoadArgs {
     pub dbits: u8,
     pub ebits: u8,
     pub cache_capacity: usize,
+    pub no_usage_cache: bool,
 }
 
 pub struct Session {
@@ -28,6 +29,8 @@ pub struct Session {
     pub rng: Rng,
     pub stop_ids: Vec<usize>,
     pub max_tokens: usize,
+    pub model_dir: PathBuf,
+    pub usage_cache_enabled: bool,
 }
 
 pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Error>> {
@@ -45,12 +48,32 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
     );
 
     let shards = Shards::open(&args.model_dir)?;
-    let caches = ExpertCaches::new(&model, args.cache_capacity);
+    let mut caches = ExpertCaches::new(&model, args.cache_capacity);
+    let usage_cache_enabled = !args.no_usage_cache;
+    if usage_cache_enabled {
+        let stats = caches.warm_start(&shards, &model.cfg, &args.model_dir, args.cache_capacity, model.ebits);
+        if stats.pinned > 0 {
+            eprintln!("usage cache: {} historical selections, confidence {:.2}, {} experts pinned", stats.hist, stats.confidence, stats.pinned);
+        } else if stats.hist > 0 {
+            eprintln!("usage cache: {} historical selections (below auto-pin threshold)", stats.hist);
+        }
+    }
     let sampling = SamplingConfig { temperature: args.temperature, nucleus: args.nucleus };
     let rng = Rng::new(args.seed);
     let stop_ids: Vec<usize> = model.cfg.stop_ids.iter().map(|&id| id as usize).collect();
 
-    Ok(Session { model, shards, tokenizer, caches, sampling, rng, stop_ids, max_tokens: args.max_tokens })
+    Ok(Session {
+        model,
+        shards,
+        tokenizer,
+        caches,
+        sampling,
+        rng,
+        stop_ids,
+        max_tokens: args.max_tokens,
+        model_dir: args.model_dir.clone(),
+        usage_cache_enabled,
+    })
 }
 
 /// GLM-5.2's official chat template (no newline after role tags), reverse-engineered from

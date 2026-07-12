@@ -33,13 +33,18 @@
 //!   syscalls into ~1, which buffered reads already get.
 //! - No **`.qs` pre-quantized fast path**: same cut as `model.rs`'s `qt_load` — out of scope
 //!   for this whole port stage (see `rabbit-plan.md`).
-//! - No **persistent learning cache** (`.coli_usage`/`eusage`/`eheat`): explicitly out of
-//!   scope for this stage per the plan.
+//!
+//! Fase 13 (this file) DOES now port the persistent learning cache (`.coli_usage`'s `eusage` ->
+//! `usage_cache.rs`'s `.rabbit_usage`) and its pin tier (`m->pin[layer]` -> `ExpertCache::pinned`)
+//! — see `usage_cache.rs` and `generate.rs`'s `ExpertCaches::warm_start`. Still cut: colibrì's
+//! opt-in LIVE re-pin (`REPIN`/`eheat`/`tier.h`'s decay-and-swap), off by default there too, and
+//! any VRAM/CUDA promotion (no CUDA backend here).
 
 use crate::config::Cfg;
 use crate::model::{ModelError, qt_load};
-use crate::quant::QT;
+use crate::quant::{QT, QTKind};
 use crate::safetensors::Shards;
+use std::collections::HashMap;
 
 #[cfg(target_os = "linux")]
 mod uring_load {
@@ -263,6 +268,17 @@ enum LoadKind {
 pub struct ExpertCache {
     capacity: usize,
     slots: Vec<ExpertSlot>,
+    /// Eagerly loaded via `pin_expert`, checked before `slots` on every lookup, never touched
+    /// by `insert`'s LRU eviction — colibrì's `m->pin[layer]`. Structurally separate from
+    /// `slots` rather than a "never evict" flag on the same `Vec`, so the existing LRU code in
+    /// `insert` needs zero changes to stay correct.
+    pinned: Vec<ExpertSlot>,
+    /// This layer's cumulative selection count per expert id — colibrì's `eusage[layer][*]`.
+    /// Seeded from `.rabbit_usage` at startup (`seed_usage`) and bumped live by `moe.rs`
+    /// (`record_selection`) on every router pick, then written back out (`usage_counts`) at
+    /// turn/response boundaries. Never decayed, unlike colibrì's separate (and here unported)
+    /// `eheat`.
+    usage: HashMap<usize, u64>,
     clock: u64,
     pub hits: u64,
     pub misses: u64,
@@ -292,6 +308,8 @@ impl ExpertCache {
         ExpertCache {
             capacity,
             slots: Vec::new(),
+            pinned: Vec::new(),
+            usage: HashMap::new(),
             clock: 0,
             hits: 0,
             misses: 0,
@@ -330,6 +348,10 @@ impl ExpertCache {
         bits: u8,
     ) -> Result<&ExpertSlot, ModelError> {
         self.clock += 1;
+        if let Some(pos) = self.pinned.iter().position(|s| s.eid == eid) {
+            self.hits += 1;
+            return Ok(&self.pinned[pos]);
+        }
         if let Some(pos) = self.slots.iter().position(|s| s.eid == eid) {
             self.hits += 1;
             self.slots[pos].used = self.clock;
@@ -365,7 +387,9 @@ impl ExpertCache {
         self.clock += 1;
         let mut misses = Vec::new();
         for &eid in eids {
-            if let Some(pos) = self.slots.iter().position(|s| s.eid == eid) {
+            if self.pinned.iter().any(|s| s.eid == eid) {
+                self.hits += 1;
+            } else if let Some(pos) = self.slots.iter().position(|s| s.eid == eid) {
                 self.hits += 1;
                 self.slots[pos].used = self.clock;
             } else if !misses.contains(&eid) {
@@ -427,9 +451,58 @@ impl ExpertCache {
     }
 
     /// Looks up an already-cached slot without touching LRU state or loading anything —
-    /// pairs with `ensure_loaded`, which the caller runs first for a whole batch.
+    /// pairs with `ensure_loaded`, which the caller runs first for a whole batch. Checks the
+    /// pinned tier first (never evicted, so a pinned id is always found here even if it would
+    /// also — redundantly — appear in `slots` from before it got pinned).
     pub fn get(&self, eid: usize) -> Option<&ExpertSlot> {
-        self.slots.iter().find(|s| s.eid == eid)
+        self.pinned.iter().find(|s| s.eid == eid).or_else(|| self.slots.iter().find(|s| s.eid == eid))
+    }
+
+    /// Records one router selection of `eid` this layer — colibrì's `eusage[layer][eid]++`,
+    /// called from `moe.rs` right after top-k selection, before cache resolution. Saturating,
+    /// not wrapping (colibrì's raw `uint32_t++` can theoretically wrap after 4B selections;
+    /// `u64` here makes that a non-concern, `saturating_add` is just cheap insurance).
+    pub(crate) fn record_selection(&mut self, eid: usize) {
+        let c = self.usage.entry(eid).or_insert(0);
+        *c = c.saturating_add(1);
+    }
+
+    /// This layer's current usage counts, for `ExpertCaches::save_usage` to persist.
+    pub(crate) fn usage_counts(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.usage.iter().map(|(&eid, &c)| (eid, c))
+    }
+
+    /// Seeds this layer's counters from persisted history at startup — before any live
+    /// `record_selection` calls this session, so `usage` ends up holding old+new counts in one
+    /// place with no separate delta-tracking needed (mirrors colibrì's `usage_load`, which adds
+    /// into the same `eusage` array live counting uses).
+    pub(crate) fn seed_usage(&mut self, counts: impl Iterator<Item = (usize, u64)>) {
+        for (eid, c) in counts {
+            self.usage.insert(eid, c);
+        }
+    }
+
+    pub(crate) fn is_pinned(&self, eid: usize) -> bool {
+        self.pinned.iter().any(|s| s.eid == eid)
+    }
+
+    pub fn pinned_len(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// Eagerly, synchronously loads `eid` and adds it to the pinned tier (a no-op if already
+    /// pinned) — colibrì's `pin_load`, one expert at a time. Reuses the same synchronous
+    /// single-expert primitive `get_or_load`'s miss path already calls, rather than inventing a
+    /// new loader. `used` is irrelevant for a pinned slot (never evicted, never touched by
+    /// `insert`), stamped 0.
+    pub(crate) fn pin_expert(&mut self, shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8) -> Result<(), ModelError> {
+        if self.is_pinned(eid) {
+            return Ok(());
+        }
+        let slot = load_expert(shards, cfg, layer, eid, bits, 0)?;
+        mlock_best_effort(&slot);
+        self.pinned.push(slot);
+        Ok(())
     }
 
     fn insert(&mut self, slot: ExpertSlot) {
@@ -462,6 +535,31 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
     let up = qt_load(shards, &p("up_proj"), i, d, bits)?;
     let down = qt_load(shards, &p("down_proj"), d, i, bits)?;
     Ok(ExpertSlot { eid, gate, up, down, used })
+}
+
+/// Best-effort `mlock` on a pinned expert's backing buffers, so the OS can't swap out memory
+/// pinning exists specifically to keep resident — same "unsafe libc call, best-effort, never a
+/// hard error" precedent already established for `posix_fadvise` in `safetensors.rs`. A failure
+/// (commonly `RLIMIT_MEMLOCK` too low for an unprivileged process) is logged once and otherwise
+/// ignored: losing the OS-level guarantee just means a pinned expert *could* get swapped under
+/// real memory pressure, same risk profile as not pinning it at all — not a correctness issue.
+fn mlock_best_effort(slot: &ExpertSlot) {
+    for qt in [&slot.gate, &slot.up, &slot.down] {
+        let bufs: Vec<(*const u8, usize)> = match &qt.kind {
+            QTKind::F32(v) => vec![(v.as_ptr() as *const u8, std::mem::size_of_val(v.as_slice()))],
+            QTKind::I8 { data, scale } => {
+                vec![(data.as_ptr() as *const u8, std::mem::size_of_val(data.as_slice())), (scale.as_ptr() as *const u8, std::mem::size_of_val(scale.as_slice()))]
+            }
+            QTKind::I4 { data, scale } | QTKind::I2 { data, scale } => {
+                vec![(data.as_ptr(), data.len()), (scale.as_ptr() as *const u8, std::mem::size_of_val(scale.as_slice()))]
+            }
+        };
+        for (ptr, len) in bufs {
+            if len > 0 && unsafe { libc::mlock(ptr as *const libc::c_void, len) } != 0 {
+                eprintln!("usage cache: mlock failed for a pinned expert (best-effort, continuing): {}", std::io::Error::last_os_error());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -847,5 +945,98 @@ mod tests {
         // not ~1.0 (which is what the pre-fix bug's unscaled decode would have produced).
         let gate_vals = qt_values(&batch_slot.gate);
         assert!(gate_vals.iter().any(|&v| v.abs() > 1.5), "gate scale (2.0) doesn't look applied: {gate_vals:?}");
+    }
+
+    #[test]
+    fn record_selection_and_usage_counts_round_trip() {
+        let mut cache = ExpertCache::new(4);
+        cache.record_selection(3);
+        cache.record_selection(3);
+        cache.record_selection(7);
+        let counts: std::collections::HashMap<usize, u64> = cache.usage_counts().collect();
+        assert_eq!(counts.get(&3), Some(&2));
+        assert_eq!(counts.get(&7), Some(&1));
+    }
+
+    #[test]
+    fn seed_usage_sets_counters_seen_by_usage_counts() {
+        let mut cache = ExpertCache::new(4);
+        cache.seed_usage(vec![(1usize, 100u64), (2, 200)].into_iter());
+        cache.record_selection(2); // live count must land on top of the seeded value, not replace it via a fresh insert
+        let counts: std::collections::HashMap<usize, u64> = cache.usage_counts().collect();
+        assert_eq!(counts.get(&1), Some(&100));
+        assert_eq!(counts.get(&2), Some(&201));
+    }
+
+    #[test]
+    fn pin_expert_is_returned_by_get_and_counted_as_a_hit_not_a_miss() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_pin_hit", 3, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(3, 4, 6);
+        let mut cache = ExpertCache::new(4);
+
+        cache.pin_expert(&shards, &cfg, 0, 1, 32).unwrap();
+        assert!(cache.is_pinned(1));
+        assert_eq!(cache.pinned_len(), 1);
+        assert_eq!(cache.hits, 0, "pin_expert itself is not a cache lookup, must not touch hits/misses");
+        assert_eq!(cache.misses, 0);
+        assert_eq!(cache.len(), 0, "a pinned expert must not also land in the ordinary LRU slots");
+
+        let slot = cache.get(1).unwrap();
+        assert_eq!(slot.eid, 1);
+
+        // begin_loading/get_or_load must treat a pinned id as a hit, never as a miss to load.
+        cache.begin_loading(&shards, &cfg, 0, &[1], 32).unwrap();
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.misses, 0);
+
+        cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
+        assert_eq!(cache.hits, 2);
+        assert_eq!(cache.misses, 0);
+    }
+
+    #[test]
+    fn pinned_experts_survive_lru_pressure_at_capacity_one() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_pin_survives_lru", 4, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(4, 4, 6);
+        let mut cache = ExpertCache::new(1); // capacity 1: every OTHER load evicts the LRU slot
+
+        cache.pin_expert(&shards, &cfg, 0, 0, 32).unwrap();
+        // hammer the tiny LRU cache with unrelated experts -- must never disturb the pin.
+        for eid in [1, 2, 3, 1, 2, 3] {
+            cache.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
+        }
+        assert!(cache.is_pinned(0));
+        assert_eq!(cache.pinned_len(), 1);
+        assert!(cache.get(0).is_some(), "pinned expert 0 must still resolve after LRU churn");
+    }
+
+    #[test]
+    fn get_prefers_pinned_over_a_stale_lru_slot_with_the_same_id() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_pin_precedence", 2, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(2, 4, 6);
+        let mut cache = ExpertCache::new(4);
+
+        // load id 0 the normal way first (lands in `slots`), then also pin it -- `get` must
+        // still resolve without ambiguity/panics, and pinned lookup must not regress hit
+        // counting for the ordinary path.
+        cache.get_or_load(&shards, &cfg, 0, 0, 32).unwrap();
+        cache.pin_expert(&shards, &cfg, 0, 0, 32).unwrap();
+        assert!(cache.get(0).is_some());
+        assert!(cache.is_pinned(0));
+    }
+
+    #[test]
+    fn pin_expert_is_idempotent() {
+        let fixture = build_experts_fixture("rabbit_test_ecache_pin_idempotent", 2, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(2, 4, 6);
+        let mut cache = ExpertCache::new(4);
+
+        cache.pin_expert(&shards, &cfg, 0, 0, 32).unwrap();
+        cache.pin_expert(&shards, &cfg, 0, 0, 32).unwrap();
+        assert_eq!(cache.pinned_len(), 1, "pinning the same id twice must not duplicate the slot");
     }
 }
