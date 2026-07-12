@@ -377,12 +377,22 @@ impl ExpertCache {
         }
         self.misses += misses.len() as u64;
 
+        // Timed from here, not just around the actual disk reads below: `submit_batch` itself
+        // does real synchronous I/O first (reading each miss's `.qs`/FP8 scale sidecar, a
+        // handful of small `pread`s per expert before it ever touches the ring) — leaving that
+        // untimed would silently undercount `load_nanos` for the async path relative to what
+        // `finish_loading` measures for its own wait, making the two look artificially
+        // different without any real work having moved anywhere. Caught this by comparing
+        // `load_nanos` readings against total wall-clock time, which didn't move the way the
+        // I/O counter suggested it should have — see the project memory for the full story.
+        let load_t = std::time::Instant::now();
+
         #[cfg(target_os = "linux")]
         if let Some(pending) = uring_load::submit_batch(&mut self.ring, shards, cfg, layer, &misses)? {
+            self.load_nanos += load_t.elapsed().as_nanos() as u64;
             return Ok(PendingExpertLoad(LoadKind::Async(pending)));
         }
 
-        let load_t = std::time::Instant::now();
         let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock)?;
         self.load_nanos += load_t.elapsed().as_nanos() as u64;
         Ok(PendingExpertLoad(LoadKind::Sync(loaded)))
