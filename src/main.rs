@@ -90,8 +90,32 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = Rng::new(args.seed);
     let stop_ids: Vec<usize> = model.cfg.stop_ids.iter().map(|&id| id as usize).collect();
 
+    // Inlines `generate::generate`'s own loop (rather than calling it directly) so each step
+    // — prefill, then one per new token — reports timing to stderr as it happens. A 744B-param
+    // model forwarding on CPU can take a long time per step; silent output until the very end
+    // would be indistinguishable from a hang.
     let t1 = std::time::Instant::now();
-    let out_ids = generate::generate(&model, &shards, &mut caches, &mut kv, &prompt_ids, args.max_tokens, &sampling, &mut rng, &stop_ids)?;
+    eprintln!("prefill ({} tokens)...", prompt_ids.len());
+    let mut step_t = std::time::Instant::now();
+    let mut logits = generate::step(&model, &shards, &mut caches, &mut kv, &prompt_ids, 0)?;
+    eprintln!("  prefill done in {:.1}s", step_t.elapsed().as_secs_f32());
+    let mut pos = prompt_ids.len();
+
+    let mut out_ids = Vec::with_capacity(args.max_tokens);
+    while out_ids.len() < args.max_tokens {
+        let next = generate::pick_token(&logits, &sampling, &mut rng, None);
+        if stop_ids.contains(&next) {
+            break;
+        }
+        out_ids.push(next);
+        if out_ids.len() >= args.max_tokens {
+            break;
+        }
+        step_t = std::time::Instant::now();
+        logits = generate::step(&model, &shards, &mut caches, &mut kv, &[next], pos)?;
+        eprintln!("  token {}/{} in {:.1}s", out_ids.len() + 1, args.max_tokens, step_t.elapsed().as_secs_f32());
+        pos += 1;
+    }
     let elapsed = t1.elapsed().as_secs_f32();
 
     let out_i32: Vec<i32> = out_ids.iter().map(|&id| id as i32).collect();
