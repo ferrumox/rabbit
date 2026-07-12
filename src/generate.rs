@@ -50,6 +50,13 @@ impl ExpertCaches {
             .collect();
         ExpertCaches(v)
     }
+
+    /// Summed `hits`/`misses` across every MoE layer's cache — a coarse signal for whether
+    /// generation time is still dominated by disk loads (misses climbing every step) or has
+    /// become compute-bound (hits dominating, misses flat).
+    pub fn hit_miss_totals(&self) -> (u64, u64) {
+        self.0.iter().flatten().fold((0, 0), |(h, m), c| (h + c.hits, m + c.misses))
+    }
 }
 
 fn embed_tokens(model: &Model, ids: &[usize]) -> Vec<f32> {

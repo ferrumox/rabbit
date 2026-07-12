@@ -98,7 +98,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("prefill ({} tokens)...", prompt_ids.len());
     let mut step_t = std::time::Instant::now();
     let mut logits = generate::step(&model, &shards, &mut caches, &mut kv, &prompt_ids, 0)?;
-    eprintln!("  prefill done in {:.1}s", step_t.elapsed().as_secs_f32());
+    let (h, m) = caches.hit_miss_totals();
+    eprintln!("  prefill done in {:.1}s (expert cache: {h} hits, {m} misses)", step_t.elapsed().as_secs_f32());
     let mut pos = prompt_ids.len();
 
     let mut out_ids = Vec::with_capacity(args.max_tokens);
@@ -113,7 +114,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         step_t = std::time::Instant::now();
         logits = generate::step(&model, &shards, &mut caches, &mut kv, &[next], pos)?;
-        eprintln!("  token {}/{} in {:.1}s", out_ids.len() + 1, args.max_tokens, step_t.elapsed().as_secs_f32());
+        let (h, m) = caches.hit_miss_totals();
+        eprintln!(
+            "  token {}/{} in {:.1}s (expert cache: {h} hits, {m} misses)",
+            out_ids.len() + 1,
+            args.max_tokens,
+            step_t.elapsed().as_secs_f32()
+        );
         pos += 1;
     }
     let elapsed = t1.elapsed().as_secs_f32();
