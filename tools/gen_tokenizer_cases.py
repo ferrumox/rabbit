@@ -1,7 +1,7 @@
 """Generates text->ids ground truth from the REAL GLM-5.2 tokenizer (`tokenizers` library,
 not rabbit's own port), for `tests/tokenizer_fixture.rs` to check `src/tokenizer.rs` against.
 
-Same spirit as colibri's `tests/test_tok.c` (`TEXT\tID,ID,..` cases from an HF oracle) but as
+Same spirit as the reference implementation's `tests/test_tok.c` (`TEXT\tID,ID,..` cases from an HF oracle) but as
 JSON, since that's what the Rust side already speaks fluently.
 
 Usage:

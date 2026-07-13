@@ -4,7 +4,7 @@ as opposed to tests/oracle/make_glm_oracle.py's tiny random model (vocab_size=25
 exists to validate the forward pass, not the tokenizer.
 
 Not part of `cargo test`: it needs network access and the real ~150k-entry vocab, so it's a
-dev-time check, same spirit as colibri's tests/test_tok.c (see rabbit-plan.md, Fase 2).
+dev-time check, same spirit as the reference implementation's tests/test_tok.c (see rabbit-plan.md, Fase 2).
 
 Usage:
     pip install huggingface_hub

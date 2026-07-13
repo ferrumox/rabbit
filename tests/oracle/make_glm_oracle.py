@@ -7,8 +7,8 @@ MLA: rabbit can validate token-exact output without needing the real sparse-sele
 to be exercised by this particular fixture (that's covered separately by
 `attention.rs`'s `dsa_force_select_all_matches_plain_dense_attention` unit test).
 
-Adapted from colibri's `c/tools/make_glm_oracle.py` — self-contained, no colibri checkout
-needed. Run FROM this directory (`tests/oracle/`), since it writes `glm_tiny/`+`ref_glm.json`
+Adapted from the reference implementation's `c/tools/make_glm_oracle.py` — self-contained, no
+extra checkout needed. Run FROM this directory (`tests/oracle/`), since it writes `glm_tiny/`+`ref_glm.json`
 relative to the current directory:
 
     pip install torch transformers safetensors huggingface_hub numpy
@@ -95,7 +95,7 @@ print("tf_pred:", tf_pred)
 # into one `gate_up_proj[E, 2*I, D]` parameter for compute efficiency (its forward does
 # `nn.functional.linear(x, gate_up_proj[e]).chunk(2, dim=-1)`, i.e. rows `[0:I]` are gate,
 # rows `[I:2I]` are up — see `GlmMoeDsaExperts.forward` in `modeling_glm_moe_dsa.py`) and
-# `down_proj[E, D, I]` similarly. colibri's loader (and rabbit's port) expect the real
+# `down_proj[E, D, I]` similarly. The reference loader (and rabbit's port) expect the real
 # checkpoint's per-expert-file layout instead (`experts.{id}.{gate,up,down}_proj.weight`),
 # so split them back out here rather than adding a "fused" special case to the Rust loader.
 sd = model.state_dict()

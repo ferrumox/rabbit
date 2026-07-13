@@ -1,6 +1,6 @@
 //! Port of `tok_unicode.h` — binary-searchable Unicode range tables for the
 //! cl100k-style pre-tokenizer's `\p{L}`, `\p{N}`, `\s` classes. Ranges are
-//! extracted verbatim from colibri's generated header (itself produced by
+//! extracted verbatim from the reference implementation's generated header (itself produced by
 //! `tools/gen_unicode.py`); do not hand-edit — regenerate from the C header instead.
 
 pub(crate) static UNI_L: &[(u32, u32)] = &[

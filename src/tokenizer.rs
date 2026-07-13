@@ -382,7 +382,7 @@ impl Tokenizer {
                 }
                 specials.push(Special { text: content, id });
             }
-            // longest match first, same as colibri's qsort(cmp_sp_len).
+            // longest match first, same as the reference implementation's qsort(cmp_sp_len).
             specials.sort_by_key(|sp| std::cmp::Reverse(sp.text.len()));
         }
 

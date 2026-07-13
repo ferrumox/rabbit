@@ -1,4 +1,4 @@
-//! Port of `load_cfg` (colibri/c/glm.c:636) — reads config.json into `Cfg`.
+//! Port of `load_cfg` (`glm.c:636` in the reference implementation) — reads config.json into `Cfg`.
 
 use serde_json::Value;
 use std::fmt;

@@ -26,11 +26,11 @@
 //!   one io_uring ring sized to the batch) doesn't need one. A batch this large only happens
 //!   with `S`x`topk` distinct experts in one forward, which stays well under 64 for realistic
 //!   batch sizes even on the real 21,504-expert model.
-//! - No **O_DIRECT**: colibri's own default is buffered reads too (`g_direct=0` — "su questo
-//!   host... il buffered liscio e' risultato il migliore"); O_DIRECT needs page-aligned
-//!   buffers/offsets/lengths, which is real complexity for a benefit the original's own
-//!   measurements don't reliably show. The `io_uring` win here is purely about collapsing N
-//!   syscalls into ~1, which buffered reads already get.
+//! - No **O_DIRECT**: the reference implementation's own default is buffered reads too
+//!   (`g_direct=0` — "su questo host... il buffered liscio e' risultato il migliore");
+//!   O_DIRECT needs page-aligned buffers/offsets/lengths, which is real complexity for a
+//!   benefit the original's own measurements don't reliably show. The `io_uring` win here
+//!   is purely about collapsing N syscalls into ~1, which buffered reads already get.
 //! - No **`.qs` pre-quantized fast path**: same cut as `model.rs`'s `qt_load` — out of scope
 //!   for this whole port stage (see `rabbit-plan.md`).
 //!
@@ -68,7 +68,7 @@ mod uring_load {
         cols: usize,
         loc: TensorLocation,
         /// `Some(scale)` when a `{name}.qs` sibling exists: `loc` then points at already-
-        /// packed int8/int4/int2 bytes (colibri's pre-quantized container, see `model.rs`'s
+        /// packed int8/int4/int2 bytes (the reference's pre-quantized container format, see `model.rs`'s
         /// `qt_load`) to wrap as-is via `QT::from_packed`, not raw f32/bf16/FP8 to decode and
         /// requantize. The scale itself is tiny (`rows` floats) — fetched with a plain
         /// `read_f32` up front rather than folded into the batched `io_uring` reads, which

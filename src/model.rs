@@ -6,7 +6,7 @@
 //!
 //! `qt_load` mirrors `qt_from_disk`'s fast path: if `{name}.qs` exists, `name` already holds
 //! our own packed int8/int4/int2 bytes (written by an external converter — `tools/convert.rs`,
-//! or the community's pre-converted checkpoints for colibri itself) and `.qs` holds the
+//! or community pre-converted checkpoints in the same container format) and `.qs` holds the
 //! per-row F32 scale, so the tensor is wrapped via `QT::from_packed` with no quantization
 //! work at load time. Otherwise it falls back to the plain path (read as f32/bf16/f16/FP8,
 //! quantize at load) — the only branch the tiny oracle (no `.qs` siblings) ever exercises.

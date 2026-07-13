@@ -13,7 +13,7 @@
 //! `y[S,O] = x[S,I] @ W^T` throughout, `W` given in one of the `QT` formats from `quant.rs`.
 //! The IDOT kernels additionally quantize activations to int8 per row (`qrow_i8`, scalar only
 //! in the original — never vectorized there, so not here either) so the whole dot product
-//! runs in integer arithmetic — colibri measures this at ~2-3x over the float-weight path, at
+//! runs in integer arithmetic — the reference implementation measures this at ~2-3x over the float-weight path, at
 //! ~0.3% added RMS error per matmul from the activation quantization.
 
 use crate::quant::{QT, QTKind};
@@ -23,7 +23,7 @@ use rayon::prelude::*;
 use std::arch::x86_64::*;
 
 /// Every `matmul_*` below parallelizes over output rows (`oi`, 0..O) with rayon — same axis
-/// colibri's `#pragma omp parallel for` picks for its C matmul kernels, and the natural one:
+/// the reference implementation's `#pragma omp parallel for` picks for its C matmul kernels, and the natural one:
 /// each `oi` reads the same `x`/activations but a disjoint row of the weight matrix, so there's
 /// no cross-row dependency. The catch is `y`'s own layout (`y[si*O+oi]`, row-major by sequence
 /// position): a fixed `oi` touches `S` elements strided by `O`, which safe Rust can't split into
@@ -42,7 +42,7 @@ fn transpose_so(y: &mut [f32], yt: &[f32], s: usize, o: usize) {
 
 thread_local! {
     /// The `yt` transpose buffer every `matmul_*` below needs, reused across calls instead of
-    /// freshly allocated each time — one of colibri's own tricks (`_Thread_local` scratch
+    /// freshly allocated each time — one of the reference implementation's own tricks (`_Thread_local` scratch
     /// buffers, `glm.c:458`) that a naive Rust port doesn't get for free just from adding
     /// `rayon`. Thread-local, not a shared pool: every call into a `matmul_*` function happens
     /// synchronously on the SAME calling thread (the generation loop never calls `matmul_qt`
@@ -641,7 +641,7 @@ fn matmul_i4_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[f32]
 const I4_IDOT_MIN_S: usize = 2;
 
 /// y[S,O] = x[S,I] @ W^T for a `QT` in any format — the dispatcher every layer calls.
-/// int8 IDOT is always used (colibri measures 1.4-2.5x over the float-weight path); int4
+/// int8 IDOT is always used (the reference implementation measures 1.4-2.5x over the float-weight path); int4
 /// IDOT only kicks in at `S >= I4_IDOT_MIN_S`; int2 has no IDOT path (matches the original,
 /// which never added one).
 pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QT, s: usize) {
