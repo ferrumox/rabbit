@@ -201,7 +201,7 @@ pub enum Dsa<'a> {
 }
 
 /// Whether to use the weight-absorbed decode path or the dense reconstruction path.
-/// `Auto` matches colibri's default heuristic (`g_absorb<0`): absorbed for `S<=4`.
+/// `Auto` matches the reference implementation's default heuristic (`g_absorb<0`): absorbed for `S<=4`.
 pub enum Absorb {
     Auto,
     Always,

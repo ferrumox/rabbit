@@ -1,4 +1,4 @@
-//! Integration tests against the tiny GLM-5.2 oracle, matching colibri's own self-test
+//! Integration tests against the tiny GLM-5.2 oracle, matching the reference implementation's own self-test
 //! criteria (`setup.sh`'s "32/32 posizioni" teacher-forcing check and its greedy-replay
 //! check): a single forward pass over `full_ids` must reproduce the reference's per-position
 //! argmax exactly, AND incremental greedy decode from `prompt_ids` must reproduce
@@ -46,7 +46,7 @@ fn load_oracle() -> Option<Oracle> {
     let tf_pred = as_usize_vec("tf_pred");
     assert_eq!(full_ids.len(), tf_pred.len(), "ref_glm.json: full_ids/tf_pred length mismatch");
 
-    // dbits=ebits=16: colibri's own self-test (setup.sh: `./glm 64 16 16`) uses bits>=16,
+    // dbits=ebits=16: the reference implementation's own self-test (setup.sh: `./glm 64 16 16`) uses bits>=16,
     // which lands in QT's F32 passthrough format — exact, no quantization noise. Anything
     // less would risk flipping an argmax on this tiny random model purely from quantization
     // error, which is not what these tests are meant to catch.

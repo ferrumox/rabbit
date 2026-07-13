@@ -4,7 +4,7 @@
 //!
 //! `bits` and format are independent: `bits` sets the quantization range (`qmax`) and divides
 //! the container into three storage tiers, but e.g. `bits=3` still lands in the int4 tier
-//! (`>=3`) using less than its full nibble range — this is what colibri's `NOPACK` env var
+//! (`>=3`) using less than its full nibble range — this is what the reference implementation's `NOPACK` env var
 //! exploits to store sub-8-bit values in an unpacked int8 container for validating that the
 //! packed and unpacked encodings agree bit-for-bit (see the tests below).
 //!
@@ -66,7 +66,7 @@ pub enum QTKind {
 
 impl QT {
     /// Chooses a format from `bits`, mirroring `qt_alloc`: `>=16` -> f32, `>=5` (or
-    /// `nopack`, colibri's `NOPACK=1`) -> int8, `>=3` -> int4, else -> int2.
+    /// `nopack`, the reference's `NOPACK=1`) -> int8, `>=3` -> int4, else -> int2.
     pub fn alloc(rows: usize, cols: usize, bits: u8, nopack: bool) -> QT {
         let kind = if bits >= 16 {
             QTKind::F32(vec![0.0; rows * cols])
@@ -102,7 +102,7 @@ impl QT {
         }
     }
 
-    /// Wraps already-quantized bytes — colibri's `name.qs` pre-quantized container (see
+    /// Wraps already-quantized bytes — the reference's `name.qs` pre-quantized container (see
     /// `qt_from_disk` in `glm.c`): `data` is the packed int8/int4/int2 payload straight off
     /// disk (no `quantize_rows`/`pack_int4`/`pack_int2` work), `scale` is its per-row F32
     /// scale, also read straight off disk. Format is inferred from `data.len()` against the
