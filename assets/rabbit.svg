@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="620" height="140" viewBox="0 0 620 140">
+  <g shape-rendering="crispEdges">
+    <!-- left ear -->
+    <rect x="28" y="0" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="0" width="14" height="14" fill="#d7875f"/>
+    <rect x="28" y="14" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="14" width="14" height="14" fill="#ffd7af"/>
+    <rect x="28" y="28" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="28" width="14" height="14" fill="#ffd7af"/>
+    <rect x="28" y="42" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="42" width="14" height="14" fill="#d7875f"/>
+    <!-- right ear -->
+    <rect x="98" y="0" width="14" height="14" fill="#d7875f"/>
+    <rect x="112" y="0" width="14" height="14" fill="#d7875f"/>
+    <rect x="98" y="14" width="14" height="14" fill="#ffd7af"/>
+    <rect x="112" y="14" width="14" height="14" fill="#d7875f"/>
+    <rect x="98" y="28" width="14" height="14" fill="#ffd7af"/>
+    <rect x="112" y="28" width="14" height="14" fill="#d7875f"/>
+    <rect x="98" y="42" width="14" height="14" fill="#d7875f"/>
+    <rect x="112" y="42" width="14" height="14" fill="#d7875f"/>
+    <!-- head, row 4 -->
+    <rect x="14" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="28" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="56" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="70" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="84" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="98" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="112" y="56" width="14" height="14" fill="#d7875f"/>
+    <rect x="126" y="56" width="14" height="14" fill="#d7875f"/>
+    <!-- head, row 5 (eyes) -->
+    <rect x="14" y="70" width="14" height="14" fill="#d7875f"/>
+    <rect x="28" y="70" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="70" width="14" height="14" fill="#3a3a3a"/>
+    <rect x="56" y="70" width="14" height="14" fill="#d7875f"/>
+    <rect x="70" y="70" width="14" height="14" fill="#d7875f"/>
+    <rect x="84" y="70" width="14" height="14" fill="#d7875f"/>
+    <rect x="98" y="70" width="14" height="14" fill="#3a3a3a"/>
+    <rect x="112" y="70" width="14" height="14" fill="#d7875f"/>
+    <rect x="126" y="70" width="14" height="14" fill="#d7875f"/>
+    <!-- head, row 6 (cheeks + nose) -->
+    <rect x="28" y="84" width="14" height="14" fill="#d7875f"/>
+    <rect x="42" y="84" width="14" height="14" fill="#d7875f"/>
+    <rect x="56" y="84" width="14" height="14" fill="#d7875f"/>
+    <rect x="70" y="84" width="14" height="14" fill="#ff9fb0"/>
+    <rect x="84" y="84" width="14" height="14" fill="#d7875f"/>
+    <rect x="98" y="84" width="14" height="14" fill="#d7875f"/>
+    <rect x="112" y="84" width="14" height="14" fill="#d7875f"/>
+    <!-- body, row 7 -->
+    <rect x="14" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="28" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="42" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="56" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="70" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="84" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="98" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="112" y="98" width="14" height="14" fill="#af8760"/>
+    <rect x="126" y="98" width="14" height="14" fill="#af8760"/>
+    <!-- body, row 8 (chest tuft) -->
+    <rect x="28" y="112" width="14" height="14" fill="#af8760"/>
+    <rect x="42" y="112" width="14" height="14" fill="#af8760"/>
+    <rect x="56" y="112" width="14" height="14" fill="#af8760"/>
+    <rect x="70" y="112" width="14" height="14" fill="#ffd7af"/>
+    <rect x="84" y="112" width="14" height="14" fill="#af8760"/>
+    <rect x="98" y="112" width="14" height="14" fill="#af8760"/>
+    <rect x="112" y="112" width="14" height="14" fill="#af8760"/>
+    <!-- feet, row 9 -->
+    <rect x="42" y="126" width="14" height="14" fill="#af8760"/>
+    <rect x="56" y="126" width="14" height="14" fill="#af8760"/>
+    <rect x="84" y="126" width="14" height="14" fill="#af8760"/>
+    <rect x="98" y="126" width="14" height="14" fill="#af8760"/>
+  </g>
+  <text x="252" y="62" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="52" font-weight="bold" fill="#af8760">rabbit</text>
+  <text x="252" y="94" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="19" fill="#808080" font-style="italic">small hops, immense model</text>
+  <text x="252" y="122" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="15" fill="#9a9a9a">GLM-5.2 &#183; 744B MoE &#183; int4 &#183; streaming CPU</text>
+</svg>

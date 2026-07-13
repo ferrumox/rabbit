@@ -1,4 +1,6 @@
-# rabbit
+<p align="center">
+  <img src="assets/rabbit.svg" width="500" alt="rabbit — small hops, immense model">
+</p>
 
 A Rust inference engine for GLM-5.2 (744B-parameter MoE): the dense part resident in RAM at
 int4, the 21,504 routed experts streamed on demand from disk. Part of the [ferrumox](../) AI
