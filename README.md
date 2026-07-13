@@ -2,46 +2,72 @@
   <img src="assets/rabbit.svg" width="500" alt="rabbit — small hops, immense model">
 </p>
 
-A Rust inference engine for GLM-5.2 (744B-parameter MoE): the dense part resident in RAM at
-int4, the 21,504 routed experts streamed on demand from disk. Part of the [ferrumox](../) AI
-lab, alongside [fox](../fox) (a production local-LLM server wrapping llama.cpp) — rabbit is the
-opposite kind of project: a research engine for a model that doesn't fit in memory even
-offloaded, built by hand instead of wrapping an existing runtime.
+**Small hops, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a single machine by keeping the dense part resident in RAM at int4 and streaming the 21,504 routed experts from disk on demand — a Rust reimplementation of [colibrì](https://github.com/JustVugg/colibri)'s C engine.
 
-## What it does today
+```
+$ rabbit --model /nvme/glm52_i4 --prompt "The capital of France is"
+prompt: 6 tokens
+prefill (6 tokens)...
+  prefill done in 4.2s (expert cache: 12 hits, 468 misses, 3.1s in disk I/O)
+  token 1/64 in 2.1s (1.4s in disk I/O this step; expert cache totals: 20 hits, 476 misses)
+  ...
+ Paris. It is located in the north of the country...
+```
 
-- `--prompt "<text>"` — single-shot completion.
-- `--chat` — interactive multi-turn chat with GLM-5.2's official template, `:reset`/`:quit`,
-  and `--session <path>` to persist the KV cache across process restarts.
-- `--serve` — an OpenAI-compatible HTTP server (`POST /v1/chat/completions`, streaming and
-  non-streaming; `GET /v1/models`).
-- A persistent expert usage cache (`.rabbit_usage`, automatic, no flag needed) that learns which
-  experts your usage routes to most and pins them in RAM across restarts.
-- int4/int8/int2 quantization, native FP8 checkpoint loading, MLA attention with weight
-  absorption for decode, the DSA sparse-attention indexer, `io_uring`-batched expert streaming,
-  and `rayon`-parallel kernels across the hot paths.
+## The idea
 
-See [`rabbit-plan.md`](rabbit-plan.md) for the full phase-by-phase history, and the `v0.*.0`
-git tags for a working snapshot at the end of each phase.
+A 744B-parameter MoE model activates only ~40B parameters per token, and only a fraction of
+those change token to token (the routed experts). So:
 
-## Why
+- the **dense part** (attention, shared expert, embeddings) stays **resident in RAM at int4**;
+- the **21,504 routed experts** (75 MoE layers × 256 experts, ~19 MB each at int4) live **on
+  disk** and are **streamed on demand**, via a per-layer LRU cache, a persistent learned pin for
+  the hottest ones, and the OS page cache as a free extra tier.
 
-This engine's design — MLA attention with weight absorption, the DSA sparse-attention indexer,
-the `noaux_tc` MoE router, on-demand expert streaming from disk, the GLM-5.2 chat template — is
-ported from [colibrì](https://github.com/JustVugg/colibri), a C, hand-written, effectively
-zero-dependency inference engine for the same model. rabbit reimplements the same algorithms in
-Rust, with a short list of well-justified dependencies instead of colibrì's zero-dep stance —
-see `rabbit-plan.md` for the reasoning on each one — plus its own performance work on top (a
-measured 3.5x from parallelizing the matmul kernels with `rayon`, ~29% from parallelizing the
-absorbed-attention decode path, KV-session and expert-usage persistence colibrì doesn't have in
-this exact form). Validated against a synthetic tiny GLM-5.2 oracle (token-exact teacher-forcing,
-the same self-test colibrì uses) and against the real 744B checkpoint.
+## What's implemented
 
-The name is a nod to [RabbitLLM](https://github.com/ManuelSLemos/RabbitLLM), an earlier,
-unrelated project of mine (a fork of AirLLM that streams full model layers through limited GPU
-VRAM) — same broad interest in running large models on constrained hardware, different problem
-and a completely different technique (CPU-side quantized MoE expert streaming here, vs. GPU
-layer streaming there). Nothing in this codebase is derived from that one.
+- **Faithful GLM-5.2 (`glm_moe_dsa`) forward** — validated token-exact against a synthetic
+  oracle (32/32 teacher-forcing, 20/20 greedy decode) and against the real 744B checkpoint.
+- **MLA attention** with **weight absorption** for decode (no per-token k/v reconstruction) and
+  dense reconstruction for prefill — validated exact against each other, and parallelized with
+  `rayon` across attention heads.
+- **DSA sparse attention** — the lightning indexer, with selection sharing between "full" and
+  "shared" layers across a forward pass.
+- **`noaux_tc` sigmoid MoE router** with correction bias, shared expert, batch-union expert
+  dispatch (each unique expert in a batch is read and applied once).
+- **int4/int8/int2 quantization**, native **FP8** (E4M3, block-scale) checkpoint loading, and a
+  **`.qs` pre-quantized fast path** — no external converter needed for any of the three.
+- **AVX2 + AVX-512/VNNI kernels**, runtime-selected, plus `rayon` parallelization across CPU
+  cores (not just SIMD) for every matmul and the absorbed-attention decode path.
+- **`io_uring`-batched expert streaming**, with a sequential-`pread` fallback.
+- **Persistent expert usage cache** (`.rabbit_usage`) — learns which experts your usage routes
+  to and pins them, lazily: only once a candidate is actually loaded through normal use, unlike
+  colibrì's own eager default (see `rabbit-plan.md` for the measured reason it was changed).
+- **KV-cache persistence** (`--session`) — conversations reopen warm across restarts, via an
+  append-only on-disk format.
+- **OpenAI-compatible HTTP server** (`--serve`) — streaming and non-streaming
+  `/v1/chat/completions`, `/v1/models`.
+- **Multi-turn chat** (`--chat`) with GLM-5.2's official template.
+
+Not yet built: a standalone `.qs` converter (currently relies on checkpoints pre-converted by
+colibrì's own tooling), live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
+grammar-constrained decoding, and a web UI. See `rabbit-plan.md` for the full phase-by-phase
+history.
+
+## Honest numbers (Ryzen AI 9 HX 370, 12 cores/24 threads)
+
+| metric | value |
+|---|---|
+| checkpoint | 378 GB (`jlnsrk/GLM-5.2-colibri-int4`) |
+| `rayon` matmul parallelization | 128.9s → 36.3s for 5 tokens (3.5×), bit-exact output |
+| `rayon` absorbed-attention parallelization | 224.3s → 158.4s for 70 decode tokens (~29% faster) |
+| decode I/O share, steady state (warm cache) | ~30–35% disk I/O / 65–70% compute |
+| prefill I/O share (cold cache) | ~75% disk I/O |
+| expert-cache hit rate, steady-state decode | ~70–77% (miss floor ~23–30%) |
+| usage-cache auto-pin | 150 experts (2/layer × 75 MoE layers) → prefill hits 0 → 136 |
+
+All measured against the real checkpoint, not estimated — see the phase entries in
+`rabbit-plan.md` for the commits and full methodology behind each number.
 
 ## Building
 
@@ -56,12 +82,45 @@ cargo test
 ./target/release/rabbit --model <checkpoint-dir> --serve --port 8000
 ```
 
-## Status
+`--model` takes a directory with the same layout colibrì's converter produces — a pre-converted
+checkpoint such as [`jlnsrk/GLM-5.2-colibri-int4`](https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4)
+works directly, no conversion step needed. See `--help` for the full flag list
+(`--max-tokens`, `--temperature`, `--nucleus`, `--expert-cache`, `--no-usage-cache`, ...).
 
-All phases through Fase 15 are complete (see `rabbit-plan.md`). Not yet built: a standalone
-`.qs` converter (task tracked as Fase 10 — currently relies on pre-converted checkpoints), live
-expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON, and grammar-constrained decoding
-— none of these are required for the engine to work, they're future scope.
+## Repo layout
+
+```
+src/
+├── safetensors.rs, config.rs          shard index + config loading
+├── tokenizer.rs, unicode_tables.rs    byte-level BPE tokenizer
+├── quant.rs, kernels.rs               quantization + scalar/AVX2/AVX-512 kernels
+├── model.rs, attention.rs, moe.rs     dense model, MLA/DSA attention, MoE router
+├── expert_cache.rs, usage_cache.rs    LRU expert streaming + persistent usage learning
+├── generate.rs, kv_session.rs         generation loop + KV-cache persistence
+├── chat.rs, server.rs, main.rs        chat template, HTTP server, CLI entrypoint
+tests/oracle/     synthetic GLM-5.2 oracle generator + teacher-forcing fixtures
+tools/            real-tokenizer validation fixtures (dev-only, not a runtime dependency)
+benches/          criterion benchmarks (kernels, expert loading)
+```
+
+## Why Rust, why colibrì
+
+colibrì is C, hand-written, effectively zero-dependency. rabbit ports the same algorithms to
+Rust with a short list of well-justified dependencies instead of a zero-dep stance — see
+`rabbit-plan.md` for the reasoning on each one — plus its own performance work on top that
+colibrì doesn't have in this exact form (the `rayon` parallelization above, KV-session and
+expert-usage persistence). Validated the same way colibrì validates itself: token-exact
+teacher-forcing against a tiny synthetic model with the real architecture.
+
+Part of the [ferrumox](../) AI lab, alongside [fox](../fox) (a production local-LLM server
+wrapping llama.cpp) — rabbit is the opposite kind of project: a research engine for a model that
+doesn't fit in memory even offloaded, built by hand instead of wrapping an existing runtime.
+
+The name is a nod to [RabbitLLM](https://github.com/ManuelSLemos/RabbitLLM), an earlier,
+unrelated project of mine (a fork of AirLLM that streams full model layers through limited GPU
+VRAM) — same interest in running large models on constrained hardware, different problem and a
+completely different technique (CPU-side quantized MoE expert streaming here, vs. GPU layer
+streaming there). Nothing in this codebase is derived from that one.
 
 ## Versioning
 
