@@ -30,6 +30,34 @@ pub struct ServeConfig {
     /// flag. Not exposed per-request in v1 (OpenAI's Chat Completions shape has no field to
     /// map it from); every request served by one process gets the same setting.
     pub think: bool,
+    /// Ceiling for a per-request `max_tokens` override, taken from the CLI's own `--max-tokens`
+    /// (the same value `session.max_tokens` is initialized from). A request asking for more
+    /// than this gets clamped down to it rather than rejected — matches colibrì's own
+    /// `da260c3` fix (real client SDKs send large default `max_tokens` regardless of what the
+    /// server can actually do; rejecting broke trivial requests).
+    pub max_tokens_cap: usize,
+}
+
+/// Constant-time byte comparison — an API key check using `==`/`memcmp` short-circuits on the
+/// first mismatched byte, letting a network-observable timing difference leak how many leading
+/// bytes of a guess were correct. Length is compared normally first (leaking length isn't
+/// meaningful for a fixed-format secret) before the constant-time body.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `Ok(Some(n))` — set `session.max_tokens` to `n` (already clamped to `cap`); `Ok(None)` —
+/// leave the session's current value untouched (no override requested); `Err` — the request
+/// asked for something nonsensical (zero tokens).
+fn clamp_max_tokens(requested: Option<usize>, cap: usize) -> Result<Option<usize>, ApiError> {
+    match requested {
+        Some(0) => Err(ApiError::bad_request("max_tokens must be a positive integer")),
+        Some(n) => Ok(Some(n.min(cap))),
+        None => Ok(None),
+    }
 }
 
 /// Chat messages are text, not file uploads — 1 MiB is generous headroom for even a long
@@ -37,6 +65,7 @@ pub struct ServeConfig {
 /// loop on an enormous body.
 const MAX_BODY_BYTES: usize = 1 << 20;
 
+#[derive(Debug)]
 struct ApiError {
     status: u16,
     kind: &'static str,
@@ -101,7 +130,10 @@ fn respond_err(request: Request, e: ApiError) {
 fn handle(request: Request, session: &mut Session, cfg: &ServeConfig) {
     if let Some(key) = &cfg.api_key {
         let want = format!("Bearer {key}");
-        let authorized = request.headers().iter().any(|h| h.field.equiv("Authorization") && h.value.as_str() == want);
+        let authorized = request
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Authorization") && constant_time_eq(h.value.as_str().as_bytes(), want.as_bytes()));
         if !authorized {
             respond_err(request, ApiError::new(401, "invalid_request_error", "Invalid API key"));
             return;
@@ -190,7 +222,11 @@ fn handle_chat_completions(mut request: Request, session: &mut Session, cfg: &Se
     // stale-value carryover between requests.
     session.sampling.temperature = req.temperature.unwrap_or(session.sampling.temperature);
     session.sampling.nucleus = req.top_p.unwrap_or(session.sampling.nucleus);
-    session.max_tokens = req.max_tokens.unwrap_or(session.max_tokens);
+    match clamp_max_tokens(req.max_tokens, cfg.max_tokens_cap) {
+        Ok(Some(n)) => session.max_tokens = n,
+        Ok(None) => {}
+        Err(e) => return respond_err(request, e),
+    }
 
     let prompt_text = chat::render_messages(&messages, cfg.think);
     let prompt_ids: Vec<usize> = session.tokenizer.encode(&prompt_text).into_iter().map(|id| id as usize).collect();
@@ -348,4 +384,39 @@ fn request_id() -> u64 {
 
 fn unix_time() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"Bearer sk-abc123", b"Bearer sk-abc123"));
+        assert!(!constant_time_eq(b"Bearer sk-abc123", b"Bearer sk-abc124"));
+        assert!(!constant_time_eq(b"Bearer sk-abc123", b"Bearer sk-abc12"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn clamp_max_tokens_rejects_zero() {
+        let err = clamp_max_tokens(Some(0), 200).unwrap_err();
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn clamp_max_tokens_caps_requests_above_the_server_limit_instead_of_rejecting() {
+        assert_eq!(clamp_max_tokens(Some(1_000_000), 200).unwrap(), Some(200));
+    }
+
+    #[test]
+    fn clamp_max_tokens_passes_through_requests_within_the_limit() {
+        assert_eq!(clamp_max_tokens(Some(50), 200).unwrap(), Some(50));
+    }
+
+    #[test]
+    fn clamp_max_tokens_leaves_the_session_default_untouched_when_omitted() {
+        assert_eq!(clamp_max_tokens(None, 200).unwrap(), None);
+    }
 }

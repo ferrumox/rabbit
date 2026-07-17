@@ -246,6 +246,7 @@ fn run_serve(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         api_key: args.api_key.clone(),
         model_id: args.model_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "rabbit".to_string()),
         think: args.think,
+        max_tokens_cap: args.max_tokens,
     };
     server::serve(sess, cfg)
 }

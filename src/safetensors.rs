@@ -200,6 +200,7 @@ fn decode_floats(raw: &[u8], dtype: DType, out: &mut Vec<f32>) {
     }
 }
 
+#[derive(Debug)]
 pub struct Shards {
     files: Vec<File>,
     tensors: Vec<Tensor>,
@@ -223,9 +224,18 @@ impl Shards {
 
         for path in paths {
             let file = File::open(&path)?;
+            let file_len = file.metadata()?.len();
             let mut hlen_buf = [0u8; 8];
             read_exact_at(&file, 0, &mut hlen_buf)?;
             let hlen = u64::from_le_bytes(hlen_buf);
+            // the header can't be bigger than the file it lives in — reject up front instead of
+            // trusting a corrupt/malicious `hlen` into a multi-exabyte allocation attempt.
+            if hlen > file_len {
+                return Err(SafetensorsError::BadHeader(format!(
+                    "{}: header length {hlen} exceeds file size {file_len}",
+                    path.display()
+                )));
+            }
             let mut header_buf = vec![0u8; hlen as usize];
             read_exact_at(&file, 8, &mut header_buf)?;
             let header: Value = serde_json::from_slice(&header_buf)?;
@@ -249,8 +259,24 @@ impl Shards {
                     .get("data_offsets")
                     .and_then(Value::as_array)
                     .ok_or_else(|| SafetensorsError::BadHeader(format!("{name}: missing data_offsets")))?;
-                let a0 = offsets[0].as_u64().unwrap_or(0);
-                let b0 = offsets[1].as_u64().unwrap_or(0);
+                if offsets.len() != 2 {
+                    return Err(SafetensorsError::BadHeader(format!("{name}: data_offsets must have 2 elements")));
+                }
+                let a0 = offsets[0]
+                    .as_u64()
+                    .ok_or_else(|| SafetensorsError::BadHeader(format!("{name}: data_offsets[0] is not a u64")))?;
+                let b0 = offsets[1]
+                    .as_u64()
+                    .ok_or_else(|| SafetensorsError::BadHeader(format!("{name}: data_offsets[1] is not a u64")))?;
+                if b0 < a0 {
+                    return Err(SafetensorsError::BadHeader(format!("{name}: data_offsets end {b0} precedes start {a0}")));
+                }
+                if data_start + b0 > file_len {
+                    return Err(SafetensorsError::BadHeader(format!(
+                        "{name}: data_offsets end {b0} extends past end of file ({} bytes available)",
+                        file_len.saturating_sub(data_start)
+                    )));
+                }
                 let shape = meta
                     .get("shape")
                     .and_then(Value::as_array)
@@ -558,6 +584,51 @@ mod tests {
         let shards = Shards::open(&dir.0).unwrap();
         let err = shards.read_f32("does.not.exist", false).unwrap_err();
         assert!(matches!(err, SafetensorsError::MissingTensor(_)));
+    }
+
+    #[test]
+    fn open_rejects_a_header_length_claiming_to_exceed_the_file() {
+        let dir = TempDir::new("rabbit_test_st_hlen_overflow");
+        // a real header length would be small; claim the header is bigger than the whole file.
+        let mut out = Vec::new();
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        out.extend_from_slice(b"{}");
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+
+        let err = Shards::open(&dir.0).unwrap_err();
+        assert!(matches!(err, SafetensorsError::BadHeader(_)), "{err}");
+    }
+
+    #[test]
+    fn open_rejects_data_offsets_where_end_precedes_start() {
+        let dir = TempDir::new("rabbit_test_st_offsets_inverted");
+        let mut header = serde_json::Map::new();
+        header.insert("a".to_string(), json!({"dtype": "F32", "shape": [1], "data_offsets": [4, 0]}));
+        let header_bytes = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&f32_bytes(&[1.0]));
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+
+        let err = Shards::open(&dir.0).unwrap_err();
+        assert!(matches!(err, SafetensorsError::BadHeader(_)), "{err}");
+    }
+
+    #[test]
+    fn open_rejects_data_offsets_extending_past_end_of_file() {
+        let dir = TempDir::new("rabbit_test_st_offsets_oob");
+        let mut header = serde_json::Map::new();
+        // claims 4096 bytes of tensor data but the file has none after the header.
+        header.insert("a".to_string(), json!({"dtype": "F32", "shape": [1024], "data_offsets": [0, 4096]}));
+        let header_bytes = serde_json::to_vec(&Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+
+        let err = Shards::open(&dir.0).unwrap_err();
+        assert!(matches!(err, SafetensorsError::BadHeader(_)), "{err}");
     }
 
     #[test]
