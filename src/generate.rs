@@ -188,7 +188,7 @@ fn layer_forward(
         Ffn::Dense(w) => moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, &mut tmp),
         Ffn::Moe(w) => {
             let cache = caches.0[li].as_mut().expect("MoE layer must have an ExpertCache");
-            moe::moe(cfg, w, cache, shards, li, model.ebits, &nrm, s, &mut tmp)?;
+            moe::moe(cfg, w, cache, shards, li, model.ebits, &model.route_cfg, &nrm, s, &mut tmp)?;
         }
     }
     for (xi, &ti) in x.iter_mut().zip(&tmp) {
@@ -704,7 +704,7 @@ mod tests {
                 Ffn::Dense(w) => moe::dense_mlp(w, &nrm2, s, dm.dense_inter, &mut ffn_out),
                 Ffn::Moe(w) => {
                     let cache = caches_b.0[li].as_mut().unwrap();
-                    moe::moe(&model.cfg, w, cache, &shards, li, model.ebits, &nrm2, s, &mut ffn_out).unwrap();
+                    moe::moe(&model.cfg, w, cache, &shards, li, model.ebits, &model.route_cfg, &nrm2, s, &mut ffn_out).unwrap();
                 }
             }
             for (xi, &fi) in x_manual.iter_mut().zip(&ffn_out) {

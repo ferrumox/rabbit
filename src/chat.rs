@@ -18,6 +18,9 @@ pub struct LoadArgs {
     pub ebits: u8,
     pub cache_capacity: usize,
     pub no_usage_cache: bool,
+    /// opt-in CACHE_ROUTE (see `moe::RouteConfig`) — off by default, matching colibrì's own
+    /// stance, since it's still unmeasured on rabbit's own architecture.
+    pub cache_route: bool,
 }
 
 pub struct Session {
@@ -39,12 +42,14 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
 
     eprintln!("loading model (dbits={}, ebits={})...", args.dbits, args.ebits);
     let t0 = std::time::Instant::now();
-    let model = Model::load(&args.model_dir, args.dbits, args.ebits)?;
+    let mut model = Model::load(&args.model_dir, args.dbits, args.ebits)?;
+    model.route_cfg.cache_route = args.cache_route;
     eprintln!(
-        "model loaded in {:.1}s ({} layers, has_dsa={})",
+        "model loaded in {:.1}s ({} layers, has_dsa={}), cache_route={}",
         t0.elapsed().as_secs_f32(),
         model.layers.len(),
-        model.has_dsa
+        model.has_dsa,
+        model.route_cfg.cache_route
     );
 
     let shards = Shards::open(&args.model_dir)?;

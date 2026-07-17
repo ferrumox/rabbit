@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
-[--session <path>] [--no-usage-cache] [--host H] [--port N] [--api-key K]";
+[--session <path>] [--no-usage-cache] [--cache-route] [--host H] [--port N] [--api-key K]";
 
 struct Args {
     model_dir: PathBuf,
@@ -29,6 +29,7 @@ struct Args {
     cache_capacity: usize,
     session: Option<PathBuf>,
     no_usage_cache: bool,
+    cache_route: bool,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -49,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
     let mut cache_capacity = 64usize;
     let mut session = None;
     let mut no_usage_cache = false;
+    let mut cache_route = false;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut api_key = None;
@@ -71,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
             "--expert-cache" => cache_capacity = next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?,
             "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--no-usage-cache" => no_usage_cache = true,
+            "--cache-route" => cache_route = true,
             "--host" => host = next("--host")?,
             "--port" => port = next("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--api-key" => api_key = Some(next("--api-key")?),
@@ -101,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
         cache_capacity,
         session,
         no_usage_cache,
+        cache_route,
         host,
         port,
         api_key,
@@ -118,6 +122,7 @@ fn load_args(args: &Args) -> LoadArgs {
         ebits: args.ebits,
         cache_capacity: args.cache_capacity,
         no_usage_cache: args.no_usage_cache,
+        cache_route: args.cache_route,
     }
 }
 

@@ -12,6 +12,7 @@
 //! quantize at load) — the only branch the tiny oracle (no `.qs` siblings) ever exercises.
 
 use crate::config::{Cfg, ConfigError};
+use crate::moe::RouteConfig;
 use crate::quant::{PackedFormatError, QT};
 use crate::safetensors::{SafetensorsError, Shards};
 use std::fmt;
@@ -80,6 +81,10 @@ pub struct Model {
     /// here (like `m->ebits` in the C) so it travels with the model instead of needing to be
     /// threaded through every call site that might load an expert.
     pub ebits: u8,
+    /// CACHE_ROUTE toggle (see `moe::RouteConfig`) — defaults off at load time; the CLI/server
+    /// entry points flip `cache_route` on after `Model::load` returns, same reason `ebits`
+    /// lives here instead of being threaded through every `moe()` call site.
+    pub route_cfg: RouteConfig,
 }
 
 #[derive(Debug)]
@@ -233,7 +238,7 @@ impl Model {
             layers.push(Layer { in_ln, post_ln, attn, dsa, ffn });
         }
 
-        Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa, ebits })
+        Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa, ebits, route_cfg: RouteConfig::default() })
     }
 
     /// Dequantizes token `tok`'s embedding row into `x[hidden]`.

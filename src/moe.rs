@@ -53,53 +53,161 @@ pub struct Routing {
     pub choices: Vec<Vec<(usize, f32)>>,
 }
 
+/// Opt-in cache-aware MoE routing (colibrì's `CACHE_ROUTE`, arXiv:2412.00099's max-rank
+/// selection) — off by default, matching colibrì's own "never default" stance. When enabled,
+/// selection no longer always takes the strict top-`k` by `choice`: the true top-`route_j`
+/// ranks are still always taken (never dropped, even if uncached), but the remaining slots
+/// prefer experts already resident (pin ∪ LRU) among the next-ranked experts up to
+/// `route_m`, falling back to true rank order for anything still unfilled. This can only
+/// change WHICH lower-ranked expert ids fill the non-sacred slots — it never runs fewer than
+/// `k` experts and never touches the top-`route_j` picks, so a cold cache degrades exactly to
+/// plain top-`k` routing (every "preferred resident" slot falls through to the same fallback
+/// loop `route()` itself uses).
+///
+/// Scope cuts vs colibrì's flag surface, both left at their "effectively off" default and not
+/// implemented here (see `docs/CACHE_ROUTE.md` in the colibrì source for what they'd do):
+/// `ROUTE_P` (cumulative-router-mass window instead of a fixed `route_m`) and `ROUTE_ALPHA`
+/// (down-weight substituted experts' gate mass before renorm — default `1` is a no-op anyway).
+#[derive(Clone, Copy)]
+pub struct RouteConfig {
+    pub cache_route: bool,
+    pub route_j: usize,
+    pub route_m: usize,
+}
+
+impl Default for RouteConfig {
+    fn default() -> RouteConfig {
+        // colibrì's own defaults (ROUTE_J=2, ROUTE_M=12) for when cache_route gets turned on;
+        // cache_route itself defaults off, matching colibrì's "never default" stance.
+        RouteConfig { cache_route: false, route_j: 2, route_m: 12 }
+    }
+}
+
+/// Router forward (matmul + sigmoid) and the bias-augmented selection score for one token —
+/// shared by both `route()`'s plain top-k and `route_cache_aware`'s wider ranking window.
+fn router_scores(cfg: &Cfg, w: &MoeWeights, xs: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let d = cfg.hidden as usize;
+    let e = cfg.n_experts as usize;
+    let mut logit = vec![0f32; e];
+    crate::kernels::matmul(&mut logit, xs, &w.router, 1, d, e);
+    for v in logit.iter_mut() {
+        *v = 1.0 / (1.0 + (-*v).exp()); // sigmoid
+    }
+    let choice: Vec<f32> = logit.iter().zip(&w.router_bias).map(|(&l, &b)| l + b).collect();
+    (logit, choice)
+}
+
+/// Ranks the top `m` experts by `choice` (descending; ties keep the lowest expert id, since a
+/// later equal `choice` value doesn't beat an already-found `bv`) — shared by plain top-k
+/// selection and CACHE_ROUTE's wider ranking window. Each entry's paired value is that
+/// expert's own plain `sigmoid(logit)`, not `choice` — matches `route()`'s existing
+/// selection-vs-weight split (see the module doc).
+fn rank_top(choice: &[f32], logit: &[f32], m: usize) -> Vec<(usize, f32)> {
+    let m = m.min(choice.len());
+    let mut taken = vec![false; choice.len()];
+    let mut ranked = Vec::with_capacity(m);
+    for _ in 0..m {
+        let mut best = None;
+        let mut bv = -1e30f32;
+        for (ei, (&taken_e, &choice_e)) in taken.iter().zip(choice).enumerate() {
+            if !taken_e && choice_e > bv {
+                bv = choice_e;
+                best = Some(ei);
+            }
+        }
+        let best = best.expect("m must not exceed n_experts");
+        taken[best] = true;
+        ranked.push((best, logit[best]));
+    }
+    ranked
+}
+
+fn normalize_and_scale(cfg: &Cfg, picked: &mut [(usize, f32)]) {
+    if cfg.norm_topk {
+        let sum: f32 = picked.iter().map(|&(_, wt)| wt).sum::<f32>() + 1e-20;
+        for (_, wt) in picked.iter_mut() {
+            *wt /= sum;
+        }
+    }
+    for (_, wt) in picked.iter_mut() {
+        *wt *= cfg.routed_scale;
+    }
+}
+
 /// Router forward + top-k selection for every token in the batch. Selection order is by
 /// `sigmoid(logit) + bias` (descending, ties broken by lowest expert id via a strict `>`
 /// scan), but each chosen expert's stored weight is its plain `sigmoid(logit)` — see the
 /// module doc.
 pub fn route(cfg: &Cfg, w: &MoeWeights, x: &[f32], s: usize) -> Routing {
     let d = cfg.hidden as usize;
-    let e = cfg.n_experts as usize;
     let k = cfg.topk as usize;
 
     let mut choices = Vec::with_capacity(s);
     for si in 0..s {
         let xs = &x[si * d..(si + 1) * d];
-        let mut logit = vec![0f32; e];
-        crate::kernels::matmul(&mut logit, xs, &w.router, 1, d, e);
-        for v in logit.iter_mut() {
-            *v = 1.0 / (1.0 + (-*v).exp()); // sigmoid
-        }
-        let choice: Vec<f32> = logit.iter().zip(&w.router_bias).map(|(&l, &b)| l + b).collect();
-
-        let mut taken = vec![false; e];
-        let mut picked: Vec<(usize, f32)> = Vec::with_capacity(k);
-        for _ in 0..k {
-            let mut best = None;
-            let mut bv = -1e30f32;
-            for (ei, (&taken_e, &choice_e)) in taken.iter().zip(&choice).enumerate() {
-                if !taken_e && choice_e > bv {
-                    bv = choice_e;
-                    best = Some(ei);
-                }
-            }
-            let best = best.expect("topk must not exceed n_experts");
-            taken[best] = true;
-            picked.push((best, logit[best]));
-        }
-
-        if cfg.norm_topk {
-            let sum: f32 = picked.iter().map(|&(_, wt)| wt).sum::<f32>() + 1e-20;
-            for (_, wt) in picked.iter_mut() {
-                *wt /= sum;
-            }
-        }
-        for (_, wt) in picked.iter_mut() {
-            *wt *= cfg.routed_scale;
-        }
+        let (logit, choice) = router_scores(cfg, w, xs);
+        let mut picked = rank_top(&choice, &logit, k);
+        normalize_and_scale(cfg, &mut picked);
         choices.push(picked);
     }
     Routing { choices }
+}
+
+/// Same as `route()`, but consults `cache` for CACHE_ROUTE's resident-preferring fill when
+/// `route_cfg.cache_route` is set — see `RouteConfig`'s doc. With `cache_route: false` this is
+/// bit-identical to `route()` (same per-token computation, just routed through the shared
+/// `rank_top`/`normalize_and_scale` helpers).
+pub fn route_cache_aware(cfg: &Cfg, w: &MoeWeights, x: &[f32], s: usize, cache: &ExpertCache, route_cfg: &RouteConfig) -> Routing {
+    if !route_cfg.cache_route {
+        return route(cfg, w, x, s);
+    }
+    let d = cfg.hidden as usize;
+    let k = cfg.topk as usize;
+
+    let mut choices = Vec::with_capacity(s);
+    for si in 0..s {
+        let xs = &x[si * d..(si + 1) * d];
+        let (logit, choice) = router_scores(cfg, w, xs);
+        let mut picked = cache_route_select(&choice, &logit, k, cache, route_cfg);
+        normalize_and_scale(cfg, &mut picked);
+        choices.push(picked);
+    }
+    Routing { choices }
+}
+
+/// CACHE_ROUTE's max-rank selection for one token: keep the true top-`route_j` always; fill
+/// remaining slots preferring resident (pin ∪ LRU) experts among the next-ranked ones up to
+/// `route_m`; fall back to true rank order for anything still unfilled.
+fn cache_route_select(choice: &[f32], logit: &[f32], k: usize, cache: &ExpertCache, route_cfg: &RouteConfig) -> Vec<(usize, f32)> {
+    let m = route_cfg.route_m.max(k);
+    let ranked = rank_top(choice, logit, m);
+    let j = route_cfg.route_j.min(k).min(ranked.len());
+
+    let mut picked: Vec<(usize, f32)> = Vec::with_capacity(k);
+    picked.extend_from_slice(&ranked[..j]);
+
+    if picked.len() < k {
+        for &(eid, wt) in &ranked[j..] {
+            if picked.len() >= k {
+                break;
+            }
+            if cache.get(eid).is_some() {
+                picked.push((eid, wt));
+            }
+        }
+    }
+    if picked.len() < k {
+        for &(eid, wt) in &ranked[j..] {
+            if picked.len() >= k {
+                break;
+            }
+            if picked.iter().any(|&(e2, _)| e2 == eid) {
+                continue;
+            }
+            picked.push((eid, wt));
+        }
+    }
+    picked
 }
 
 /// Distinct expert ids across the whole batch's routing, in first-occurrence order — loaded
@@ -129,6 +237,7 @@ pub fn moe(
     shards: &Shards,
     layer: usize,
     ebits: u8,
+    route_cfg: &RouteConfig,
     x: &[f32],
     s: usize,
     out: &mut [f32],
@@ -137,7 +246,9 @@ pub fn moe(
     let i = cfg.moe_inter as usize;
     let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
 
-    let routing = route(cfg, w, x, s);
+    // `route_cache_aware` reads (never mutates) `cache` for residency checks — must happen
+    // before the mutable `record_selection`/loading calls below borrow it exclusively.
+    let routing = route_cache_aware(cfg, w, x, s, cache, route_cfg);
     // Persistent usage histogram (colibrì's `eusage[layer][eid]++`): once per top-k selection,
     // before any cache resolution -- reflects the router's decision, not cache hit/miss.
     for choices in &routing.choices {
@@ -323,6 +434,155 @@ mod tests {
         }
     }
 
+    /// Builds a tiny on-disk fixture with `n_experts` gate/up/down expert tensors (F32, layer
+    /// 0) — used by the CACHE_ROUTE tests below, which need a real `ExpertCache`/`Shards` pair
+    /// to seed genuine residency via `ensure_loaded` (unlike the plain routing tests above,
+    /// which never touch the cache at all).
+    fn build_expert_fixture(dir: &std::path::Path, n_experts: usize, moe_inter: usize, hidden: usize, seed: &mut u32) -> Shards {
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        for eid in 0..n_experts {
+            let gate = random_vec(moe_inter * hidden, seed);
+            let up = random_vec(moe_inter * hidden, seed);
+            let down = random_vec(hidden * moe_inter, seed);
+            for (suf, rows, cols, vals) in [
+                ("gate_proj", moe_inter, hidden, &gate),
+                ("up_proj", moe_inter, hidden, &up),
+                ("down_proj", hidden, moe_inter, &down),
+            ] {
+                let name = format!("model.layers.0.mlp.experts.{eid}.{suf}.weight");
+                let bytes = f32_bytes(vals);
+                let start = data.len() as u64;
+                data.extend_from_slice(&bytes);
+                let end = data.len() as u64;
+                header.insert(name, json!({"dtype": "F32", "shape": [rows, cols], "data_offsets": [start, end]}));
+            }
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out_bytes = Vec::new();
+        out_bytes.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out_bytes.extend_from_slice(&header_bytes);
+        out_bytes.extend_from_slice(&data);
+        fs::write(dir.join("model.safetensors"), out_bytes).unwrap();
+        Shards::open(dir).unwrap()
+    }
+
+    #[test]
+    fn route_cache_aware_matches_route_when_cache_route_disabled() {
+        let mut seed = 7;
+        let cfg = tiny_cfg(5, 3, 4, 5, 1, false);
+        let w = MoeWeights {
+            router: random_vec(5 * 5, &mut seed),
+            router_bias: random_vec(5, &mut seed),
+            sh_gate: QT::alloc(1, 5, 32, false),
+            sh_up: QT::alloc(1, 5, 32, false),
+            sh_down: QT::alloc(5, 1, 32, false),
+        };
+        let x = random_vec(5, &mut seed);
+        let plain = route(&cfg, &w, &x, 1);
+        let cache = ExpertCache::new(5);
+        let aware = route_cache_aware(&cfg, &w, &x, 1, &cache, &RouteConfig::default());
+        assert_eq!(plain.choices, aware.choices, "RouteConfig::default() (cache_route: false) must be bit-identical to plain route()");
+    }
+
+    #[test]
+    fn cache_route_select_always_keeps_true_top_j_regardless_of_residency() {
+        // choice[e] == e as f32, so rank order is exactly descending expert id: 4,3,2,1,0.
+        let choice = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let logit = choice.clone();
+        let cache = ExpertCache::new(5); // nothing resident anywhere
+        let route_cfg = RouteConfig { cache_route: true, route_j: 2, route_m: 5 };
+        let picked = cache_route_select(&choice, &logit, 3, &cache, &route_cfg);
+        let ids: Vec<usize> = picked.iter().map(|&(e, _)| e).collect();
+        assert_eq!(ids, vec![4, 3, 2], "cold cache with no residents must fall back to true top-3, same as plain routing");
+    }
+
+    #[test]
+    fn cache_route_select_prefers_resident_experts_over_higher_ranked_non_resident_ones() {
+        let dir = TempDir::new("rabbit_test_cache_route_resident");
+        let mut seed = 99;
+        let shards = build_expert_fixture(&dir.0, 5, 4, 5, &mut seed);
+        let cfg = tiny_cfg(5, 3, 4, 5, 1, false);
+        let mut cache = ExpertCache::new(5);
+        cache.ensure_loaded(&shards, &cfg, 0, &[1, 0], 32).unwrap(); // seed genuine residency for experts 1 and 0
+
+        let choice = vec![0.0, 1.0, 2.0, 3.0, 4.0]; // rank order: 4,3,2,1,0
+        let logit = choice.clone();
+        let route_cfg = RouteConfig { cache_route: true, route_j: 1, route_m: 5 };
+        let picked = cache_route_select(&choice, &logit, 3, &cache, &route_cfg);
+        let ids: Vec<usize> = picked.iter().map(|&(e, _)| e).collect();
+        assert_eq!(
+            ids,
+            vec![4, 1, 0],
+            "the 2 non-sacred slots must prefer resident experts 1 and 0 over higher-ranked but uncached 3 and 2"
+        );
+        // a substituted expert's stored weight must be its OWN plain sigmoid, not the rank it displaced.
+        for &(eid, wt) in &picked {
+            assert_eq!(wt, logit[eid]);
+        }
+    }
+
+    #[test]
+    fn cache_route_select_fills_only_as_many_resident_slots_as_needed_then_falls_back() {
+        let dir = TempDir::new("rabbit_test_cache_route_partial_resident");
+        let mut seed = 17;
+        let shards = build_expert_fixture(&dir.0, 5, 4, 5, &mut seed);
+        let cfg = tiny_cfg(5, 3, 4, 5, 1, false);
+        let mut cache = ExpertCache::new(5);
+        cache.ensure_loaded(&shards, &cfg, 0, &[0], 32).unwrap(); // only expert 0 is resident
+
+        let choice = vec![0.0, 1.0, 2.0, 3.0, 4.0]; // rank order: 4,3,2,1,0
+        let logit = choice.clone();
+        let route_cfg = RouteConfig { cache_route: true, route_j: 1, route_m: 5 };
+        let picked = cache_route_select(&choice, &logit, 3, &cache, &route_cfg);
+        let ids: Vec<usize> = picked.iter().map(|&(e, _)| e).collect();
+        // sacred top-1 (4), then resident 0 fills one non-sacred slot, then the last slot falls
+        // back to true rank order (next-highest unpicked: 3), skipping non-resident 2 and 1.
+        assert_eq!(ids, vec![4, 0, 3]);
+    }
+
+    /// Safety invariant this whole feature depends on: a COLD cache (nothing resident, which is
+    /// true at the start of every `moe()` call since routing runs before any loading) must
+    /// degrade CACHE_ROUTE to bit-identical output vs it being off — every "prefer resident"
+    /// slot finds nothing and falls through to the same true-rank-order fallback plain routing
+    /// already uses.
+    #[test]
+    fn moe_output_with_cache_route_enabled_on_a_cold_cache_matches_disabled() {
+        let n_experts = 5;
+        let moe_inter = 4;
+        let hidden = 5;
+        let n_shared = 1;
+        let mut seed = 123;
+
+        let dir = TempDir::new("rabbit_test_cache_route_cold_moe");
+        let shards = build_expert_fixture(&dir.0, n_experts, moe_inter, hidden, &mut seed);
+
+        let cfg = tiny_cfg(n_experts as i32, 3, moe_inter as i32, hidden as i32, n_shared as i32, false);
+        let w = MoeWeights {
+            router: random_vec(n_experts * hidden, &mut seed),
+            router_bias: random_vec(n_experts, &mut seed),
+            sh_gate: random_qt_f32(moe_inter * n_shared, hidden, &mut seed),
+            sh_up: random_qt_f32(moe_inter * n_shared, hidden, &mut seed),
+            sh_down: random_qt_f32(hidden, moe_inter * n_shared, &mut seed),
+        };
+        let s = 2;
+        let x = random_vec(s * hidden, &mut seed);
+
+        let mut cache_off = ExpertCache::new(n_experts);
+        let mut out_off = vec![0f32; s * hidden];
+        moe(&cfg, &w, &mut cache_off, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out_off).unwrap();
+
+        let mut cache_on = ExpertCache::new(n_experts);
+        let mut out_on = vec![0f32; s * hidden];
+        let route_cfg = RouteConfig { cache_route: true, route_j: 2, route_m: 12 };
+        moe(&cfg, &w, &mut cache_on, &shards, 0, 32, &route_cfg, &x, s, &mut out_on).unwrap();
+
+        for (a, b) in out_off.iter().zip(&out_on) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
     #[test]
     fn dense_mlp_matches_hand_computed_silu_gate() {
         let mut seed = 1;
@@ -449,7 +709,7 @@ mod tests {
 
         let mut cache = ExpertCache::new(n_experts);
         let mut out = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache, &shards, 0, 32, &x, s, &mut out).unwrap();
+        moe(&cfg, &w, &mut cache, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out).unwrap();
 
         // independent reference: route (to get weights) + sum every expert directly, bypassing moe()'s dispatch.
         let routing = route(&cfg, &w, &x, s);
@@ -552,12 +812,12 @@ mod tests {
 
         let mut cache_unpinned = ExpertCache::new(n_experts);
         let mut out_unpinned = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache_unpinned, &shards, 0, 32, &x, s, &mut out_unpinned).unwrap();
+        moe(&cfg, &w, &mut cache_unpinned, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out_unpinned).unwrap();
 
         let mut cache_pinned = ExpertCache::new(n_experts);
         cache_pinned.mark_pin_candidates(std::iter::once(0usize)); // lazy: promotes on moe()'s own first load of it
         let mut out_pinned = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache_pinned, &shards, 0, 32, &x, s, &mut out_pinned).unwrap();
+        moe(&cfg, &w, &mut cache_pinned, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out_pinned).unwrap();
         assert!(cache_pinned.is_pinned(0), "topk==n_experts guarantees moe() touched expert 0, so it must have been promoted");
 
         for (a, b) in out_unpinned.iter().zip(&out_pinned) {
@@ -628,7 +888,7 @@ mod tests {
         // capacity (3) < uniq.len() (8, since topk==n_experts) -> forces moe() to chunk.
         let mut cache = ExpertCache::new(3);
         let mut out = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache, &shards, 0, 32, &x, s, &mut out).unwrap();
+        moe(&cfg, &w, &mut cache, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out).unwrap();
 
         let routing = route(&cfg, &w, &x, s);
         let mut expected = vec![0f32; s * hidden];
