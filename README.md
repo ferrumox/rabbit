@@ -67,7 +67,9 @@ history.
 | usage-cache auto-pin | 150 experts (2/layer × 75 MoE layers) → prefill hits 0 → 136 |
 
 All measured against the real checkpoint, not estimated — see the phase entries in
-`rabbit-plan.md` for the commits and full methodology behind each number.
+`rabbit-plan.md` for the commits and full methodology behind each number, or
+[`PERFORMANCE.md`](PERFORMANCE.md) for the full chronological log, including techniques that
+were tried and reverted.
 
 ## Building
 
