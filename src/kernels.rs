@@ -4,11 +4,18 @@
 //! `*_scalar` function is the untouched Fase 3 implementation; the public names
 //! (`matmul_q`/`matmul_i4`/`matmul_i2`/`dot_i8i8`/`dot_i4i8`) are now dispatchers.
 //!
-//! Tier ladder, matching the C exactly: `matmul_q`/`matmul_i4`/`matmul_i2` (float-weight
-//! dequant-and-FMA path) get scalar/AVX2 only — the original never added an AVX-512 tier for
-//! them. `dot_i8i8`/`dot_i4i8` (the integer IDOT path) get scalar/AVX2/AVX-512-VNNI: pure
-//! integer accumulation, so unlike the float path there's no reassociation to worry about —
-//! every tier must agree bit-for-bit, which is exactly what this module's parity tests check.
+//! Tier ladder: `matmul_q`/`matmul_i2` (float-weight dequant-and-FMA path) get scalar/AVX2 only
+//! — colibrì never added an AVX-512 tier for those. `matmul_i4` is the one exception: colibrì's
+//! later `I4_ACC512` (`dot_i4f_avx512`) adds an AVX-512F/BW tier specifically for int4, two
+//! independent `__m512` FMA chains reduced via a single `_mm512_reduce_add_ps` tree-sum at the
+//! end instead of AVX2's running accumulator — same lossless nibble-unpack math, genuinely
+//! *less* rounding error than the AVX2/scalar order (colibrì measured 2-6x lower max relative
+//! error vs the scalar oracle), but for that same reason NOT bit-identical to them — parity
+//! tests for `matmul_i4`'s tiers are within-tolerance, not bit-exact, same as AVX2-vs-scalar
+//! already was for this function. `dot_i8i8`/`dot_i4i8` (the integer IDOT path) get
+//! scalar/AVX2/AVX-512-VNNI: pure integer accumulation, so unlike either float path there's no
+//! reassociation to worry about — every tier must agree bit-for-bit there, which is exactly
+//! what this module's parity tests check.
 //!
 //! `y[S,O] = x[S,I] @ W^T` throughout, `W` given in one of the `QT` formats from `quant.rs`.
 //! The IDOT kernels additionally quantize activations to int8 per row (`qrow_i8`, scalar only
@@ -117,16 +124,24 @@ fn matmul_q_scalar(y: &mut [f32], x: &[f32], q: &[i8], scale: &[f32], s: usize, 
     });
 }
 
-/// y[S,O] = x[S,I] @ W^T, W int4-packed[O,ceil(I/2)] (2 values/byte) per-row scale.
+/// y[S,O] = x[S,I] @ W^T, W int4-packed[O,ceil(I/2)] (2 values/byte) per-row scale. Dispatches
+/// AVX-512F/BW (`I4_ACC512`'s dual-accumulator kernel) > AVX2 > scalar — see the module doc for
+/// why this is the one float-weight matmul with an AVX-512 tier at all.
 pub fn matmul_i4(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     #[cfg(target_arch = "x86_64")]
-    if has_avx2() {
-        return unsafe { matmul_i4_avx2(y, x, q4, scale, s, i, o) };
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            return unsafe { matmul_i4_avx512(y, x, q4, scale, s, i, o) };
+        }
+        if has_avx2() {
+            return unsafe { matmul_i4_avx2(y, x, q4, scale, s, i, o) };
+        }
     }
     matmul_i4_scalar(y, x, q4, scale, s, i, o)
 }
 
-fn matmul_i4_scalar(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
+/// `pub` so `benches/kernels.rs` can compare tiers directly — same reason `dot_i8i8_scalar` is.
+pub fn matmul_i4_scalar(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
     let rb = i.div_ceil(2);
     with_yt_scratch(o * s, |yt| {
         yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
@@ -369,6 +384,51 @@ mod simd {
         }
     }
 
+    /// int4-packed weight row · f32 activation row -> f32, AVX-512F/BW (colibrì's
+    /// `dot_i4f_avx512`/`I4_ACC512`): 32 weights/iteration across two independent `__m512` FMA
+    /// chains, combined via one `_mm512_reduce_add_ps` tree-sum at the very end instead of
+    /// accumulating into a single running vector — see the module doc for why this makes it
+    /// NOT bit-identical to `dot_i4_f32_avx2`/scalar despite the same lossless nibble-unpack
+    /// math. `n` = logical (unpacked) length.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn dot_i4_f32_avx512(w: &[u8], xs: &[f32], n: usize) -> f32 {
+        unsafe {
+            let m4 = _mm_set1_epi8(0x0F);
+            let b8 = _mm512_set1_epi32(8);
+            let mut acc0 = _mm512_setzero_ps();
+            let mut acc1 = _mm512_setzero_ps();
+            let mut i = 0;
+            while i + 32 <= n {
+                let by = _mm_loadu_si128(w.as_ptr().add(i >> 1) as *const __m128i);
+                let lo = _mm_and_si128(by, m4);
+                let hi = _mm_and_si128(_mm_srli_epi16::<4>(by), m4);
+                // unpacklo/unpackhi interleave lo_k/hi_k back into sequential element order:
+                // n0 = elements [i, i+16), n1 = elements [i+16, i+32) — matches x's two loads.
+                let n0 = _mm_unpacklo_epi8(lo, hi);
+                let n1 = _mm_unpackhi_epi8(lo, hi);
+                let w0 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0), b8));
+                let w1 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1), b8));
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(xs.as_ptr().add(i)), w0, acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(xs.as_ptr().add(i + 16)), w1, acc1);
+                i += 32;
+            }
+            let mut a = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+            while i + 1 < n {
+                let byte = w[i >> 1];
+                let lo = (byte & 0xF) as i32 - 8;
+                let hi = (byte >> 4) as i32 - 8;
+                a += xs[i] * lo as f32 + xs[i + 1] * hi as f32;
+                i += 2;
+            }
+            if i < n {
+                let byte = w[i >> 1];
+                let lo = (byte & 0xF) as i32 - 8;
+                a += xs[i] * lo as f32;
+            }
+            a
+        }
+    }
+
     /// int2-packed weight row · f32 activation row -> f32. `n` = logical (unpacked) length.
     #[target_feature(enable = "avx2")]
     unsafe fn dot_i2_f32_avx2(w: &[u8], xs: &[f32], n: usize) -> f32 {
@@ -421,8 +481,13 @@ mod simd {
         });
     }
 
+    /// y[S,O] = x[S,I] @ W^T, int4-packed W, AVX2 tier.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx2")`. `x` must have length >=
+    /// `s*i`, `q4` length >= `o*ceil(i/2)`, `scale` length >= `o`, `y` length >= `s*o`.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn matmul_i4_avx2(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
+    pub unsafe fn matmul_i4_avx2(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
         let rb = i.div_ceil(2);
         with_yt_scratch(o * s, |yt| {
             yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
@@ -431,6 +496,28 @@ mod simd {
                 for (si, slot) in row.iter_mut().enumerate() {
                     let xs = &x[si * i..(si + 1) * i];
                     *slot = unsafe { dot_i4_f32_avx2(w, xs, i) } * sc;
+                }
+            });
+            transpose_so(y, yt, s, o);
+        });
+    }
+
+    /// y[S,O] = x[S,I] @ W^T, int4-packed W, AVX-512F/BW dual-accumulator tier.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx512f")` and `"avx512bw"`. `x`
+    /// must have length >= `s*i`, `q4` length >= `o*ceil(i/2)`, `scale` length >= `o`, `y`
+    /// length >= `s*o`.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub unsafe fn matmul_i4_avx512(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], s: usize, i: usize, o: usize) {
+        let rb = i.div_ceil(2);
+        with_yt_scratch(o * s, |yt| {
+            yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+                let w = &q4[oi * rb..(oi + 1) * rb];
+                let sc = scale[oi];
+                for (si, slot) in row.iter_mut().enumerate() {
+                    let xs = &x[si * i..(si + 1) * i];
+                    *slot = unsafe { dot_i4_f32_avx512(w, xs, i) } * sc;
                 }
             });
             transpose_so(y, yt, s, o);
@@ -601,7 +688,7 @@ use simd::*;
 // `dot_i8i8_scalar`/`dot_i4i8_scalar` for why the auto-dispatching `dot_i8i8`/`dot_i4i8`
 // functions can't be used for a scalar-vs-AVX2-vs-AVX-512 comparison.
 #[cfg(target_arch = "x86_64")]
-pub use simd::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx512vnni};
+pub use simd::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512};
 
 // mirrors matmul_q_idot/matmul_i4_idot's C signature 1:1; both are private, single-call-site
 // helpers for matmul_qt, so a wrapper struct would be indirection with no real caller benefit.
@@ -1083,6 +1170,69 @@ mod tests {
             let mut y_avx2 = vec![0.0; rows];
             unsafe { matmul_i4_avx2(&mut y_avx2, &x, &data, &scale, 1, cols, rows) };
             for (a, b) in y_scalar.iter().zip(&y_avx2) {
+                assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_i4_avx512_matches_scalar_within_tolerance() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")) {
+            eprintln!("SKIP: no AVX-512F/BW on this CPU");
+            return;
+        }
+        let rows = 3;
+        // include a case past the first 32-wide chunk (33) so the tail-handling path (both the
+        // 2-at-a-time scalar tail and the final odd element) is actually exercised.
+        for &cols in &[1usize, 7, 16, 17, 32, 33, 65] {
+            let w = random_vec(rows * cols, cols as u32 * 3 + 3);
+            let mut t = QT::alloc(rows, cols, 4, false);
+            t.fill(&w);
+            let (data, scale) = match &t.kind {
+                QTKind::I4 { data, scale } => (data.clone(), scale.clone()),
+                _ => panic!("expected I4"),
+            };
+            let x = random_vec(cols, cols as u32 * 7 + 4);
+
+            let mut y_scalar = vec![0.0; rows];
+            matmul_i4_scalar(&mut y_scalar, &x, &data, &scale, 1, cols, rows);
+            let mut y_avx512 = vec![0.0; rows];
+            unsafe { matmul_i4_avx512(&mut y_avx512, &x, &data, &scale, 1, cols, rows) };
+            for (a, b) in y_scalar.iter().zip(&y_avx512) {
+                assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_i4_avx512_matches_avx2_within_tolerance() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")) {
+            eprintln!("SKIP: no AVX-512F/BW on this CPU");
+            return;
+        }
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP: no AVX2 on this CPU");
+            return;
+        }
+        // Both tiers are non-bit-exact vs scalar (different reassociation order) but should
+        // still land close to each other, not just close to scalar independently — same
+        // lossless nibble math, just accumulated in a different order.
+        let rows = 3;
+        for &cols in &[1usize, 7, 16, 17, 32, 33, 65] {
+            let w = random_vec(rows * cols, cols as u32 * 3 + 3);
+            let mut t = QT::alloc(rows, cols, 4, false);
+            t.fill(&w);
+            let (data, scale) = match &t.kind {
+                QTKind::I4 { data, scale } => (data.clone(), scale.clone()),
+                _ => panic!("expected I4"),
+            };
+            let x = random_vec(cols, cols as u32 * 7 + 4);
+
+            let mut y_avx2 = vec![0.0; rows];
+            unsafe { matmul_i4_avx2(&mut y_avx2, &x, &data, &scale, 1, cols, rows) };
+            let mut y_avx512 = vec![0.0; rows];
+            unsafe { matmul_i4_avx512(&mut y_avx512, &x, &data, &scale, 1, cols, rows) };
+            for (a, b) in y_avx2.iter().zip(&y_avx512) {
                 assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
             }
         }

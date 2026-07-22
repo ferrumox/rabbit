@@ -12,12 +12,13 @@
 //! benchmark toward an unrealistically huge single dot product).
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rabbit::kernels::{dot_i4i8_scalar, dot_i8i8_scalar};
+use rabbit::kernels::{dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar};
 #[cfg(target_arch = "x86_64")]
-use rabbit::kernels::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx512vnni};
+use rabbit::kernels::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512};
 use std::hint::black_box;
 
 const I: usize = 4096;
+const O: usize = 4096;
 
 fn xorshift(seed: &mut u32) -> u32 {
     *seed ^= *seed << 13;
@@ -76,5 +77,38 @@ fn bench_dot_i4i8(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dot_i8i8, bench_dot_i4i8);
+/// `matmul_i4` (float-weight int4 dequant-and-FMA path) is the one float-weight matmul with an
+/// AVX-512 tier at all (colibrì's `I4_ACC512`) — see `kernels.rs`'s module doc. Benched at the
+/// full `matmul_i4_*` level (not a single dot product like the IDOT benches above) since that
+/// tier also parallelizes over `O` rows via `rayon`, which is part of its real-world cost/win,
+/// not just the inner dot product.
+fn bench_matmul_i4(c: &mut Criterion) {
+    let x = random_i8(I, 5).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let q4 = random_bytes(O * I.div_ceil(2), 6);
+    let scale: Vec<f32> = (0..O).map(|o| 1.0 + (o % 7) as f32 * 0.1).collect();
+    let mut y = vec![0f32; O];
+    let mut group = c.benchmark_group("matmul_i4");
+
+    group.bench_function("scalar", |b| {
+        b.iter(|| matmul_i4_scalar(black_box(&mut y), black_box(&x), black_box(&q4), black_box(&scale), 1, I, O))
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        group.bench_function("avx2", |b| {
+            b.iter(|| unsafe { matmul_i4_avx2(black_box(&mut y), black_box(&x), black_box(&q4), black_box(&scale), 1, I, O) })
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        group.bench_function("avx512", |b| {
+            b.iter(|| unsafe { matmul_i4_avx512(black_box(&mut y), black_box(&x), black_box(&q4), black_box(&scale), 1, I, O) })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_dot_i8i8, bench_dot_i4i8, bench_matmul_i4);
 criterion_main!(benches);
