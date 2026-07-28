@@ -46,7 +46,9 @@ impl std::fmt::Display for PackedFormatError {
 
 impl std::error::Error for PackedFormatError {}
 
-/// A quantized `[rows, cols]` weight matrix in one of four formats, chosen by `bits`.
+/// A quantized `[rows, cols]` weight matrix in one of five formats, chosen by `bits` (or, for
+/// `MxFp4`, by the dedicated `alloc_mxfp4` constructor — see its doc for why it sits outside
+/// the `bits`-threshold ladder the other four share).
 pub struct QT {
     pub rows: usize,
     pub cols: usize,
@@ -62,6 +64,13 @@ pub enum QTKind {
     I4 { data: Vec<u8>, scale: Vec<f32> },
     /// 4 values/byte (2 bits each, low bits first), stored as `value + 2` in `0..4`.
     I2 { data: Vec<u8>, scale: Vec<f32> },
+    /// OCP Microscaling (MX) FP4: 4-bit E2M1 floating-point elements, 2/byte (low nibble
+    /// first — same nibble order as `I4`), with one shared E8M0 (8-bit, exponent-only) scale
+    /// per 32-element block along the row — NOT a per-row `f32` scale like every other variant
+    /// here. See `e2m1_decode`/`e8m0_decode`'s docs for the exact bit layouts (OCP Microscaling
+    /// Formats (MX) v1.0 spec). `data.len() == rows * cols.div_ceil(2)`,
+    /// `block_scale.len() == rows * cols.div_ceil(32)`.
+    MxFp4 { data: Vec<u8>, block_scale: Vec<u8> },
 }
 
 impl QT {
@@ -80,6 +89,20 @@ impl QT {
         QT { rows, cols, bits, kind }
     }
 
+    /// Allocates the OCP-MX FP4 format — a dedicated constructor, not another `bits` threshold
+    /// in `alloc`'s ladder, because MXFP4 isn't a point on that ladder's linear-quantization
+    /// spectrum: it's a floating-point element format with a block-shared exponent-only scale,
+    /// picked explicitly (by a checkpoint declaring itself MXFP4), never inferred from a bit
+    /// count the way `alloc`'s other four tiers are.
+    pub fn alloc_mxfp4(rows: usize, cols: usize) -> QT {
+        QT {
+            rows,
+            cols,
+            bits: 4,
+            kind: QTKind::MxFp4 { data: vec![0; rows * cols.div_ceil(2)], block_scale: vec![0; rows * cols.div_ceil(32)] },
+        }
+    }
+
     /// Fills from row-major f32 weights `w[rows*cols]`, quantizing per the chosen format.
     pub fn fill(&mut self, w: &[f32]) {
         assert_eq!(w.len(), self.rows * self.cols);
@@ -88,6 +111,7 @@ impl QT {
             QTKind::I8 { data, scale } => quantize_rows(w, data, scale, self.rows, self.cols, self.bits),
             QTKind::I4 { data, scale } => pack_int4(w, data, scale, self.rows, self.cols, self.bits),
             QTKind::I2 { data, scale } => pack_int2(w, data, scale, self.rows, self.cols, self.bits),
+            QTKind::MxFp4 { data, block_scale } => pack_mxfp4(w, data, block_scale, self.rows, self.cols),
         }
     }
 
@@ -99,6 +123,10 @@ impl QT {
             QTKind::I8 { .. } => self.rows * self.cols + self.rows * 4,
             QTKind::I4 { .. } => self.rows * self.cols.div_ceil(2) + self.rows * 4,
             QTKind::I2 { .. } => self.rows * self.cols.div_ceil(4) + self.rows * 4,
+            // E8M0 is 1 byte/block (vs. the other tiers' 4-byte f32 per-row scale) — one of
+            // MX's actual design points: exponent-only scale metadata stays cheap even at a
+            // much finer (32-element, not per-row) granularity.
+            QTKind::MxFp4 { .. } => self.rows * self.cols.div_ceil(2) + self.rows * self.cols.div_ceil(32),
         }
     }
 
@@ -160,6 +188,98 @@ impl QT {
                         (bits as i32 - 2) as f32 * s
                     })
                     .collect()
+            }
+            QTKind::MxFp4 { data, block_scale } => {
+                let rb = cols.div_ceil(2);
+                let bpr = cols.div_ceil(32);
+                let wr = &data[row * rb..(row + 1) * rb];
+                let bsr = &block_scale[row * bpr..(row + 1) * bpr];
+                (0..cols)
+                    .map(|k| {
+                        let byte = wr[k >> 1];
+                        let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                        e2m1_decode(nibble) * e8m0_decode(bsr[k / 32])
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// The 8 positive magnitudes E2M1 (OCP MX's 4-bit floating-point element format: 1 sign + 2
+/// exponent + 1 mantissa bit, exponent bias 1) can represent, indexed by the low 3 bits
+/// `(exp<<1)|mantissa`. Denormals (`exp==0`) give `{0, 0.5}`; normals (`exp>=1`) give
+/// `(1 + mantissa*0.5) * 2^(exp-1)`.
+const E2M1_MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+/// Decodes one E2M1 nibble (bit 3 = sign, bits 2..0 index [`E2M1_MAGNITUDES`]). `pub(crate)`
+/// (not private, unlike the linear formats' inline nibble unpacking in `kernels.rs`) so the
+/// matmul kernel reuses this exact LUT instead of duplicating a subtle floating-point decode.
+pub(crate) fn e2m1_decode(nibble: u8) -> f32 {
+    let mag = E2M1_MAGNITUDES[(nibble & 0x7) as usize];
+    if nibble & 0x8 != 0 { -mag } else { mag }
+}
+
+/// Encodes a value to the nearest E2M1 code — a plain nearest-magnitude search over the 8 fixed
+/// points (ties keep the lower index, i.e. the smaller magnitude; with only 8 unevenly-spaced
+/// points a closed-form round doesn't apply the way it does for the linear int formats above).
+fn e2m1_encode(value: f32) -> u8 {
+    let sign = if value.is_sign_negative() && value != 0.0 { 0x8u8 } else { 0 };
+    let av = value.abs();
+    let mut best = 0usize;
+    let mut best_diff = f32::MAX;
+    for (i, &m) in E2M1_MAGNITUDES.iter().enumerate() {
+        let diff = (av - m).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    sign | best as u8
+}
+
+/// Decodes an E8M0 byte (OCP MX's shared block scale: 8 bits, exponent-only, no sign/mantissa)
+/// to its `f32` power-of-two value, bias 127 — the same bias IEEE-754 `f32`'s own exponent
+/// field uses. `0xFF` is reserved for NaN in the spec; unreached here since `choose_block_scale`
+/// never emits it (see its doc), so this only ever computes `2^(byte-127)`.
+pub(crate) fn e8m0_decode(byte: u8) -> f32 {
+    2f32.powi(byte as i32 - 127)
+}
+
+/// Picks the E8M0 scale byte for one 32-element block from its max absolute value: the largest
+/// power of two `s` such that `amax / s` still fits under E2M1's max representable magnitude
+/// (6.0), i.e. `shared_exp = floor(log2(amax)) - 2`. Returns `(byte, s)`. `amax == 0.0` (an
+/// all-zero block) gets an arbitrary `s = 1.0` — the encoded values are all zero regardless of
+/// scale, so the choice is a no-op. Clamped to `[-127, 127]` (byte `0..=254`) to stay clear of
+/// E8M0's reserved `0xFF` NaN code.
+fn choose_block_scale(amax: f32) -> (u8, f32) {
+    if amax <= 0.0 {
+        return (127, 1.0);
+    }
+    let shared_exp = (amax.log2().floor() as i32 - 2).clamp(-127, 127);
+    (u8::try_from(shared_exp + 127).expect("clamped to 0..=254"), 2f32.powi(shared_exp))
+}
+
+/// f32[rows,cols] -> MXFP4[rows,ceil(cols/2)] + one E8M0 byte per 32-element block per row.
+fn pack_mxfp4(w: &[f32], q: &mut [u8], block_scale: &mut [u8], rows: usize, cols: usize) {
+    let rb = cols.div_ceil(2);
+    let bpr = cols.div_ceil(32);
+    for o in 0..rows {
+        let wr = &w[o * cols..(o + 1) * cols];
+        let qr = &mut q[o * rb..(o + 1) * rb];
+        for b in 0..bpr {
+            let start = b * 32;
+            let end = (start + 32).min(cols);
+            let amax = wr[start..end].iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let (byte, scale) = choose_block_scale(amax);
+            block_scale[o * bpr + b] = byte;
+            for k in start..end {
+                let code = e2m1_encode(wr[k] / scale);
+                if k & 1 == 0 {
+                    qr[k >> 1] = (qr[k >> 1] & 0xF0) | code;
+                } else {
+                    qr[k >> 1] = (qr[k >> 1] & 0x0F) | (code << 4);
+                }
             }
         }
     }
@@ -427,5 +547,119 @@ mod tests {
             QTKind::I4 { data, .. } => assert_eq!(data[0], 15 | (8 << 4)),
             _ => panic!("expected I4"),
         }
+    }
+
+    // ---- MXFP4 (OCP Microscaling Formats v1.0): E2M1 elements + E8M0 block scale ----
+
+    #[test]
+    fn e2m1_decode_matches_the_spec_s_8_positive_magnitudes() {
+        // OCP MX v1.0: E2M1's representable positive values are exactly {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+        let expected = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        for (code, &want) in expected.iter().enumerate() {
+            assert_eq!(e2m1_decode(code as u8), want, "code {code}");
+            assert_eq!(e2m1_decode(code as u8 | 0x8), -want, "code {code} (signed)");
+        }
+    }
+
+    #[test]
+    fn e2m1_encode_round_trips_every_exact_representable_value() {
+        for code in 0u8..16 {
+            let v = e2m1_decode(code);
+            let back = e2m1_decode(e2m1_encode(v));
+            assert_eq!(back, v, "code {code} -> {v} -> re-encoded differently");
+        }
+    }
+
+    #[test]
+    fn e2m1_encode_rounds_an_inexact_value_to_the_nearest_representable_point() {
+        // 2.9 sits between 3 (diff .1) and 2 (diff .9) -> nearest is 3.
+        assert_eq!(e2m1_decode(e2m1_encode(2.9)), 3.0);
+        // 5.0 sits between 4 (diff 1) and 6 (diff 1) -> exact tie, keeps the lower magnitude (4).
+        assert_eq!(e2m1_decode(e2m1_encode(5.0)), 4.0);
+        // -2.9 must round to -3, not lose its sign.
+        assert_eq!(e2m1_decode(e2m1_encode(-2.9)), -3.0);
+    }
+
+    #[test]
+    fn e8m0_decode_is_a_power_of_two_biased_by_127() {
+        assert_eq!(e8m0_decode(127), 1.0);
+        assert_eq!(e8m0_decode(128), 2.0);
+        assert_eq!(e8m0_decode(126), 0.5);
+        assert_eq!(e8m0_decode(127 + 4), 16.0);
+    }
+
+    #[test]
+    fn choose_block_scale_keeps_amax_within_e2m1_s_representable_range() {
+        // amax=6.0 -> shared_exp=0 (scale=1), amax/scale=6.0 exactly hits E2M1's max point.
+        let (byte, scale) = choose_block_scale(6.0);
+        assert_eq!(byte, 127);
+        assert_eq!(scale, 1.0);
+        // amax=12.0 -> shared_exp=1 (scale=2), amax/scale=6.0, same exact fit one octave up.
+        let (byte, scale) = choose_block_scale(12.0);
+        assert_eq!(byte, 128);
+        assert_eq!(scale, 2.0);
+        // an all-zero block gets an arbitrary but valid scale, never a NaN/inf byte.
+        let (byte, scale) = choose_block_scale(0.0);
+        assert_eq!(scale, 1.0);
+        assert_ne!(byte, 0xFF);
+    }
+
+    #[test]
+    fn mxfp4_fill_and_row_f32_round_trip_within_one_quantization_step() {
+        let rows = 3;
+        let cols = 40; // > 32 -> exercises 2 blocks per row, the second only 8 wide
+        let w = random_matrix(rows, cols, 123);
+        let mut t = QT::alloc_mxfp4(rows, cols);
+        t.fill(&w);
+        for o in 0..rows {
+            let row = t.row_f32(o);
+            for k in 0..cols {
+                // random_matrix draws from (-1,1); E2M1's coarsest step at that scale is 0.5
+                // (denormal spacing) — generous but format-appropriate slack, not a fudge.
+                assert!((row[k] - w[o * cols + k]).abs() < 0.5, "row {o} col {k}: {} vs {}", row[k], w[o * cols + k]);
+            }
+        }
+    }
+
+    #[test]
+    fn mxfp4_uses_a_separate_scale_per_32_element_block_not_per_row() {
+        // Two blocks in one row: first all at magnitude ~1 (scale picks shared_exp so amax=1
+        // fits), second all at magnitude ~100 (needs a much larger scale). A single per-row
+        // scale (like every other format here) would butcher one of the two; MXFP4 must not.
+        let cols = 64;
+        let mut w = vec![1.0f32; cols];
+        for v in w[32..].iter_mut() {
+            *v = 100.0;
+        }
+        let mut t = QT::alloc_mxfp4(1, cols);
+        t.fill(&w);
+        let row = t.row_f32(0);
+        for (k, &v) in row[0..32].iter().enumerate() {
+            assert!((v - 1.0).abs() < 0.5, "block 0 col {k}: {v}");
+        }
+        for (k, &v) in row[32..cols].iter().enumerate() {
+            assert!((v - 100.0).abs() < 8.0, "block 1 col {}: {v}", 32 + k);
+        }
+    }
+
+    #[test]
+    fn mxfp4_resident_bytes_matches_the_per_block_not_per_row_scale_formula() {
+        // Same 4-bit payload as I4 (cols/2 bytes/row), but the scale metadata is 1 byte per
+        // 32-element BLOCK instead of I4's flat 4-byte-per-ROW f32 scale — cheaper per scale
+        // value (finer granularity), but NOT cheaper in total once a row has more than 4 blocks
+        // (32 * 4 = 128 columns): at cols=320 (10 blocks/row) MXFP4 spends 10 bytes/row on scale
+        // vs I4's flat 4, more metadata for finer-grained accuracy, not less. The formula itself,
+        // not "always smaller", is the thing worth asserting here.
+        let rows = 10;
+        let cols = 320; // exactly 10 blocks/row, so the formula check below has no rounding slop
+        let mxfp4 = QT::alloc_mxfp4(rows, cols).resident_bytes();
+        assert_eq!(mxfp4, rows * (cols / 2) + rows * (cols / 32));
+
+        // At a short row width (<=128 cols, <=4 blocks), the finer scale genuinely does cost
+        // less total metadata than I4's flat 4 bytes/row.
+        let short_cols = 64; // 2 blocks/row -> 2 bytes/row of scale, vs I4's flat 4
+        let mxfp4_short = QT::alloc_mxfp4(rows, short_cols).resident_bytes();
+        let i4_short = QT::alloc(rows, short_cols, 4, false).resident_bytes();
+        assert!(mxfp4_short < i4_short, "mxfp4 {mxfp4_short} should be cheaper than i4 {i4_short} for a short row (few blocks)");
     }
 }

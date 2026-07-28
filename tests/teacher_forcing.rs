@@ -11,7 +11,7 @@
 //! fail) when the fixture is absent, same policy as the tokenizer fixture in `tools/`.
 
 use rabbit::generate::{self, ExpertCaches, KvState, Rng, SamplingConfig};
-use rabbit::model::Model;
+use rabbit::glm52::model::Model;
 use rabbit::safetensors::Shards;
 use std::path::Path;
 

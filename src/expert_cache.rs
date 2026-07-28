@@ -51,15 +51,49 @@
 //! to the same steady-state protection colibrì's eager version gets, just without ever paying
 //! for an expert that never got used.
 
-use crate::config::Cfg;
-use crate::model::{ModelError, qt_load};
+use crate::glm52::config::Cfg;
+use crate::glm52::model::{ModelError, qt_load};
 use crate::quant::{QT, QTKind};
 use crate::safetensors::Shards;
 use std::collections::HashMap;
 
+/// Which on-disk tensor-name convention a checkpoint's routed experts use — the one piece of
+/// `expert_cache.rs` that was still GLM-hardcoded (see `rabbit-plan.md`'s Phase 1 notes: "Only
+/// one hardcoded HF tensor-name template ties it to GLM's on-disk naming — trivially
+/// parameterizable"). Everything else here (LRU, pinning, `io_uring` batching, usage tracking)
+/// is keyed by plain `(layer, expert_id)` pairs and was already architecture-agnostic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpertNaming {
+    /// `model.layers.{layer}.mlp.experts.{eid}.{gate_proj,up_proj,down_proj}.weight`.
+    Glm52,
+    /// `model.layers.{layer}.block_sparse_moe.experts.{eid}.{w1,w2,w3}.weight` — `w1` is the
+    /// gate projection, `w2` is down, `w3` is up (confirmed via `KimiBlockSparseMLP`'s own code
+    /// comments in the real `modeling_kimi.py`, not guessed; see `kimi_linear::model`'s doc).
+    KimiLinear,
+}
+
+impl ExpertNaming {
+    /// Returns `[gate, up, down]` tensor names, in that fixed order — every caller in this file
+    /// (the `io_uring` batch path and the sequential fallback alike) already indexes reads
+    /// positionally as gate/up/down (see `complete_batch_streaming`'s `base+0/1/2`), so this is
+    /// the one place that ordering has to be gotten right.
+    fn tensor_names(&self, layer: usize, eid: usize) -> [String; 3] {
+        match self {
+            ExpertNaming::Glm52 => {
+                let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
+                [p("gate_proj"), p("up_proj"), p("down_proj")]
+            }
+            ExpertNaming::KimiLinear => {
+                let p = |suf: &str| format!("model.layers.{layer}.block_sparse_moe.experts.{eid}.{suf}.weight");
+                [p("w1"), p("w3"), p("w2")]
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod uring_load {
-    use super::{Cfg, ExpertSlot, ModelError, QT};
+    use super::{Cfg, ExpertNaming, ExpertSlot, ModelError, QT};
     use crate::safetensors::{DType, SafetensorsError, Shards, TensorLocation, dequant_fp8_blockscale};
     use io_uring::{IoUring, opcode, types};
 
@@ -154,7 +188,7 @@ mod uring_load {
     /// in one submission round, or the submission itself fails; every one of these just means
     /// "the caller should fall back to a synchronous load for this batch," same as a hard
     /// `load_batch` failure always meant before this split existed.
-    pub(super) fn submit_batch(ring: &mut Option<Ring>, shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize]) -> Result<Option<Pending>, ModelError> {
+    pub(super) fn submit_batch(ring: &mut Option<Ring>, shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], naming: ExpertNaming) -> Result<Option<Pending>, ModelError> {
         let Some(r) = ring.as_mut() else { return Ok(None) };
 
         let i = cfg.moe_inter as usize;
@@ -163,10 +197,9 @@ mod uring_load {
         let mut reqs = Vec::with_capacity(misses.len() * 3);
         let mut scale_locs: Vec<TensorLocation> = Vec::new();
         for &eid in misses {
-            let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-            for (suf, rows, cols) in [("gate_proj", i, d), ("up_proj", i, d), ("down_proj", d, i)] {
-                let name = p(suf);
-                let loc = shards.tensor_location(&name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name.clone())))?;
+            let names = naming.tensor_names(layer, eid);
+            for (name, rows, cols) in [(&names[0], i, d), (&names[1], i, d), (&names[2], d, i)] {
+                let loc = shards.tensor_location(name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name.clone())))?;
 
                 let mut packed_scale = None;
                 let mut fp8_scale = None;
@@ -418,6 +451,7 @@ pub struct ExpertCache {
     pub io_wait_nanos: u64,
     #[cfg(target_os = "linux")]
     ring: Option<uring_load::Ring>,
+    naming: ExpertNaming,
 }
 
 impl ExpertCache {
@@ -431,6 +465,14 @@ impl ExpertCache {
     }
 
     pub fn new(capacity: usize) -> ExpertCache {
+        Self::for_family(capacity, ExpertNaming::Glm52)
+    }
+
+    /// Like `new`, but for a checkpoint whose routed experts use a different on-disk
+    /// tensor-name convention (see `ExpertNaming`) — e.g. Kimi Linear's
+    /// `block_sparse_moe.experts.{eid}.{w1,w2,w3}` instead of GLM-5.2's
+    /// `mlp.experts.{eid}.{gate_proj,up_proj,down_proj}`.
+    pub fn for_family(capacity: usize, naming: ExpertNaming) -> ExpertCache {
         ExpertCache {
             capacity,
             slots: Vec::new(),
@@ -444,6 +486,7 @@ impl ExpertCache {
             io_wait_nanos: 0,
             #[cfg(target_os = "linux")]
             ring: uring_load::new_ring(capacity),
+            naming,
         }
     }
 
@@ -487,7 +530,7 @@ impl ExpertCache {
         }
 
         self.misses += 1;
-        let fresh = load_expert(shards, cfg, layer, eid, bits, self.clock)?;
+        let fresh = load_expert(shards, cfg, layer, eid, bits, self.clock, self.naming)?;
         self.insert_or_pin(fresh);
         Ok(self.get(eid).expect("just inserted or pinned above"))
     }
@@ -540,12 +583,12 @@ impl ExpertCache {
         let load_t = std::time::Instant::now();
 
         #[cfg(target_os = "linux")]
-        if let Some(pending) = uring_load::submit_batch(&mut self.ring, shards, cfg, layer, &misses)? {
+        if let Some(pending) = uring_load::submit_batch(&mut self.ring, shards, cfg, layer, &misses, self.naming)? {
             self.load_nanos += load_t.elapsed().as_nanos() as u64;
             return Ok(PendingExpertLoad(LoadKind::Async(pending)));
         }
 
-        let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock)?;
+        let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock, self.naming)?;
         self.load_nanos += load_t.elapsed().as_nanos() as u64;
         Ok(PendingExpertLoad(LoadKind::Sync(loaded)))
     }
@@ -586,7 +629,7 @@ impl ExpertCache {
                         v
                     }
                     Err(_) => {
-                        let v = sequential_fallback(shards, cfg, layer, &eids_for_fallback, bits, self.clock)?;
+                        let v = sequential_fallback(shards, cfg, layer, &eids_for_fallback, bits, self.clock, self.naming)?;
                         for slot in &v {
                             on_slot(slot);
                         }
@@ -682,17 +725,17 @@ impl ExpertCache {
 
 /// Used as `begin_loading`'s non-Linux (or ring-unavailable) synchronous path, and as
 /// `finish_loading`'s fallback when `uring_load::complete_batch` reports an I/O error.
-fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64) -> Result<Vec<ExpertSlot>, ModelError> {
-    misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used)).collect()
+fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64, naming: ExpertNaming) -> Result<Vec<ExpertSlot>, ModelError> {
+    misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used, naming)).collect()
 }
 
-fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, used: u64) -> Result<ExpertSlot, ModelError> {
+fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, used: u64, naming: ExpertNaming) -> Result<ExpertSlot, ModelError> {
     let i = cfg.moe_inter as usize;
     let d = cfg.hidden as usize;
-    let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-    let gate = qt_load(shards, &p("gate_proj"), i, d, bits)?;
-    let up = qt_load(shards, &p("up_proj"), i, d, bits)?;
-    let down = qt_load(shards, &p("down_proj"), d, i, bits)?;
+    let names = naming.tensor_names(layer, eid);
+    let gate = qt_load(shards, &names[0], i, d, bits)?;
+    let up = qt_load(shards, &names[1], i, d, bits)?;
+    let down = qt_load(shards, &names[2], d, i, bits)?;
     Ok(ExpertSlot { eid, gate, up, down, used })
 }
 
@@ -711,6 +754,9 @@ fn mlock_best_effort(slot: &ExpertSlot) {
             }
             QTKind::I4 { data, scale } | QTKind::I2 { data, scale } => {
                 vec![(data.as_ptr(), data.len()), (scale.as_ptr() as *const u8, std::mem::size_of_val(scale.as_slice()))]
+            }
+            QTKind::MxFp4 { data, block_scale } => {
+                vec![(data.as_ptr(), data.len()), (block_scale.as_ptr(), block_scale.len())]
             }
         };
         for (ptr, len) in bufs {
@@ -784,6 +830,38 @@ mod tests {
         dir
     }
 
+    /// Like `build_experts_fixture`, but Kimi Linear's real on-disk naming
+    /// (`block_sparse_moe.experts.{eid}.{w1,w2,w3}.weight`) and a distinct constant fill per
+    /// tensor (`w1`=1.0, `w3`=3.0, `w2`=2.0) instead of random data, so a test can verify each
+    /// one lands in the right `ExpertSlot` field (`w1`→`gate`, `w3`→`up`, `w2`→`down`) by VALUE,
+    /// not just by shape (`w1`/`w3` share the same `[moe_inter, hidden]` shape, so a shape-only
+    /// check couldn't catch the two being swapped).
+    fn build_kimi_experts_fixture(name: &str, n_experts: usize, moe_inter: usize, hidden: usize) -> TempDir {
+        let dir = TempDir::new(name);
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, rows: usize, cols: usize, fill: f32| {
+            let bytes = f32_bytes(&vec![fill; rows * cols]);
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": "F32", "shape": [rows, cols], "data_offsets": [start, end]}));
+        };
+        for eid in 0..n_experts {
+            push(&mut header, format!("model.layers.0.block_sparse_moe.experts.{eid}.w1.weight"), moe_inter, hidden, 1.0);
+            push(&mut header, format!("model.layers.0.block_sparse_moe.experts.{eid}.w3.weight"), moe_inter, hidden, 3.0);
+            push(&mut header, format!("model.layers.0.block_sparse_moe.experts.{eid}.w2.weight"), hidden, moe_inter, 2.0);
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+        dir
+    }
+
     fn tiny_cfg(n_experts: i32, moe_inter: i32, hidden: i32) -> Cfg {
         Cfg {
             hidden,
@@ -837,6 +915,57 @@ mod tests {
         assert_eq!(cache.hits, 1);
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    /// The real point of `ExpertNaming::KimiLinear`: `get_or_load` (the sequential, non-`io_uring`
+    /// path, portable to any OS) must read Kimi's real on-disk tensor names
+    /// (`block_sparse_moe.experts.{eid}.{w1,w2,w3}.weight`) and land `w1`/`w3`/`w2` in
+    /// `gate`/`up`/`down` respectively — checked by VALUE (each tensor has a distinct constant
+    /// fill), not just shape, since `w1`/`w3` share a shape and a shape-only check couldn't
+    /// catch them being swapped.
+    #[test]
+    fn kimi_linear_naming_loads_w1_w3_w2_into_gate_up_down() {
+        let fixture = build_kimi_experts_fixture("rabbit_test_ecache_kimi_naming", 2, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(2, 4, 6);
+        let mut cache = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
+
+        let slot = cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
+        assert_eq!(slot.gate.rows, 4);
+        assert_eq!(slot.gate.cols, 6);
+        assert_eq!(slot.down.rows, 6);
+        assert_eq!(slot.down.cols, 4);
+        assert!(qt_values(&slot.gate).iter().all(|&v| (v - 1.0).abs() < 1e-6), "w1 must land in gate");
+        assert!(qt_values(&slot.up).iter().all(|&v| (v - 3.0).abs() < 1e-6), "w3 must land in up");
+        assert!(qt_values(&slot.down).iter().all(|&v| (v - 2.0).abs() < 1e-6), "w2 must land in down");
+    }
+
+    /// `ensure_loaded`'s batched path (the `io_uring` route on Linux, still the sequential
+    /// fallback elsewhere) must respect `ExpertNaming` too, not just `get_or_load` — cross-check
+    /// against `get_or_load`'s own result on the same Kimi-named fixture, mirroring
+    /// `ensure_loaded_matches_sequential_get_or_load_values`'s existing GLM-naming version.
+    #[test]
+    fn kimi_linear_naming_ensure_loaded_matches_get_or_load() {
+        let fixture = build_kimi_experts_fixture("rabbit_test_ecache_kimi_naming_batch", 3, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(3, 4, 6);
+
+        let mut cache_seq = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
+        let eids = [0usize, 1, 2];
+        for &eid in &eids {
+            cache_seq.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
+        }
+
+        let mut cache_batch = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
+        cache_batch.ensure_loaded(&shards, &cfg, 0, &eids, 32).unwrap();
+
+        for &eid in &eids {
+            let a = cache_seq.get(eid).unwrap();
+            let b = cache_batch.get(eid).unwrap();
+            assert_eq!(qt_values(&a.gate), qt_values(&b.gate), "expert {eid} gate");
+            assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up");
+            assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down");
+        }
     }
 
     #[test]

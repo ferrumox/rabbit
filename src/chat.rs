@@ -1,11 +1,10 @@
 //! Shared session/generation/template logic for both the CLI's `--chat` mode and the HTTP
 //! server (`server.rs`) — extracted from `main.rs` so neither has to duplicate it.
 
-use crate::generate::{self, ExpertCaches, Rng, SamplingConfig, StepProfile};
-pub use crate::generate::KvState;
-use crate::model::Model;
+use crate::generate::{self, Rng, SamplingConfig, StepProfile};
+use crate::model::{self, ExpertCaches, Model, Tokenizer};
+pub use crate::model::KvState;
 use crate::safetensors::Shards;
-use crate::tokenizer::Tokenizer;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -49,20 +48,14 @@ pub struct Session {
 }
 
 pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Error>> {
-    eprintln!("loading tokenizer...");
-    let tokenizer = Tokenizer::load(&args.model_dir.join("tokenizer.json"))?;
-
     eprintln!("loading model (dbits={}, ebits={})...", args.dbits, args.ebits);
     let t0 = std::time::Instant::now();
     let mut model = Model::load(&args.model_dir, args.dbits, args.ebits)?;
-    model.route_cfg.cache_route = args.cache_route;
-    eprintln!(
-        "model loaded in {:.1}s ({} layers, has_dsa={}), cache_route={}",
-        t0.elapsed().as_secs_f32(),
-        model.layers.len(),
-        model.has_dsa,
-        model.route_cfg.cache_route
-    );
+    model.set_cache_route(args.cache_route);
+    eprintln!("model loaded in {:.1}s ({} layers), cache_route={}", t0.elapsed().as_secs_f32(), model.n_layers(), args.cache_route);
+
+    eprintln!("loading tokenizer...");
+    let tokenizer = Tokenizer::load(&args.model_dir, &model)?;
 
     let shards = Shards::open(&args.model_dir)?;
     let mut caches = ExpertCaches::new(&model, args.cache_capacity);
@@ -80,7 +73,7 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
     }
     let sampling = SamplingConfig { temperature: args.temperature, nucleus: args.nucleus };
     let rng = Rng::new(args.seed);
-    let stop_ids: Vec<usize> = model.cfg.stop_ids.iter().map(|&id| id as usize).collect();
+    let stop_ids = model.stop_ids();
 
     Ok(Session {
         model,
@@ -114,7 +107,7 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
 /// content there), but carries the same "wrong template detail -> model never stops" risk
 /// `think_tag` above already has a proven history of — validate any code path using this with
 /// a real request against the real checkpoint before trusting it in production.
-pub fn render_turn(user_msg: &str, first: bool, think: bool, system: Option<&str>) -> String {
+fn glm52_render_turn(user_msg: &str, first: bool, think: bool, system: Option<&str>) -> String {
     let think_tag = if think { "<think>" } else { "<think></think>" };
     let mut out = String::new();
     if first {
@@ -137,15 +130,25 @@ pub enum Role {
     Assistant,
 }
 
+/// Renders one incremental chat turn (`--chat`'s KV-continuation mode: only the NEW turn needs
+/// rendering, prior turns already live in `kv`) into the exact prompt text to encode and
+/// forward — dispatches on `model`'s family, since GLM-5.2 and Kimi Linear use genuinely
+/// different chat templates (see `glm52_render_turn`'s doc and
+/// `kimi_linear::chat_template::render_turn`'s doc for each one's specifics, both read from
+/// real reference sources, not guessed).
+pub fn render_turn(model: &Model, user_msg: &str, first: bool, think: bool, system: Option<&str>) -> String {
+    match model {
+        Model::Glm52(_) => glm52_render_turn(user_msg, first, think, system),
+        Model::KimiLinear(_) => crate::kimi_linear::chat_template::render_turn(user_msg, first, think, system),
+    }
+}
+
 /// Renders a FULL conversation (as an OpenAI-style stateless `messages` array arrives) into
 /// one prompt string — the HTTP server's counterpart to `render_turn`'s incremental,
 /// KV-continuation-based rendering: the server never keeps a `KvState` across requests (see
 /// the Fase 11 plan's "stateless" design decision), so every request re-renders the WHOLE
-/// history from scratch. Every message except a trailing user turn is rendered complete
-/// (`<|user|>{msg}`/`<|assistant|>{msg}`, no think tag — already-said text needs none); if the
-/// conversation doesn't already end on an assistant turn, an open `<|assistant|>{think_tag}` is
-/// appended for the model to fill in. Same unvalidated-`<|system|>` caveat as `render_turn`.
-pub fn render_messages(messages: &[(Role, String)], think: bool) -> String {
+/// history from scratch. Same per-family dispatch as `render_turn`.
+fn glm52_render_messages(messages: &[(Role, String)], think: bool) -> String {
     let think_tag = if think { "<think>" } else { "<think></think>" };
     let mut out = String::from("[gMASK]<sop>");
     for (role, content) in messages {
@@ -162,6 +165,13 @@ pub fn render_messages(messages: &[(Role, String)], think: bool) -> String {
         out.push_str(think_tag);
     }
     out
+}
+
+pub fn render_messages(model: &Model, messages: &[(Role, String)], think: bool) -> String {
+    match model {
+        Model::Glm52(_) => glm52_render_messages(messages, think),
+        Model::KimiLinear(_) => crate::kimi_linear::chat_template::render_messages(messages, think),
+    }
 }
 
 /// A whole chat-completion turn's (prefill + every decode step) phase-timing totals — the
@@ -239,7 +249,7 @@ pub fn generate_reply(
     let mut profile = TurnProfile { prompt_tokens: turn_ids.len(), ..TurnProfile::default() };
 
     let mut step_t = std::time::Instant::now();
-    let (mut logits, step_profile) = generate::step_profiled(&sess.model, &sess.shards, &mut sess.caches, kv, turn_ids, pos_base)?;
+    let (mut logits, step_profile) = model::step_profiled(&sess.model, &sess.shards, &mut sess.caches, kv, turn_ids, pos_base)?;
     profile.accumulate(&step_profile);
     let (mut hits, mut misses, mut io_ns) = sess.caches.hit_miss_totals();
     let mut io_wait_ns = sess.caches.io_wait_nanos_total();
@@ -278,7 +288,7 @@ pub fn generate_reply(
         let io_ns_before = io_ns;
         let io_wait_ns_before = io_wait_ns;
         step_t = std::time::Instant::now();
-        let (next_logits, step_profile) = generate::step_profiled(&sess.model, &sess.shards, &mut sess.caches, kv, &[next], pos)?;
+        let (next_logits, step_profile) = model::step_profiled(&sess.model, &sess.shards, &mut sess.caches, kv, &[next], pos)?;
         logits = next_logits;
         profile.accumulate(&step_profile);
         let step_seconds = step_t.elapsed().as_secs_f32();

@@ -1,6 +1,6 @@
 [package]
 name = "rabbit"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 description = "A Rust inference engine for GLM-5.2 (744B-parameter MoE), streaming routed experts from disk on demand"
 
@@ -11,6 +11,13 @@ libc = "0.2"
 rayon = "1"
 tiny_http = "0.12"
 num_cpus = "1"
+# Kimi Linear's tokenizer (tokenization_kimi.py) pre-tokenizes with a Unicode SET INTERSECTION
+# pattern (`\p{Lu}...&&[^\p{Han}]]`) that Rust's plain `regex` crate doesn't support -- confirmed
+# `fancy-regex` does (same crate family real tiktoken's own Rust core uses). See
+# src/kimi_linear/tokenizer.rs's module doc.
+fancy-regex = "0.13"
+# tiktoken.model's on-disk format is `<base64-encoded-bytes> <rank>` per line.
+base64 = "0.22"
 
 # io_uring is Linux-only; the expert-loading fallback path (sequential pread via
 # safetensors.rs) covers every other target, so this dependency is never required elsewhere.

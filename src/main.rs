@@ -224,7 +224,7 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let turn_text = chat::render_turn(line, first, args.think, None);
+        let turn_text = chat::render_turn(&sess.model, line, first, args.think, None);
         first = false;
         let turn_ids: Vec<usize> = sess.tokenizer.encode(&turn_text).into_iter().map(|id| id as usize).collect();
 

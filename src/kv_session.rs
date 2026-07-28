@@ -25,9 +25,9 @@
 //! record's DSA segment is whatever overlap `[from_pos, to_pos)` has with `[0, dsa_cache.len())`
 //! — full `n_new` rows while the cache is still growing, zero once it's done.
 
-use crate::attention::{DsaCache, KvCache};
 use crate::generate::KvState;
-use crate::model::Model;
+use crate::glm52::attention::{DsaCache, KvCache};
+use crate::glm52::model::Model;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};

@@ -11,12 +11,12 @@
 //! once you delete all of that is exactly a plain greedy/sampling loop — that's `generate()`
 //! here.
 
-use crate::attention::{self, Absorb, Dsa, DsaCache, KvCache, Selection};
-use crate::config::Cfg;
 use crate::expert_cache::ExpertCache;
+use crate::glm52::attention::{self, Absorb, Dsa, DsaCache, KvCache, QProj, Rope, Selection};
+use crate::glm52::config::Cfg;
+use crate::glm52::model::{Ffn, Model, ModelError};
+use crate::glm52::moe;
 use crate::kernels::matmul_qt;
-use crate::model::{Ffn, Model, ModelError};
-use crate::moe;
 use crate::safetensors::Shards;
 use crate::usage_cache;
 use std::collections::HashMap;
@@ -206,7 +206,7 @@ fn layer_forward(
         attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.in_ln, cfg.eps);
     }
     let attn_t = std::time::Instant::now();
-    let fresh_selection = attention::attention(cfg, &layer.attn, kv_layer, &nrm, s, pos_base, dsa, Absorb::Auto, &mut tmp);
+    let fresh_selection = attention::attention(cfg, &layer.attn, kv_layer, &nrm, s, pos_base, dsa, Absorb::Auto, Rope::Interleaved, QProj::Lora, &mut tmp);
     if let Some(p) = phases.as_deref_mut() {
         p.attention_s += attn_t.elapsed().as_secs_f32();
     }
@@ -697,6 +697,7 @@ mod tests {
         }
 
         let cfg_json = json!({
+            "model_type": "glm_moe_dsa",
             "hidden_size": dm.hidden, "num_hidden_layers": 3, "num_attention_heads": dm.heads,
             "n_routed_experts": dm.n_experts, "num_experts_per_tok": dm.topk,
             "moe_intermediate_size": dm.moe_inter, "intermediate_size": dm.dense_inter,
@@ -757,7 +758,7 @@ mod tests {
                 Dsa::Off
             };
             let mut attn_out = vec![0f32; s * d];
-            let fresh = attention::attention(&model.cfg, &layer.attn, &mut kv_b.layers[li], &nrm, s, 0, dsa_mode, Absorb::Auto, &mut attn_out);
+            let fresh = attention::attention(&model.cfg, &layer.attn, &mut kv_b.layers[li], &nrm, s, 0, dsa_mode, Absorb::Auto, Rope::Interleaved, QProj::Lora, &mut attn_out);
             if let Some(sel) = fresh {
                 last_selection = Some(sel);
             }

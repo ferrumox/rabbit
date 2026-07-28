@@ -24,10 +24,10 @@
 //! Expert dispatch is also simplified vs the C's block-of-64 batching — see
 //! `expert_cache.rs`'s module doc for why that's a pure performance cut.
 
-use crate::config::Cfg;
 use crate::expert_cache::{ExpertCache, ExpertSlot};
+use crate::glm52::config::Cfg;
+use crate::glm52::model::{DenseMlpWeights, ModelError, MoeWeights};
 use crate::kernels::matmul_qt;
-use crate::model::{DenseMlpWeights, ModelError, MoeWeights};
 use crate::safetensors::Shards;
 
 fn siluf(x: f32) -> f32 {
@@ -122,6 +122,69 @@ fn rank_top(choice: &[f32], logit: &[f32], m: usize) -> Vec<(usize, f32)> {
     ranked
 }
 
+/// Same ranking as `rank_top`, but only among experts where `allowed[eid]` is set — the
+/// post-group-restriction top-k step in `rank_top_grouped`.
+fn rank_top_within(choice: &[f32], logit: &[f32], k: usize, allowed: &[bool]) -> Vec<(usize, f32)> {
+    let k = k.min(allowed.iter().filter(|&&a| a).count());
+    let mut taken = vec![false; choice.len()];
+    let mut ranked = Vec::with_capacity(k);
+    for _ in 0..k {
+        let mut best = None;
+        let mut bv = -1e30f32;
+        for (ei, ((&taken_e, &choice_e), &allowed_e)) in taken.iter().zip(choice).zip(allowed).enumerate() {
+            if !taken_e && allowed_e && choice_e > bv {
+                bv = choice_e;
+                best = Some(ei);
+            }
+        }
+        let best = best.expect("k must not exceed the number of allowed experts");
+        taken[best] = true;
+        ranked.push((best, logit[best]));
+    }
+    ranked
+}
+
+/// Sum of the two largest values in `vals` (a group's "how good are its best experts" score,
+/// DeepSeek-V3/GLM/Kimi-Linear style) — a group with fewer than 2 experts falls back to just
+/// its single value rather than manufacturing a second one.
+fn top2_sum(vals: &[f32]) -> f32 {
+    let mut top1 = f32::NEG_INFINITY;
+    let mut top2 = f32::NEG_INFINITY;
+    for &v in vals {
+        if v > top1 {
+            top2 = top1;
+            top1 = v;
+        } else if v > top2 {
+            top2 = v;
+        }
+    }
+    if top2.is_finite() { top1 + top2 } else { top1 }
+}
+
+/// Grouped top-k: partitions the `n_experts` choices into `n_group` equal-size contiguous
+/// groups, scores each group by `top2_sum`, keeps only the `topk_group` highest-scoring groups
+/// (ties keep the lower group index), then runs the ordinary top-`k` (see `rank_top`'s own
+/// tie-break) restricted to that surviving set. `n_group <= 1` skips all of this and calls
+/// `rank_top` directly — not just an optimization: with one group "keep the top group" would
+/// trivially keep everything anyway, so this is the exact same selection, computed the cheap
+/// way. This is what `config.rs::Cfg::load` validates `n_experts % n_group == 0` for.
+fn rank_top_grouped(choice: &[f32], logit: &[f32], k: usize, n_group: usize, topk_group: usize) -> Vec<(usize, f32)> {
+    if n_group <= 1 {
+        return rank_top(choice, logit, k);
+    }
+    let group_size = choice.len() / n_group;
+    let mut group_scores: Vec<(usize, f32)> = (0..n_group).map(|g| (g, top2_sum(&choice[g * group_size..(g + 1) * group_size]))).collect();
+    group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("router scores are never NaN").then(a.0.cmp(&b.0)));
+
+    let mut allowed = vec![false; choice.len()];
+    for &(g, _) in group_scores.iter().take(topk_group) {
+        for e in allowed.iter_mut().skip(g * group_size).take(group_size) {
+            *e = true;
+        }
+    }
+    rank_top_within(choice, logit, k, &allowed)
+}
+
 fn normalize_and_scale(cfg: &Cfg, picked: &mut [(usize, f32)]) {
     if cfg.norm_topk {
         let sum: f32 = picked.iter().map(|&(_, wt)| wt).sum::<f32>() + 1e-20;
@@ -146,7 +209,7 @@ pub fn route(cfg: &Cfg, w: &MoeWeights, x: &[f32], s: usize) -> Routing {
     for si in 0..s {
         let xs = &x[si * d..(si + 1) * d];
         let (logit, choice) = router_scores(cfg, w, xs);
-        let mut picked = rank_top(&choice, &logit, k);
+        let mut picked = rank_top_grouped(&choice, &logit, k, cfg.n_group as usize, cfg.topk_group as usize);
         normalize_and_scale(cfg, &mut picked);
         choices.push(picked);
     }
@@ -157,6 +220,12 @@ pub fn route(cfg: &Cfg, w: &MoeWeights, x: &[f32], s: usize) -> Routing {
 /// `route_cfg.cache_route` is set — see `RouteConfig`'s doc. With `cache_route: false` this is
 /// bit-identical to `route()` (same per-token computation, just routed through the shared
 /// `rank_top`/`normalize_and_scale` helpers).
+///
+/// **Not grouping-aware**: `cache_route_select` below still ranks over every expert via plain
+/// `rank_top`, not `rank_top_grouped` — combining CACHE_ROUTE (opt-in, off by default) with
+/// `n_group > 1` isn't implemented or tested yet. Fine for GLM-5.2 (`n_group` always 1 there,
+/// where grouped and plain top-k are identical anyway); revisit before enabling CACHE_ROUTE on
+/// a real grouped-routing checkpoint.
 pub fn route_cache_aware(cfg: &Cfg, w: &MoeWeights, x: &[f32], s: usize, cache: &ExpertCache, route_cfg: &RouteConfig) -> Routing {
     if !route_cfg.cache_route {
         return route(cfg, w, x, s);
@@ -694,6 +763,76 @@ mod tests {
         let routing = route(&cfg, &w, &x, 1);
         let sum: f32 = routing.choices[0].iter().map(|&(_, wt)| wt).sum();
         assert!((sum - cfg.routed_scale).abs() < 1e-5, "norm_topk weights must sum to routed_scale, got {sum}");
+    }
+
+    // ---- grouped routing (DeepSeek-V3/GLM/Kimi-Linear style: n_group > 1) ----
+
+    #[test]
+    fn top2_sum_adds_the_two_largest_values() {
+        assert_eq!(top2_sum(&[1.0, 5.0, 3.0, 2.0]), 5.0 + 3.0);
+        assert_eq!(top2_sum(&[5.0, 5.0]), 10.0, "ties still both count");
+    }
+
+    #[test]
+    fn top2_sum_falls_back_to_the_single_value_for_a_one_element_group() {
+        assert_eq!(top2_sum(&[7.0]), 7.0);
+    }
+
+    #[test]
+    fn rank_top_grouped_matches_plain_rank_top_when_n_group_is_one() {
+        let choice = [0.5, 3.0, 1.0, 4.0, 2.0];
+        let logit = choice;
+        assert_eq!(rank_top_grouped(&choice, &logit, 2, 1, 1), rank_top(&choice, &logit, 2));
+    }
+
+    #[test]
+    fn rank_top_grouped_keeps_only_experts_from_the_top_scoring_groups() {
+        // 8 experts, 4 groups of 2. Group scores (top-2 sum, degenerates to the pair's own sum
+        // here since each group has exactly 2 members): group0={0,1}=0.1+0.2=0.3,
+        // group1={2,3}=9.0+8.0=17.0, group2={4,5}=0.3+0.4=0.7, group3={6,7}=7.0+6.5=13.5.
+        // topk_group=2 keeps group1 and group3 (17.0, 13.5) — group0/group2 must be fully
+        // excluded even though nothing INSIDE those groups is being compared here, only the
+        // group aggregate.
+        let choice = [0.1, 0.2, 9.0, 8.0, 0.3, 0.4, 7.0, 6.5];
+        let logit = choice;
+        let picked = rank_top_grouped(&choice, &logit, 3, 4, 2);
+        let ids: Vec<usize> = picked.iter().map(|&(e, _)| e).collect();
+        assert_eq!(ids, vec![2, 3, 6], "top-3 must come only from group1 (2,3) and group3 (6,7), never group0/group2");
+    }
+
+    #[test]
+    fn rank_top_grouped_ties_keep_the_lower_group_index() {
+        // 4 groups of 2, all four scoring identically (0.9+0.9=1.8 each) — topk_group=1 must
+        // deterministically keep group0, not an arbitrary tied group.
+        let choice = [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+        let logit = choice;
+        let picked = rank_top_grouped(&choice, &logit, 2, 4, 1);
+        let ids: Vec<usize> = picked.iter().map(|&(e, _)| e).collect();
+        assert_eq!(ids, vec![0, 1], "tied groups must resolve to the lowest index, group0");
+    }
+
+    #[test]
+    fn route_respects_n_group_and_topk_group_end_to_end() {
+        let mut seed = 5;
+        let mut cfg = tiny_cfg(8, 3, 4, 6, 1, false);
+        cfg.n_group = 4;
+        cfg.topk_group = 2;
+        let w = MoeWeights {
+            router: random_vec(8 * 6, &mut seed),
+            router_bias: vec![0.0; 8], // no bias -> selection is purely the router's own sigmoid
+            sh_gate: QT::alloc(1, 6, 32, false),
+            sh_up: QT::alloc(1, 6, 32, false),
+            sh_down: QT::alloc(6, 1, 32, false),
+        };
+        let x = random_vec(6, &mut seed);
+
+        let (logit, choice) = router_scores(&cfg, &w, &x);
+        let expected = rank_top_grouped(&choice, &logit, cfg.topk as usize, cfg.n_group as usize, cfg.topk_group as usize);
+        let expected_ids: Vec<usize> = expected.iter().map(|&(e, _)| e).collect();
+
+        let routing = route(&cfg, &w, &x, 1);
+        let got_ids: Vec<usize> = routing.choices[0].iter().map(|&(e, _)| e).collect();
+        assert_eq!(got_ids, expected_ids, "route() must select the same experts rank_top_grouped alone would");
     }
 
     /// End-to-end: with `topk == n_experts`, routing always selects EVERY expert, so `moe()`'s

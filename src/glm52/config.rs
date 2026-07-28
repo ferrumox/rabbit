@@ -39,11 +39,24 @@ pub struct Cfg {
     pub routed_scale: f32,
 }
 
+/// The only `model_type` this loader recognizes today — rabbit's single supported
+/// architecture family (see `src/glm52/mod.rs`'s module doc). Checked before any GLM-specific
+/// field is read, so an unrelated checkpoint (a different HF architecture entirely) gets a
+/// clear error here instead of silently misparsing into a `Cfg` full of zero-defaulted fields
+/// (`gi()` below returns 0 for any missing key) that would only surface as a confusing panic
+/// or garbage output much later, deep in the forward pass.
+const SUPPORTED_MODEL_TYPE: &str = "glm_moe_dsa";
+
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
     Json(serde_json::Error),
-    UnsupportedNGroup(i32),
+    /// `config.json`'s `model_type` was missing or didn't match `SUPPORTED_MODEL_TYPE`.
+    UnsupportedArchitecture { found: Option<String> },
+    /// `n_routed_experts` doesn't divide evenly into `n_group` groups — grouped routing
+    /// (DeepSeek-V3/GLM/Kimi Linear style: rank groups by their top-2 `choice` sum, keep only
+    /// `topk_group` of them, then top-k within survivors) needs equal-size groups.
+    InvalidGrouping { n_experts: i32, n_group: i32 },
     OutOfRange { name: &'static str, value: i64, lo: i64, hi: i64 },
 }
 
@@ -52,8 +65,16 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "config.json: {e}"),
             ConfigError::Json(e) => write!(f, "config.json: {e}"),
-            ConfigError::UnsupportedNGroup(v) => {
-                write!(f, "this engine assumes n_group=1 (GLM-5.2), got {v}")
+            ConfigError::UnsupportedArchitecture { found: Some(model_type) } => write!(
+                f,
+                "config.json's model_type is {model_type:?}, but rabbit only supports {SUPPORTED_MODEL_TYPE:?} (GLM-5.2) today"
+            ),
+            ConfigError::UnsupportedArchitecture { found: None } => write!(
+                f,
+                "config.json has no model_type field; rabbit only supports {SUPPORTED_MODEL_TYPE:?} (GLM-5.2) today"
+            ),
+            ConfigError::InvalidGrouping { n_experts, n_group } => {
+                write!(f, "n_routed_experts={n_experts} doesn't divide evenly into n_group={n_group} groups")
             }
             ConfigError::OutOfRange { name, value, lo, hi } => {
                 write!(f, "config: {name}={value} out of range [{lo},{hi}]")
@@ -97,6 +118,14 @@ impl Cfg {
     pub fn load(snap_dir: &Path) -> Result<Cfg, ConfigError> {
         let text = fs::read_to_string(snap_dir.join("config.json"))?;
         let r: Value = serde_json::from_str(&text)?;
+
+        match r.get("model_type").and_then(Value::as_str) {
+            Some(model_type) if model_type == SUPPORTED_MODEL_TYPE => {}
+            Some(model_type) => {
+                return Err(ConfigError::UnsupportedArchitecture { found: Some(model_type.to_string()) });
+            }
+            None => return Err(ConfigError::UnsupportedArchitecture { found: None }),
+        }
 
         let n_layers = gi(&r, "num_hidden_layers");
         let qk_nope = gi(&r, "qk_nope_head_dim");
@@ -157,16 +186,24 @@ impl Cfg {
         let qk_head = qk_nope + qk_rope;
         let attn_scale = 1.0 / (qk_head as f32).sqrt();
 
-        let n_group = gi(&r, "n_group");
-        if n_group != 1 {
-            return Err(ConfigError::UnsupportedNGroup(n_group));
+        // DeepSeek-V3/GLM/Kimi-Linear-style grouped routing: `n_experts` splits into `n_group`
+        // equal-size groups, ranked by their own top-2 `choice` sum, before the true top-k runs
+        // only within the `topk_group` highest-scoring groups (see `moe.rs::rank_top_grouped`).
+        // `n_group` missing or 0 defaults to 1 (matches `index_topk_freq`'s own `.max(1)`
+        // convention above) — every real GLM-5.2 checkpoint sets it to 1 explicitly anyway,
+        // degenerating to plain top-k with no grouping at all.
+        let n_group = gi(&r, "n_group").max(1);
+        let n_experts = gi(&r, "n_routed_experts");
+        let topk_group = gi(&r, "topk_group").max(1);
+        if n_experts % n_group != 0 {
+            return Err(ConfigError::InvalidGrouping { n_experts, n_group });
         }
 
         let c = Cfg {
             hidden: gi(&r, "hidden_size"),
             n_layers,
             n_heads: gi(&r, "num_attention_heads"),
-            n_experts: gi(&r, "n_routed_experts"),
+            n_experts,
             topk: gi(&r, "num_experts_per_tok"),
             moe_inter: gi(&r, "moe_intermediate_size"),
             dense_inter: gi(&r, "intermediate_size"),
@@ -180,7 +217,7 @@ impl Cfg {
             n_shared: gi(&r, "n_shared_experts"),
             vocab: gi(&r, "vocab_size"),
             n_group,
-            topk_group: gi(&r, "topk_group"),
+            topk_group,
             norm_topk,
             stop_ids,
             index_topk,
@@ -200,6 +237,8 @@ impl Cfg {
         check_range!("num_attention_heads", c.n_heads, 1, 1024);
         check_range!("n_routed_experts", c.n_experts, 1, 4096);
         check_range!("num_experts_per_tok", c.topk, 1, 64);
+        check_range!("n_group", c.n_group, 1, c.n_experts);
+        check_range!("topk_group", c.topk_group, 1, c.n_group);
         check_range!("moe_intermediate_size", c.moe_inter, 1, 1 << 20);
         check_range!("intermediate_size", c.dense_inter, 1, 1 << 24);
         check_range!("first_k_dense_replace", c.first_dense, 0, c.n_layers);
@@ -233,6 +272,7 @@ mod tests {
         write_config(
             &dir,
             r#"{
+                "model_type": "glm_moe_dsa",
                 "hidden_size": 128, "num_hidden_layers": 5, "num_attention_heads": 4,
                 "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
                 "intermediate_size": 64, "first_k_dense_replace": 3, "q_lora_rank": 64,
@@ -264,6 +304,7 @@ mod tests {
         write_config(
             &dir,
             r#"{
+                "model_type": "glm_moe_dsa",
                 "hidden_size": 128, "num_hidden_layers": 3, "num_attention_heads": 4,
                 "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
                 "intermediate_size": 64, "first_k_dense_replace": 1, "q_lora_rank": 64,
@@ -294,6 +335,7 @@ mod tests {
         write_config(
             &dir,
             r#"{
+                "model_type": "glm_moe_dsa",
                 "hidden_size": 0, "num_hidden_layers": 5, "num_attention_heads": 4,
                 "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
                 "intermediate_size": 64, "first_k_dense_replace": 3, "q_lora_rank": 64,
@@ -310,12 +352,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_n_group() {
-        let dir = std::env::temp_dir().join("rabbit_test_cfg_ngroup");
+    fn loads_a_valid_n_group_greater_than_one() {
+        // 8 experts split into 2 groups of 4 — a real grouped-routing config (Kimi Linear's
+        // own shape, not just GLM-5.2's degenerate n_group=1), must load cleanly now.
+        let dir = std::env::temp_dir().join("rabbit_test_cfg_ngroup_valid");
         fs::create_dir_all(&dir).unwrap();
         write_config(
             &dir,
             r#"{
+                "model_type": "glm_moe_dsa",
                 "hidden_size": 128, "num_hidden_layers": 5, "num_attention_heads": 4,
                 "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
                 "intermediate_size": 64, "first_k_dense_replace": 3, "q_lora_rank": 64,
@@ -325,8 +370,65 @@ mod tests {
             }"#,
         );
 
+        let c = Cfg::load(&dir).unwrap();
+        assert_eq!(c.n_group, 2);
+        assert_eq!(c.topk_group, 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_an_n_group_that_does_not_divide_n_experts_evenly() {
+        let dir = std::env::temp_dir().join("rabbit_test_cfg_ngroup_uneven");
+        fs::create_dir_all(&dir).unwrap();
+        write_config(
+            &dir,
+            r#"{
+                "model_type": "glm_moe_dsa",
+                "hidden_size": 128, "num_hidden_layers": 5, "num_attention_heads": 4,
+                "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+                "intermediate_size": 64, "first_k_dense_replace": 3, "q_lora_rank": 64,
+                "kv_lora_rank": 32, "qk_nope_head_dim": 24, "qk_rope_head_dim": 8,
+                "v_head_dim": 32, "n_shared_experts": 1, "vocab_size": 256, "n_group": 3,
+                "topk_group": 1, "index_topk": 4096, "index_n_heads": 2, "index_head_dim": 16
+            }"#,
+        );
+
         let err = Cfg::load(&dir).unwrap_err();
-        matches!(err, ConfigError::UnsupportedNGroup(2));
+        assert!(
+            matches!(err, ConfigError::InvalidGrouping { n_experts: 8, n_group: 3 }),
+            "expected InvalidGrouping {{ n_experts: 8, n_group: 3 }}, got {err:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_a_different_architectures_model_type() {
+        let dir = std::env::temp_dir().join("rabbit_test_cfg_wrong_model_type");
+        fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, r#"{"model_type": "kimi_k3", "hidden_size": 128}"#);
+
+        let err = Cfg::load(&dir).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnsupportedArchitecture { found: Some(ref m) } if m == "kimi_k3"),
+            "expected UnsupportedArchitecture(\"kimi_k3\"), got {err:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_a_config_with_no_model_type_at_all() {
+        let dir = std::env::temp_dir().join("rabbit_test_cfg_missing_model_type");
+        fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, r#"{"hidden_size": 128}"#);
+
+        let err = Cfg::load(&dir).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnsupportedArchitecture { found: None }),
+            "expected UnsupportedArchitecture(None), got {err:?}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

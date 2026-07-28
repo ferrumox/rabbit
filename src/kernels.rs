@@ -23,7 +23,7 @@
 //! runs in integer arithmetic — the reference implementation measures this at ~2-3x over the float-weight path, at
 //! ~0.3% added RMS error per matmul from the activation quantization.
 
-use crate::quant::{QT, QTKind};
+use crate::quant::{QT, QTKind, e2m1_decode, e8m0_decode};
 use rayon::prelude::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -195,6 +195,34 @@ fn matmul_i2_scalar(y: &mut [f32], x: &[f32], q2: &[u8], scale: &[f32], s: usize
                     a += xs[ii] * v as f32;
                 }
                 *slot = a * sc;
+            }
+        });
+        transpose_so(y, yt, s, o);
+    });
+}
+
+/// y[S,O] = x[S,I] @ W^T, W in OCP-MX FP4 (`QTKind::MxFp4` — see `quant.rs`'s doc): 4-bit E2M1
+/// elements, one E8M0 scale per 32-element block along the row (not per-row, unlike every other
+/// format here). Scalar only for now — correctness first, matching this project's own
+/// established order (see the module doc's history: SIMD tiers arrived after a proven scalar
+/// baseline for every other format too), and there's no real MXFP4 checkpoint to benchmark
+/// against yet regardless (see `rabbit-plan.md`'s Phase 2 entry).
+pub fn matmul_mxfp4(y: &mut [f32], x: &[f32], data: &[u8], block_scale: &[u8], s: usize, i: usize, o: usize) {
+    let rb = i.div_ceil(2);
+    let bpr = i.div_ceil(32);
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &data[oi * rb..(oi + 1) * rb];
+            let bs = &block_scale[oi * bpr..(oi + 1) * bpr];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xs = &x[si * i..(si + 1) * i];
+                let mut a = 0f32;
+                for k in 0..i {
+                    let byte = w[k >> 1];
+                    let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                    a += xs[k] * e2m1_decode(nibble) * e8m0_decode(bs[k / 32]);
+                }
+                *slot = a;
             }
         });
         transpose_so(y, yt, s, o);
@@ -747,6 +775,7 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QT, s: usize) {
             }
         }
         QTKind::I2 { data, scale } => matmul_i2(y, x, data, scale, s, w.cols, w.rows),
+        QTKind::MxFp4 { data, block_scale } => matmul_mxfp4(y, x, data, block_scale, s, w.cols, w.rows),
     }
 }
 
@@ -800,6 +829,17 @@ pub fn qt_addrow(w: &QT, row: usize, coef: f32, acc: &mut [f32]) {
                 acc[k] += c * (bits as i32 - 2) as f32;
             }
         }
+        QTKind::MxFp4 { data, block_scale } => {
+            let rb = i.div_ceil(2);
+            let bpr = i.div_ceil(32);
+            let wr = &data[row * rb..(row + 1) * rb];
+            let bsr = &block_scale[row * bpr..(row + 1) * bpr];
+            for k in 0..i {
+                let byte = wr[k >> 1];
+                let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                acc[k] += coef * e2m1_decode(nibble) * e8m0_decode(bsr[k / 32]);
+            }
+        }
     }
 }
 
@@ -845,6 +885,19 @@ pub fn qt_matvec_rows(w: &QT, r0: usize, n: usize, x: &[f32], y: &mut [f32]) {
                     acc += (bits as i32 - 2) as f32 * x[k];
                 }
                 acc as f64 * scale[row] as f64
+            }
+            QTKind::MxFp4 { data, block_scale } => {
+                let rb = i.div_ceil(2);
+                let bpr = i.div_ceil(32);
+                let wr = &data[row * rb..(row + 1) * rb];
+                let bsr = &block_scale[row * bpr..(row + 1) * bpr];
+                let mut acc = 0f64;
+                for k in 0..i {
+                    let byte = wr[k >> 1];
+                    let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                    acc += (e2m1_decode(nibble) * e8m0_decode(bsr[k / 32])) as f64 * x[k] as f64;
+                }
+                acc
             }
         };
         *yj = a as f32;
@@ -930,6 +983,49 @@ mod tests {
         matmul_i2(&mut y, &x, &bytes, &scale, 1, 5, 1);
         let expected: f32 = vals.iter().sum::<i32>() as f32 * 3.0;
         assert_eq!(y[0], expected);
+    }
+
+    #[test]
+    fn matmul_mxfp4_matches_manual_e2m1_decode_across_two_blocks() {
+        // 40 columns -> block 0 (0..32) at code 4 (=2.0), block 1 (32..40, the tail block) at
+        // code 7|sign (=-6.0) — two different E8M0 scales, one per block, in the SAME row.
+        let cols: usize = 40;
+        let mut data = vec![0u8; cols.div_ceil(2)];
+        for byte in data[0..16].iter_mut() {
+            *byte = 4 | (4 << 4); // both nibbles in block 0: code 4
+        }
+        for byte in data[16..20].iter_mut() {
+            *byte = (7 | 0x8) | ((7 | 0x8) << 4); // both nibbles in block 1: code 7|sign
+        }
+        let block_scale = [127u8, 130u8]; // scale=1.0, scale=8.0
+        let x = vec![1.0f32; cols];
+        let mut y = [0.0f32; 1];
+        matmul_mxfp4(&mut y, &x, &data, &block_scale, 1, cols, 1);
+        // block 0: 32 * (2.0 * 1.0) = 64.0; block 1: 8 * (-6.0 * 8.0) = -384.0
+        assert_eq!(y[0], 32.0 * 2.0 + 8.0 * -48.0);
+    }
+
+    #[test]
+    fn matmul_qt_mxfp4_matches_manual_dequant_dot_product() {
+        let rows = 5;
+        let cols = 96; // 3 full blocks/row
+        let s = 2;
+        let w = random_vec(rows * cols, 31);
+        let x = random_vec(s * cols, 32);
+        let mut t = QT::alloc_mxfp4(rows, cols);
+        t.fill(&w);
+
+        let mut expected = vec![0.0f32; s * rows];
+        for si in 0..s {
+            for oi in 0..rows {
+                let wr = t.row_f32(oi);
+                let xr = &x[si * cols..(si + 1) * cols];
+                expected[si * rows + oi] = wr.iter().zip(xr).map(|(&a, &b)| a * b).sum();
+            }
+        }
+        let mut y = vec![0.0f32; s * rows];
+        matmul_qt(&mut y, &x, &t, s);
+        assert_eq!(y, expected);
     }
 
     #[test]

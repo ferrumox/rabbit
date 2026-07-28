@@ -26,7 +26,7 @@
 //! about production performance.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rabbit::config::Cfg;
+use rabbit::glm52::config::Cfg;
 use rabbit::expert_cache::ExpertCache;
 use rabbit::safetensors::Shards;
 use std::hint::black_box;

@@ -18,9 +18,9 @@
 //! (`Dsa::Reuse`). The cross-layer decision of which is which belongs to the layer loop
 //! (`layers_forward`, a later phase) — this module only needs the primitive.
 
-use crate::config::Cfg;
+use crate::glm52::config::Cfg;
+use crate::glm52::model::{AttnWeights, DsaWeights};
 use crate::kernels::{matmul_qt, qt_addrow, qt_matvec_rows};
-use crate::model::{AttnWeights, DsaWeights};
 use rayon::prelude::*;
 
 pub fn rmsnorm(v: &mut [f32], w: &[f32], eps: f32) {
@@ -208,6 +208,37 @@ pub enum Absorb {
     Never,
 }
 
+/// Whether `attention()` applies RoPE to the query/key rope-slice it reads/writes. GLM-5.2
+/// always wants `Interleaved` (its actual MLA behavior, unchanged from before this enum
+/// existed). `Off` exists for Kimi Linear's global MLA layers, which share GLM's exact
+/// `qk_nope`/`qk_rope` split and compressed-KV-cache shape but — per the real reference
+/// (`modeling_kimi.py`/vLLM's `mla.py`, `rotary_emb=None`, cross-checked against llama.cpp's
+/// vendored `kimi-linear.cpp`) — use the rope-slice's raw projected values directly, no rotation
+/// at all. `Off` skips `rope_interleave` entirely rather than calling it with an identity angle:
+/// even at `pos=0`, `rope_interleave` still de-interleaves (see its own doc comment), which
+/// would silently permute Kimi's untouched rope-slice into the wrong layout.
+pub enum Rope {
+    Interleaved,
+    Off,
+}
+
+/// How `attention()` computes the query projection. GLM-5.2 always wants `Lora` (its actual
+/// behavior, unchanged from before this enum existed). `Direct` exists for Kimi Linear, whose
+/// real checkpoint always has `q_lora_rank: null` (`modeling_kimi.py`'s `KimiMLAAttention`
+/// literally asserts `self.q_lora_rank is None` — not an optional feature, a hard invariant of
+/// this architecture): a single `q_proj(x)` with no intermediate low-rank compression or
+/// `RMSNorm` in between, structurally different from GLM's two-stage
+/// `q_b(rmsnorm(q_a(x)))` (not just "the same math with different numbers" the way `Rope::Off`
+/// was — an `RMSNorm` can't be parameterized into an identity function since its division
+/// depends on the actual runtime activation, so this needs a real second code path, not a
+/// weight trick). `Direct` reuses `w.q_a` to hold that single projection directly (shaped
+/// `[h*qh, hidden]` instead of `[q_lora, hidden]`) so `AttnWeights`'s shape stays the same
+/// struct for both architectures; `w.q_a_ln`/`w.q_b` are simply never read in this mode.
+pub enum QProj {
+    Lora,
+    Direct,
+}
+
 /// Computes the DSA lightning indexer's key embeddings for the new tokens (always) and a
 /// top-k selection (only when the context already exceeds `index_topk`, or `force`).
 /// Mirrors the C's parameter list 1:1 — bundling these into a struct would just move the
@@ -322,6 +353,8 @@ pub fn attention(
     pos_base: usize,
     dsa: Dsa<'_>,
     absorb: Absorb,
+    rope: Rope,
+    qproj: QProj,
     out: &mut [f32],
 ) -> Option<Selection> {
     let h = cfg.n_heads as usize;
@@ -351,15 +384,23 @@ pub fn attention(
         let xs = &x[si * d..(si + 1) * d];
         let pos = pos_base + si;
 
-        let qresid = &mut qr_all[si * q_lora..(si + 1) * q_lora];
-        matmul_qt(qresid, xs, &w.q_a, 1);
-        rmsnorm(qresid, &w.q_a_ln, cfg.eps);
-
         let qfull = &mut q[si * h * qh..(si + 1) * h * qh];
-        matmul_qt(qfull, qresid, &w.q_b, 1);
-        for hh in 0..h {
-            let start = hh * qh + qk_nope;
-            rope_interleave(&mut qfull[start..start + qk_rope], pos, cfg.theta);
+        match qproj {
+            QProj::Lora => {
+                let qresid = &mut qr_all[si * q_lora..(si + 1) * q_lora];
+                matmul_qt(qresid, xs, &w.q_a, 1);
+                rmsnorm(qresid, &w.q_a_ln, cfg.eps);
+                matmul_qt(qfull, qresid, &w.q_b, 1);
+            }
+            QProj::Direct => {
+                matmul_qt(qfull, xs, &w.q_a, 1);
+            }
+        }
+        if let Rope::Interleaved = rope {
+            for hh in 0..h {
+                let start = hh * qh + qk_nope;
+                rope_interleave(&mut qfull[start..start + qk_rope], pos, cfg.theta);
+            }
         }
 
         let mut comp = vec![0f32; kv_lora + qk_rope];
@@ -367,7 +408,9 @@ pub fn attention(
         let mut l_row = comp[0..kv_lora].to_vec();
         rmsnorm(&mut l_row, &w.kv_a_ln, cfg.eps);
         let mut r_row = comp[kv_lora..kv_lora + qk_rope].to_vec();
-        rope_interleave(&mut r_row, pos, cfg.theta);
+        if let Rope::Interleaved = rope {
+            rope_interleave(&mut r_row, pos, cfg.theta);
+        }
         kv.push(&l_row, &r_row);
     }
 
@@ -653,15 +696,154 @@ mod tests {
 
         let mut kv_a = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_absorb = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, &mut out_absorb);
+        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Interleaved, QProj::Lora, &mut out_absorb);
 
         let mut kv_d = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_dense = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, &mut out_dense);
+        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, &mut out_dense);
 
         for (a, b) in out_absorb.iter().zip(&out_dense) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
         }
+    }
+
+    /// `QProj::Direct` fixture: `q_a` is reshaped to `[h*qh, hidden]` (the full direct
+    /// projection) instead of `[q_lora, hidden]`; `q_a_ln`/`q_b` are unread in this mode, so
+    /// they're left as whatever `tiny_attn_weights` already put there.
+    fn tiny_attn_weights_direct_q(cfg: &Cfg, seed: &mut u32) -> AttnWeights {
+        let mut w = tiny_attn_weights(cfg, seed);
+        let d = cfg.hidden as usize;
+        let h = cfg.n_heads as usize;
+        let qh = cfg.qk_head as usize;
+        w.q_a = random_qt_f32(h * qh, d, seed);
+        w
+    }
+
+    #[test]
+    fn qproj_direct_absorbed_path_matches_dense_reconstruction_path() {
+        // Same equivalence as absorbed_path_matches_dense_reconstruction_path, but with Q
+        // computed as a single direct projection instead of through the LoRA+RMSNorm path.
+        let cfg = tiny_cfg();
+        let mut seed = 71;
+        let w = tiny_attn_weights_direct_q(&cfg, &mut seed);
+        let s = 3;
+        let d = cfg.hidden as usize;
+        let x = random_vec(s * d, &mut seed);
+
+        let mut kv_a = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_absorb = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Interleaved, QProj::Direct, &mut out_absorb);
+
+        let mut kv_d = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_dense = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, &mut out_dense);
+
+        for (a, b) in out_absorb.iter().zip(&out_dense) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn qproj_direct_never_reads_q_a_ln_or_q_b() {
+        // Same AttnWeights, only q_a_ln/q_b mutated in place after the first call -- corrupting
+        // them (NaN, reshaped garbage) must leave QProj::Direct's output completely unchanged.
+        let cfg = tiny_cfg();
+        let mut seed = 91;
+        let mut w = tiny_attn_weights_direct_q(&cfg, &mut seed);
+        let s = 2;
+        let d = cfg.hidden as usize;
+        let x = random_vec(s * d, &mut seed);
+
+        let mut kv1 = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_before = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv1, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, &mut out_before);
+
+        w.q_a_ln = vec![f32::NAN; w.q_a_ln.len()];
+        let mut junk_seed = 12345;
+        w.q_b = random_qt_f32(1, 1, &mut junk_seed);
+
+        let mut kv2 = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_after = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv2, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, &mut out_after);
+
+        assert_eq!(out_before, out_after, "QProj::Direct must never read q_a_ln (NaN'd) or q_b (reshaped+randomized)");
+    }
+
+    #[test]
+    fn rope_off_absorbed_path_matches_dense_reconstruction_path() {
+        // Same equivalence as absorbed_path_matches_dense_reconstruction_path, but with RoPE
+        // skipped entirely — the two attention paths must stay mathematically consistent
+        // regardless of which Rope mode feeds them.
+        let cfg = tiny_cfg();
+        let mut seed = 41;
+        let w = tiny_attn_weights(&cfg, &mut seed);
+        let s = 3;
+        let d = cfg.hidden as usize;
+        let x = random_vec(s * d, &mut seed);
+
+        let mut kv_a = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_absorb = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Off, QProj::Lora, &mut out_absorb);
+
+        let mut kv_d = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_dense = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_dense);
+
+        for (a, b) in out_absorb.iter().zip(&out_dense) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn rope_off_changes_output_versus_interleaved() {
+        // rope_interleave still permutes the rope-slice even at pos=0 (see
+        // rope_interleave_at_pos_zero_is_a_pure_deinterleave), so Rope::Off (raw, untouched
+        // slice) must diverge from Rope::Interleaved even on the very first token — proof the
+        // flag actually takes effect, not a no-op.
+        let cfg = tiny_cfg();
+        let mut seed = 51;
+        let w = tiny_attn_weights(&cfg, &mut seed);
+        let s = 2;
+        let d = cfg.hidden as usize;
+        let x = random_vec(s * d, &mut seed);
+
+        let mut kv_on = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_on = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_on, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, &mut out_on);
+
+        let mut kv_off = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_off = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_off, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_off);
+
+        let differs = out_on.iter().zip(&out_off).any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(differs, "Rope::Off must produce different output than Rope::Interleaved");
+    }
+
+    #[test]
+    fn rope_off_is_invariant_to_theta() {
+        // With RoPE skipped, cfg.theta never enters the computation at all -- changing it must
+        // leave the output bit-for-bit unchanged. This also serves as a cross-check that Off
+        // truly bypasses rope_interleave rather than calling it with some no-op angle.
+        let mut cfg_a = tiny_cfg();
+        cfg_a.theta = 10000.0;
+        let mut cfg_b = tiny_cfg();
+        cfg_b.theta = 500000.0;
+
+        let mut seed = 61;
+        let w = tiny_attn_weights(&cfg_a, &mut seed);
+        let s = 3;
+        let d = cfg_a.hidden as usize;
+        let x = random_vec(s * d, &mut seed);
+
+        let mut kv_a = KvCache::new(cfg_a.kv_lora as usize, cfg_a.qk_rope as usize);
+        let mut out_a = vec![0.0; s * d];
+        attention(&cfg_a, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_a);
+
+        let mut kv_b = KvCache::new(cfg_b.kv_lora as usize, cfg_b.qk_rope as usize);
+        let mut out_b = vec![0.0; s * d];
+        attention(&cfg_b, &w, &mut kv_b, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_b);
+
+        assert_eq!(out_a, out_b, "theta must be irrelevant when Rope::Off");
     }
 
     #[test]
@@ -682,7 +864,7 @@ mod tests {
 
         let mut kv_plain = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_plain = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_plain, &x, s, 0, Dsa::Off, Absorb::Never, &mut out_plain);
+        attention(&cfg, &w, &mut kv_plain, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, &mut out_plain);
 
         let mut kv_dsa = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut dsa_cache = DsaCache::new(cfg.index_hd as usize);
@@ -696,6 +878,8 @@ mod tests {
             0,
             Dsa::Compute { weights: &dsa_w, cache: &mut dsa_cache, force: true },
             Absorb::Never,
+            Rope::Interleaved,
+            QProj::Lora,
             &mut out_dsa,
         );
         assert!(sel.is_some(), "Dsa::Compute must return the freshly computed selection");

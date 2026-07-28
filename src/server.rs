@@ -246,7 +246,7 @@ fn handle_chat_completions(mut request: Request, session: &mut Session, cfg: &Se
         Err(e) => return respond_err(request, e),
     }
 
-    let prompt_text = chat::render_messages(&messages, cfg.think);
+    let prompt_text = chat::render_messages(&session.model, &messages, cfg.think);
     let prompt_ids: Vec<usize> = session.tokenizer.encode(&prompt_text).into_iter().map(|id| id as usize).collect();
     let mut kv = KvState::new(&session.model);
     let id = format!("chatcmpl-{:016x}", request_id());
