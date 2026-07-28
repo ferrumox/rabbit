@@ -224,75 +224,102 @@ mod uring_load {
     /// decodes the results into `ExpertSlot`s — the other half of `submit_batch`'s split,
     /// called on the same `ring` (`submit_batch` only returns `Some` when the ring exists, so
     /// this never needs its own "ring unavailable" fallback).
-    /// Returns the loaded slots plus, separately, how many of those nanoseconds were spent
-    /// purely in `submit_and_wait` (waiting on the kernel/disk) — split out from `load_nanos`
-    /// (which times this whole function, wait AND decode/copy together) specifically so a
-    /// diagnostic run can tell apart "still disk-bound" from "decode/copy is now the bigger
-    /// cost," the question that found the `qt_from_raw` buffer-copy fix — see `PERFORMANCE.md`.
-    pub(super) fn complete_batch(ring: &mut Ring, pending: Pending, bits: u8, used: u64) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
-        let Pending { reqs, bufs, scale_bufs, eids } = pending;
+    ///
+    /// Unlike a single `submit_and_wait(total)` for the whole round, this waits ONE completion
+    /// at a time and decodes each expert's `ExpertSlot` — and calls `on_slot` with it — the
+    /// MOMENT that expert's own 3 tensors (+ any scale sidecars) have all arrived, rather than
+    /// waiting for every other expert in the round too. A real-checkpoint measurement motivated
+    /// this: across 297 genuinely disk-bound rounds, on average 33% of a round's total wait time
+    /// still remained even after HALF its reads had already completed (see `PERFORMANCE.md`) —
+    /// a real, measured overlap window, not a guess. `on_slot` lets the caller (`moe.rs`) start
+    /// that expert's matmul immediately, while the ring keeps waiting on the rest, instead of
+    /// leaving the CPU idle until the slowest read in the round finishes.
+    ///
+    /// Returns the loaded slots (in completion order, not `eids` order — callers that insert by
+    /// id, like `finish_loading`, don't care) plus, separately, how many nanoseconds were spent
+    /// purely waiting on completions — split out from `load_nanos` the same way the previous
+    /// non-streaming version was, for the same reason (see `PERFORMANCE.md`).
+    pub(super) fn complete_batch_streaming(ring: &mut Ring, pending: Pending, bits: u8, used: u64, mut on_slot: impl FnMut(&ExpertSlot)) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
+        let Pending { reqs, mut bufs, scale_bufs, eids } = pending;
         let total = reqs.len() + scale_bufs.len();
+        let n_experts = eids.len();
+
+        // `scale_owner[s]` = which expert (index into `eids`) scale-sidecar read `s` belongs
+        // to; `needed[e]` = how many of expert `e`'s reads (3 main + 0-3 scale) must land
+        // before it's fully decodable.
+        let mut scale_owner = vec![usize::MAX; scale_bufs.len()];
+        let mut needed = vec![3usize; n_experts];
+        for (local, req) in reqs.iter().enumerate() {
+            let owner = local / 3;
+            if let Some(idx) = req.packed_scale {
+                scale_owner[idx] = owner;
+                needed[owner] += 1;
+            }
+            if let Some(idx) = req.fp8_scale {
+                scale_owner[idx] = owner;
+                needed[owner] += 1;
+            }
+        }
+        let mut got = vec![0usize; n_experts];
+        let mut scales: Vec<Vec<f32>> = vec![Vec::new(); scale_bufs.len()];
+        let mut out = Vec::with_capacity(n_experts);
 
         let wait_t = std::time::Instant::now();
-        ring.io.submit_and_wait(total)?;
+        let mut completed = 0usize;
+        while completed < total {
+            ring.io.submit_and_wait(1)?;
+            for cqe in ring.io.completion() {
+                completed += 1;
+                let idx = cqe.user_data() as usize;
+                let n = cqe.result();
+                let owner;
+                if idx < reqs.len() {
+                    let req = &reqs[idx];
+                    match n {
+                        n if n as u64 == req.loc.nbytes => {}
+                        n if n >= 0 => {
+                            let msg = format!("expert read: short read ({n}/{} bytes)", req.loc.nbytes);
+                            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
+                        }
+                        n => return Err(std::io::Error::from_raw_os_error(-n)),
+                    }
+                    owner = idx / 3;
+                } else {
+                    let sidx = idx - reqs.len();
+                    let buf = &scale_bufs[sidx];
+                    match n {
+                        n if n as u64 == buf.len() as u64 => {}
+                        n if n >= 0 => {
+                            let msg = format!("expert scale read: short read ({n}/{} bytes)", buf.len());
+                            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
+                        }
+                        n => return Err(std::io::Error::from_raw_os_error(-n)),
+                    }
+                    // decode as soon as this specific scale lands (plain byte->f32
+                    // reinterpretation, no I/O left to do) rather than waiting for the round.
+                    scales[sidx] = Shards::decode_f32(buf, DType::F32);
+                    owner = scale_owner[sidx];
+                }
+
+                got[owner] += 1;
+                if got[owner] == needed[owner] {
+                    // this expert's every read has landed — decode and hand it to the caller
+                    // NOW, while the ring keeps waiting on everyone else in the round.
+                    // `mem::take` (not indexing/cloning) lets `qt_from_raw` take each buffer BY
+                    // VALUE (straight into `QT::from_packed`, which already wants an owned
+                    // `Vec<u8>`) instead of `raw.to_vec()`-cloning it — same reasoning as the
+                    // buffer-copy fix this replaced (see `PERFORMANCE.md`).
+                    let base = owner * 3;
+                    let gate = qt_from_raw(std::mem::take(&mut bufs[base]), &reqs[base], bits, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let up = qt_from_raw(std::mem::take(&mut bufs[base + 1]), &reqs[base + 1], bits, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let down = qt_from_raw(std::mem::take(&mut bufs[base + 2]), &reqs[base + 2], bits, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let slot = ExpertSlot { eid: eids[owner], gate, up, down, used };
+                    on_slot(&slot);
+                    out.push(slot);
+                }
+            }
+        }
         let io_wait_nanos = wait_t.elapsed().as_nanos() as u64;
-
-        let mut results = vec![None; total];
-        for cqe in ring.io.completion() {
-            results[cqe.user_data() as usize] = Some(cqe.result());
-        }
-        for (local, req) in reqs.iter().enumerate() {
-            match results[local] {
-                Some(n) if n as u64 == req.loc.nbytes => {}
-                Some(n) if n >= 0 => {
-                    let msg = format!("expert read: short read ({n}/{} bytes)", req.loc.nbytes);
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
-                }
-                Some(n) => return Err(std::io::Error::from_raw_os_error(-n)),
-                None => return Err(std::io::Error::other("expert read: no completion queue entry")),
-            }
-        }
-        for (local, buf) in scale_bufs.iter().enumerate() {
-            let idx = reqs.len() + local;
-            match results[idx] {
-                Some(n) if n as u64 == buf.len() as u64 => {}
-                Some(n) if n >= 0 => {
-                    let msg = format!("expert scale read: short read ({n}/{} bytes)", buf.len());
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
-                }
-                Some(n) => return Err(std::io::Error::from_raw_os_error(-n)),
-                None => return Err(std::io::Error::other("expert scale read: no completion queue entry")),
-            }
-        }
-
-        // decode every scale sidecar once up front (plain byte->f32 reinterpretation, no I/O
-        // left to do) so `qt_from_raw` below just indexes into `scales` instead of re-decoding.
-        let scales: Vec<Vec<f32>> = scale_bufs.iter().map(|b| Shards::decode_f32(b, DType::F32)).collect();
-
-        // group the 3 reads per expert back into one ExpertSlot each, in `eids` order. A
-        // decode error here (bad `.qs`/FP8 format) is a real data problem, not a transient I/O
-        // one, so retrying via `sequential_fallback` (as `finish_loading` does on any error
-        // from this function) wouldn't help — same bytes, same format problem — but folding it
-        // into the same I/O-error path here is simpler than threading a second error type
-        // through, and `finish_loading`'s fallback fails the same way through `qt_load`
-        // instead: same end result either way.
-        // `bufs` is consumed in the SAME order it was built (3 entries/expert, `misses` order)
-        // — `.into_iter()` here instead of indexing lets `qt_from_raw` take each buffer BY
-        // VALUE (straight into `QT::from_packed`, which already wants an owned `Vec<u8>`)
-        // instead of `raw.to_vec()`-cloning a borrowed slice. Measured on the real checkpoint:
-        // this decode/copy loop (not the actual disk wait — see `io_wait_nanos`) was ~25s of a
-        // ~62s "disk I/O" figure, almost entirely these redundant per-tensor clones.
-        let mut bufs = bufs.into_iter();
-        let mut out = Vec::with_capacity(eids.len());
-        for (chunk, &eid) in eids.iter().enumerate() {
-            let base = chunk * 3;
-            let mut next_buf = || bufs.next().expect("bufs has exactly 3 entries per expert, in the same order as reqs");
-            let decode = |buf: Vec<u8>, req: &Req| qt_from_raw(buf, req, bits, &scales).map_err(|e| std::io::Error::other(e.to_string()));
-            let gate = decode(next_buf(), &reqs[base])?;
-            let up = decode(next_buf(), &reqs[base + 1])?;
-            let down = decode(next_buf(), &reqs[base + 2])?;
-            out.push(ExpertSlot { eid, gate, up, down, used });
-        }
         Ok((out, io_wait_nanos))
     }
 
@@ -528,22 +555,43 @@ impl ExpertCache {
     /// call this `pending` came from — only needed for the rare fallback path (an `io_uring`
     /// completion error retries as a plain synchronous read of the same misses).
     pub fn finish_loading(&mut self, pending: PendingExpertLoad, shards: &Shards, cfg: &Cfg, layer: usize, bits: u8) -> Result<(), ModelError> {
+        self.finish_loading_streaming(pending, shards, cfg, layer, bits, |_| {})
+    }
+
+    /// Same contract as `finish_loading`, but calls `on_slot` with each expert's `ExpertSlot`
+    /// the moment ITS reads land, instead of only after the whole batch completes — see
+    /// `uring_load::complete_batch_streaming`'s doc for why that gap is real and worth using.
+    /// `on_slot` only ever sees experts THIS call is loading (misses) — anything already
+    /// resident (a hit) never appears here; callers that need to handle hits too (`moe.rs`)
+    /// should check `cache.get(eid)` for the rest of their batch separately.
+    pub fn finish_loading_streaming(&mut self, pending: PendingExpertLoad, shards: &Shards, cfg: &Cfg, layer: usize, bits: u8, mut on_slot: impl FnMut(&ExpertSlot)) -> Result<(), ModelError> {
         let loaded = match pending.0 {
             LoadKind::Nothing => return Ok(()),
-            LoadKind::Sync(v) => v,
+            LoadKind::Sync(v) => {
+                for slot in &v {
+                    on_slot(slot);
+                }
+                v
+            }
             #[cfg(target_os = "linux")]
             LoadKind::Async(p) => {
                 let eids_for_fallback = p.eids_for_fallback();
                 let load_t = std::time::Instant::now();
                 let ring = self.ring.as_mut().expect("Async pending implies the ring existed when begin_loading submitted it");
-                let result = uring_load::complete_batch(ring, p, bits, self.clock);
+                let result = uring_load::complete_batch_streaming(ring, p, bits, self.clock, &mut on_slot);
                 self.load_nanos += load_t.elapsed().as_nanos() as u64;
                 match result {
                     Ok((v, io_wait_nanos)) => {
                         self.io_wait_nanos += io_wait_nanos;
                         v
                     }
-                    Err(_) => sequential_fallback(shards, cfg, layer, &eids_for_fallback, bits, self.clock)?,
+                    Err(_) => {
+                        let v = sequential_fallback(shards, cfg, layer, &eids_for_fallback, bits, self.clock)?;
+                        for slot in &v {
+                            on_slot(slot);
+                        }
+                        v
+                    }
                 }
             }
         };

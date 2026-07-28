@@ -127,6 +127,23 @@ fn respond_err(request: Request, e: ApiError) {
     respond_json(request, status, body);
 }
 
+/// Pushes one turn's profile into the rolling window `GET /profile` serves, evicting the oldest
+/// entry past `chat::PROFILE_TURNS`. Called by both chat-completion handlers after a
+/// successful `generate_reply` — same "internal performance signal, not conversation state"
+/// framing as the usage-cache save already next to each call site.
+fn push_profile(session: &mut Session, profile: chat::TurnProfile) {
+    if session.profile.len() >= chat::PROFILE_TURNS {
+        session.profile.pop_front();
+    }
+    session.profile.push_back(profile);
+    session.profile_seq += 1;
+}
+
+fn handle_profile(request: Request, session: &Session) {
+    let body = json!({"seq": session.profile_seq, "turns": session.profile});
+    respond_json(request, 200, body.to_string());
+}
+
 fn handle(request: Request, session: &mut Session, cfg: &ServeConfig) {
     if let Some(key) = &cfg.api_key {
         let want = format!("Bearer {key}");
@@ -145,6 +162,7 @@ fn handle(request: Request, session: &mut Session, cfg: &ServeConfig) {
     match (method, url.as_str()) {
         (Method::Get, "/v1/models") => handle_models(request, cfg),
         (Method::Post, "/v1/chat/completions") => handle_chat_completions(request, session, cfg),
+        (Method::Get, "/profile") => handle_profile(request, session),
         _ => respond_err(request, ApiError::new(404, "invalid_request_error", "not found")),
     }
 }
@@ -247,10 +265,11 @@ fn handle_chat_completions(mut request: Request, session: &mut Session, cfg: &Se
             hit_stop = false;
         }
     });
-    let (text, _pos, n) = match result {
+    let (text, _pos, n, profile) = match result {
         Ok(v) => v,
         Err(e) => return respond_err(request, ApiError::from(e)),
     };
+    push_profile(session, profile);
 
     // Not a violation of "stateless across requests" (Fase 11): the usage cache isn't
     // conversation memory visible to API clients, it's an internal performance-tuning file —
@@ -344,11 +363,15 @@ fn stream_chat_completion(request: Request, session: &mut Session, kv: &mut KvSt
         eprintln!("stream: client disconnected mid-response");
         return;
     }
-    if let Err(e) = gen_result {
-        eprintln!("stream: generation error: {e}");
-        let _ = write_chunk(&mut *writer, &format!("data: {}\n\n", json!({"error": {"message": e.to_string(), "type": "server_error"}})));
-        return;
-    }
+    let profile = match gen_result {
+        Ok((_, _, _, profile)) => profile,
+        Err(e) => {
+            eprintln!("stream: generation error: {e}");
+            let _ = write_chunk(&mut *writer, &format!("data: {}\n\n", json!({"error": {"message": e.to_string(), "type": "server_error"}})));
+            return;
+        }
+    };
+    push_profile(session, profile);
 
     // Any bytes still sitting in `byte_buf` never completed a valid UTF-8 character while
     // tokens were still coming — generation ended (stop token or max_tokens) with a dangling

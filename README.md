@@ -46,13 +46,15 @@ those change token to token (the routed experts). So:
 - **KV-cache persistence** (`--session`) — conversations reopen warm across restarts, via an
   append-only on-disk format.
 - **OpenAI-compatible HTTP server** (`--serve`) — streaming and non-streaming
-  `/v1/chat/completions`, `/v1/models`.
+  `/v1/chat/completions`, `/v1/models`; plus `/profile`, a rolling per-turn phase-timing window
+  (attention/expert-wait/expert-matmul/lm-head) as JSON.
 - **Multi-turn chat** (`--chat`) with GLM-5.2's official template.
 
 Not yet built: a standalone `.qs` converter (currently relies on checkpoints pre-converted by
 colibrì's own tooling), live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
-grammar-constrained decoding, and a web UI. See `rabbit-plan.md` for the full phase-by-phase
-history.
+grammar-constrained decoding, an expert-routing heatmap (colibrì's "Brain" view), and any web
+UI (`/profile` above is a JSON endpoint, no page serves it yet — see `DASHBOARD_BRIEF.md` for
+the planned direction). See `rabbit-plan.md` for the full phase-by-phase history.
 
 ## Honest numbers (Ryzen AI 9 HX 370, 12 cores/24 threads)
 

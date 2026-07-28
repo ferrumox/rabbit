@@ -25,7 +25,7 @@
 //! `expert_cache.rs`'s module doc for why that's a pure performance cut.
 
 use crate::config::Cfg;
-use crate::expert_cache::ExpertCache;
+use crate::expert_cache::{ExpertCache, ExpertSlot};
 use crate::kernels::matmul_qt;
 use crate::model::{DenseMlpWeights, ModelError, MoeWeights};
 use crate::safetensors::Shards;
@@ -277,12 +277,10 @@ pub fn moe(
     // is always active regardless of routing, so its matmuls don't depend on which ROUTED
     // experts end up loaded — `begin_loading` submits that chunk's `io_uring` reads without
     // waiting, we compute the shared expert's VALUE while that read is in flight, and only
-    // then call `finish_loading` to wait for it. This changes nothing about the RESULT (the
-    // shared expert's contribution is still added to `out` in the same relative position,
-    // after every routed expert's — see below), only when its otherwise-idle wait time gets
-    // spent on independent CPU work instead. Later chunks (rare — only when a batch's unique
-    // expert count exceeds `cache.capacity()`) don't get this treatment: there's no more
-    // independent work left to overlap them with once the shared expert is already computed.
+    // then drain it. This changes nothing about the RESULT (the shared expert's contribution
+    // is still added to `out` in the same relative position, after every routed expert's — see
+    // below), only when its otherwise-idle wait time gets spent on independent CPU work
+    // instead.
     let first_chunk = chunks.next();
     let pending = match first_chunk {
         Some(chunk) => Some(cache.begin_loading(shards, cfg, layer, chunk, ebits)?),
@@ -299,13 +297,28 @@ pub fn moe(
     let mut hh = vec![0f32; s * d];
     matmul_qt(&mut hh, &sg, &w.sh_down, s);
 
+    // Per-expert early drain: rather than waiting for the WHOLE chunk's disk reads to finish
+    // before computing ANY routed expert's matmul, `finish_loading_streaming` calls back the
+    // moment each individual expert's own reads land, so its matmul can run while the ring is
+    // still waiting on the rest of the chunk. Measured on the real checkpoint (see
+    // `PERFORMANCE.md`): across genuinely disk-bound rounds, ~33% of a round's total wait time
+    // on average still remains even after half its reads have already completed — a real,
+    // otherwise-wasted window this fills with useful compute instead of leaving the CPU idle.
+    // Hits (already resident, no read to wait on) are handled separately right after
+    // `begin_loading` returns, since `finish_loading_streaming`'s callback only ever sees
+    // experts THIS call is actually loading.
     if let (Some(chunk), Some(pending)) = (first_chunk, pending) {
-        cache.finish_loading(pending, shards, cfg, layer, ebits)?;
-        apply_expert_chunk(cache, chunk, &routing, x, d, i, out);
+        for &eid in chunk {
+            if let Some(slot) = cache.get(eid) {
+                apply_single_expert(slot, &routing, x, d, i, out);
+            }
+        }
+        cache.finish_loading_streaming(pending, shards, cfg, layer, ebits, |slot| {
+            apply_single_expert(slot, &routing, x, d, i, out);
+        })?;
     }
     for chunk in chunks {
-        cache.ensure_loaded(shards, cfg, layer, chunk, ebits)?;
-        apply_expert_chunk(cache, chunk, &routing, x, d, i, out);
+        dispatch_chunk_streaming(cache, shards, cfg, layer, chunk, ebits, &routing, x, d, i, out)?;
     }
 
     // shared expert's contribution, added last — same relative accumulation order into `out`
@@ -318,45 +331,75 @@ pub fn moe(
     Ok(())
 }
 
-/// Computes and accumulates every routed expert in `chunk`'s contribution into `out`. Every
-/// id in `chunk` must already be resident in `cache` (via `ensure_loaded`, or
-/// `begin_loading`+`finish_loading`) before calling this.
+/// Computes and accumulates one routed expert's contribution into `out` — the per-expert body
+/// `apply_expert_chunk` used to loop over a whole chunk with; split out so it can be called
+/// either from that loop (hits, already resident) or from `finish_loading_streaming`'s
+/// per-expert callback (misses, as each one's reads land) without waiting for its neighbors.
 #[allow(clippy::too_many_arguments)]
-fn apply_expert_chunk(cache: &ExpertCache, chunk: &[usize], routing: &Routing, x: &[f32], d: usize, i: usize, out: &mut [f32]) {
-    for &eid in chunk {
-        let rows: Vec<(usize, f32)> = routing
-            .choices
-            .iter()
-            .enumerate()
-            .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let nr = rows.len();
+fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize, i: usize, out: &mut [f32]) {
+    let eid = slot.eid;
+    let rows: Vec<(usize, f32)> = routing
+        .choices
+        .iter()
+        .enumerate()
+        .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let nr = rows.len();
 
-        let mut xg = vec![0f32; nr * d];
-        for (r, &(si, _)) in rows.iter().enumerate() {
-            xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
-        }
+    let mut xg = vec![0f32; nr * d];
+    for (r, &(si, _)) in rows.iter().enumerate() {
+        xg[r * d..(r + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
+    }
 
-        let slot = cache.get(eid).expect("just ensured loaded above");
-        let mut gg = vec![0f32; nr * i];
-        let mut uu = vec![0f32; nr * i];
-        matmul_qt(&mut gg, &xg, &slot.gate, nr);
-        matmul_qt(&mut uu, &xg, &slot.up, nr);
-        for z in 0..nr * i {
-            gg[z] = siluf(gg[z]) * uu[z];
-        }
-        let mut hh = vec![0f32; nr * d];
-        matmul_qt(&mut hh, &gg, &slot.down, nr);
+    let mut gg = vec![0f32; nr * i];
+    let mut uu = vec![0f32; nr * i];
+    matmul_qt(&mut gg, &xg, &slot.gate, nr);
+    matmul_qt(&mut uu, &xg, &slot.up, nr);
+    for z in 0..nr * i {
+        gg[z] = siluf(gg[z]) * uu[z];
+    }
+    let mut hh = vec![0f32; nr * d];
+    matmul_qt(&mut hh, &gg, &slot.down, nr);
 
-        for (r, &(si, wgt)) in rows.iter().enumerate() {
-            for dd in 0..d {
-                out[si * d + dd] += wgt * hh[r * d + dd];
-            }
+    for (r, &(si, wgt)) in rows.iter().enumerate() {
+        for dd in 0..d {
+            out[si * d + dd] += wgt * hh[r * d + dd];
         }
     }
+}
+
+/// Loads `chunk` (hits touched immediately, misses submitted to `io_uring`) and computes every
+/// expert's contribution into `out` as soon as it's available — hits right away (already
+/// resident, nothing to wait on), misses as each one's own reads land via
+/// `finish_loading_streaming`'s callback, rather than waiting for the whole chunk. Used for
+/// every chunk except the first (which gets its own inline version in `moe()` so its
+/// `begin_loading` call can happen BEFORE the shared expert's compute, not right before this).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_chunk_streaming(
+    cache: &mut ExpertCache,
+    shards: &Shards,
+    cfg: &Cfg,
+    layer: usize,
+    chunk: &[usize],
+    ebits: u8,
+    routing: &Routing,
+    x: &[f32],
+    d: usize,
+    i: usize,
+    out: &mut [f32],
+) -> Result<(), ModelError> {
+    let pending = cache.begin_loading(shards, cfg, layer, chunk, ebits)?;
+    for &eid in chunk {
+        if let Some(slot) = cache.get(eid) {
+            apply_single_expert(slot, routing, x, d, i, out);
+        }
+    }
+    cache.finish_loading_streaming(pending, shards, cfg, layer, ebits, |slot| {
+        apply_single_expert(slot, routing, x, d, i, out);
+    })
 }
 
 #[cfg(test)]

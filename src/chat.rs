@@ -1,12 +1,18 @@
 //! Shared session/generation/template logic for both the CLI's `--chat` mode and the HTTP
 //! server (`server.rs`) — extracted from `main.rs` so neither has to duplicate it.
 
-use crate::generate::{self, ExpertCaches, Rng, SamplingConfig};
+use crate::generate::{self, ExpertCaches, Rng, SamplingConfig, StepProfile};
 pub use crate::generate::KvState;
 use crate::model::Model;
 use crate::safetensors::Shards;
 use crate::tokenizer::Tokenizer;
+use std::collections::VecDeque;
 use std::path::PathBuf;
+
+/// How many recent chat-completion turns' [`TurnProfile`]s `Session::profile` keeps — old
+/// entries are dropped as new ones arrive (see `server.rs`'s `/profile` handler). Matches
+/// colibrì's own rolling-window size for the equivalent feature.
+pub const PROFILE_TURNS: usize = 120;
 
 pub struct LoadArgs {
     pub model_dir: PathBuf,
@@ -34,6 +40,12 @@ pub struct Session {
     pub max_tokens: usize,
     pub model_dir: PathBuf,
     pub usage_cache_enabled: bool,
+    /// Rolling window of the last `PROFILE_TURNS` chat-completion turns' phase timings — fed by
+    /// `server.rs`'s HTTP handlers (not by `generate_reply` itself, which just computes and
+    /// returns each turn's [`TurnProfile`]) and served read-only at `GET /profile`. Empty when
+    /// running via `--chat`/`--prompt` — nothing ever pushes into it outside `server.rs`.
+    pub profile: VecDeque<TurnProfile>,
+    pub profile_seq: u64,
 }
 
 pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Error>> {
@@ -81,6 +93,8 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
         max_tokens: args.max_tokens,
         model_dir: args.model_dir.clone(),
         usage_cache_enabled,
+        profile: VecDeque::new(),
+        profile_seq: 0,
     })
 }
 
@@ -150,6 +164,38 @@ pub fn render_messages(messages: &[(Role, String)], think: bool) -> String {
     out
 }
 
+/// A whole chat-completion turn's (prefill + every decode step) phase-timing totals — the
+/// `/profile` dashboard's per-entry shape. `hits`/`misses`/`prompt_tokens`/`completion_tokens`
+/// mirror the same counters `GenEvent` already reports per step, just summed over the turn;
+/// `attention_s`/`expert_wait_s`/`expert_matmul_s`/`lm_head_s` come from `generate::StepProfile`
+/// (see its doc for what each phase measures). `forwards` counts real forward passes only — the
+/// synthetic zero-cost final `Token` event `generate_reply` emits when `max_tokens` is hit
+/// exactly on selection (no further step needed) does not call `step_profiled`, so it doesn't
+/// bump this.
+#[derive(serde::Serialize, Clone, Default)]
+pub struct TurnProfile {
+    pub wall_s: f32,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub attention_s: f32,
+    pub expert_wait_s: f32,
+    pub expert_matmul_s: f32,
+    pub lm_head_s: f32,
+    pub forwards: u64,
+}
+
+impl TurnProfile {
+    fn accumulate(&mut self, step: &StepProfile) {
+        self.attention_s += step.phases.attention_s;
+        self.expert_wait_s += step.phases.expert_wait_s;
+        self.expert_matmul_s += step.phases.expert_matmul_s;
+        self.lm_head_s += step.lm_head_s;
+        self.forwards += 1;
+    }
+}
+
 /// One event `generate_reply` reports as it works — enough for a caller to either print rich
 /// progress (the CLI's stderr output) or build streaming output (the server's SSE chunks)
 /// without `generate_reply` itself needing to know which.
@@ -179,16 +225,22 @@ pub enum GenEvent<'a> {
 /// `--chat`/`--prompt` modes print them to stderr, the HTTP server's streaming mode turns
 /// `Token` events into SSE chunks. Returns the full decoded reply text, the new total position
 /// (`pos_base + turn_ids.len() + generated.len()`, for the caller to pass back in as the next
-/// turn's `pos_base`), and the count of tokens generated.
+/// turn's `pos_base`), the count of tokens generated, and this whole turn's [`TurnProfile`]
+/// (every caller gets one — the timing overhead is a handful of `Instant::now()` calls per
+/// layer, negligible next to a real forward pass; only `server.rs` does anything with it).
 pub fn generate_reply(
     sess: &mut Session,
     kv: &mut KvState,
     turn_ids: &[usize],
     pos_base: usize,
     mut on_event: impl FnMut(GenEvent),
-) -> Result<(String, usize, usize), Box<dyn std::error::Error>> {
+) -> Result<(String, usize, usize, TurnProfile), Box<dyn std::error::Error>> {
+    let turn_t = std::time::Instant::now();
+    let mut profile = TurnProfile { prompt_tokens: turn_ids.len(), ..TurnProfile::default() };
+
     let mut step_t = std::time::Instant::now();
-    let mut logits = generate::step(&sess.model, &sess.shards, &mut sess.caches, kv, turn_ids, pos_base)?;
+    let (mut logits, step_profile) = generate::step_profiled(&sess.model, &sess.shards, &mut sess.caches, kv, turn_ids, pos_base)?;
+    profile.accumulate(&step_profile);
     let (mut hits, mut misses, mut io_ns) = sess.caches.hit_miss_totals();
     let mut io_wait_ns = sess.caches.io_wait_nanos_total();
     on_event(GenEvent::Prefill {
@@ -226,7 +278,9 @@ pub fn generate_reply(
         let io_ns_before = io_ns;
         let io_wait_ns_before = io_wait_ns;
         step_t = std::time::Instant::now();
-        logits = generate::step(&sess.model, &sess.shards, &mut sess.caches, kv, &[next], pos)?;
+        let (next_logits, step_profile) = generate::step_profiled(&sess.model, &sess.shards, &mut sess.caches, kv, &[next], pos)?;
+        logits = next_logits;
+        profile.accumulate(&step_profile);
         let step_seconds = step_t.elapsed().as_secs_f32();
         (hits, misses, io_ns) = sess.caches.hit_miss_totals();
         io_wait_ns = sess.caches.io_wait_nanos_total();
@@ -248,5 +302,10 @@ pub fn generate_reply(
     let out_i32: Vec<i32> = out_ids.iter().map(|&id| id as i32).collect();
     let text = String::from_utf8_lossy(&sess.tokenizer.decode(&out_i32)).into_owned();
 
-    Ok((text, pos, out_ids.len()))
+    profile.wall_s = turn_t.elapsed().as_secs_f32();
+    profile.completion_tokens = out_ids.len();
+    profile.hits = hits;
+    profile.misses = misses;
+
+    Ok((text, pos, out_ids.len(), profile))
 }

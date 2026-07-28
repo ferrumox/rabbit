@@ -367,6 +367,43 @@ Context of thousands of tokens couldn't be measured (would take hours of sequent
 the growing trend in this range already confirms the direction — left as future work if the
 exact number at large `nt` is needed.
 
+**Phase 16 — Per-turn profiling endpoint (`GET /profile`): complete (2026-07-18).** Prompted
+by reviewing colibrì's own (unmerged `dev`-branch) profiling page,
+which streams a per-turn phase-timing breakdown (disk service, I/O wait, expert matmul,
+attention, lm_head) to a React dashboard. Rabbit had most of the raw data already:
+`chat.rs`'s `generate_reply` was already reporting wall time, hits/misses, and `io_seconds`/
+`io_wait_seconds` per step via `GenEvent` (the latter already isolating the genuine `io_uring`
+stall from decode/copy overhead — see `expert_cache.rs`'s `io_wait_nanos` doc). Missing: a
+breakdown of `attention_s`/`expert_matmul_s`/`lm_head_s`, and an HTTP surface.
+
+Added `generate::Phases`/`StepProfile`, threaded as an `Option<&mut Phases>` through
+`layer_forward`/`layers_forward` (zero-cost when `None`, so `step`/`step_all` and their ~15
+existing test call sites are untouched); a new `step_profiled()` entry point times the
+attention call, the dense/MoE FFN dispatch (splitting a MoE layer's FFN time into
+`expert_wait_s`, from `ExpertCache::io_wait_nanos`'s before/after delta, and
+`expert_matmul_s`, the remainder), and the final lm_head matmul — used only by
+`chat.rs::generate_reply`, which now returns a `TurnProfile` (wall time, prompt/completion
+tokens, hits/misses, the four phases, forward-pass count) for every caller. `Session` gained a
+120-turn rolling `VecDeque<TurnProfile>`, pushed by `server.rs`'s two chat-completion handlers
+(not by `generate_reply` itself — CLI callers just ignore the returned profile) and served at
+`GET /profile` as JSON. No page serves it (yet): a hand-rolled `assets/dashboard.html`
+(vanilla HTML/CSS/JS, no build step, styled after colibrì's real dashboard tokens/components)
+went through several rounds and was ultimately pulled back out — verified working end to end
+against the real checkpoint, but not judged good enough to keep, and the user decided a web UI
+for this (and possibly other projects) deserves its own separate repo rather than living inside
+rabbit's single-binary constraints. The reference-design research and a full handoff brief for
+that future UI work (including this dashboard's postmortem) live in `DASHBOARD_BRIEF.md`.
+
+Verified: `cargo test` (123 passing, including a new `step_profiled_reports_nonzero_...` test
+confirming the timers actually fire on the 3-layer dense/MoE fixture), `cargo clippy` clean, and
+the endpoint itself manually verified against the real checkpoint (curled `/profile`, sanity-
+checked that the phase totals stay under the turn's wall time).
+
+Deliberately out of scope here (see `DASHBOARD_BRIEF.md` for the full discussion): a
+"Brain"-style expert routing heatmap and a `/health`-style runtime/hardware overview —
+rabbit has no GPU/VRAM tier and no request scheduler/KV-slots the way colibrì does, so both
+need real adaptation, not a straight port; left for whatever picks up `DASHBOARD_BRIEF.md`.
+
 **Phase 12 — Performance, round 2 (the rest, not tackled)**
 - Fusing a layer's active experts' matmuls into fewer parallel calls (today 8 experts x 3
   matmuls = 24 separate dispatches per layer) — estimated modest gain (~5-15%), requires being
@@ -379,8 +416,11 @@ exact number at large `nt` is needed.
   colibrì itself ships it off by default too).
 
 **Undated backlog (evaluate if worth it when we get there)**
-- Native MTP / speculative decoding (`DRAFT=n`/`MTP=1`) — the `jlnsrk` checkpoint doesn't ship
-  the MTP head, but `mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp` does.
+- Native MTP / speculative decoding (`DRAFT=n`/`MTP=1`) — **correction, 2026-07-17: the `jlnsrk`
+  checkpoint DOES ship the MTP head** (confirmed directly against the checkpoint's own header:
+  `model.layers.78`, ~5GB across the `out-mtp-*` shards, `eh_proj`/`enorm`/`hnorm` + its own
+  experts — this line previously claimed otherwise). See `ROADMAP.md` for the current thinking on
+  this idea.
 - GPU/CUDA backend — colibrì itself notes there's no proven end-to-end speedup there yet, so
   it's not an obvious performance win, more a different deployment path.
 - ARM NEON (rabbit is x86_64-only today).

@@ -1,6 +1,6 @@
 [package]
 name = "rabbit"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 description = "A Rust inference engine for GLM-5.2 (744B-parameter MoE), streaming routed experts from disk on demand"
 

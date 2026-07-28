@@ -157,6 +157,27 @@ fn embed_tokens(model: &Model, ids: &[usize]) -> Vec<f32> {
     x
 }
 
+/// Phase-by-phase wall time for one `step`/`step_all` call, accumulated across every layer —
+/// feeds the HTTP server's `/profile` dashboard (`chat.rs`'s `TurnProfile`). `expert_wait_s` is
+/// the portion of `expert_matmul_s`'s layers' FFN time that was pure `io_uring` stall (see
+/// `ExpertCache::io_wait_nanos`'s doc); `expert_matmul_s` is everything else in the FFN dispatch
+/// (dense layers' whole time counts here too — there's nothing to wait on there). `lm_head_s`
+/// lives on `StepProfile` instead, since the lm_head matmul happens once per step, outside the
+/// per-layer loop this struct is threaded through.
+#[derive(Default)]
+pub struct Phases {
+    pub attention_s: f32,
+    pub expert_wait_s: f32,
+    pub expert_matmul_s: f32,
+}
+
+/// A profiled `step_profiled` call's full timing breakdown: [`Phases`] plus the final lm_head
+/// matmul, which sits outside the layer loop `Phases` is accumulated through.
+pub struct StepProfile {
+    pub phases: Phases,
+    pub lm_head_s: f32,
+}
+
 /// One transformer layer: `x += attention(rmsnorm(x, in_ln))`, then `x += ffn(rmsnorm(x,
 /// post_ln))` — dense MLP or MoE depending on `layer.ffn`. `dsa` selects this layer's DSA
 /// behavior (already resolved by `layers_forward`, which owns the full-vs-shared threading).
@@ -172,6 +193,7 @@ fn layer_forward(
     pos_base: usize,
     kv_layer: &mut KvCache,
     dsa: Dsa<'_>,
+    mut phases: Option<&mut Phases>,
 ) -> Result<Option<Selection>, ModelError> {
     let d = cfg.hidden as usize;
     let layer = &model.layers[li];
@@ -183,7 +205,11 @@ fn layer_forward(
         nrm[si * d..(si + 1) * d].copy_from_slice(&x[si * d..(si + 1) * d]);
         attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.in_ln, cfg.eps);
     }
+    let attn_t = std::time::Instant::now();
     let fresh_selection = attention::attention(cfg, &layer.attn, kv_layer, &nrm, s, pos_base, dsa, Absorb::Auto, &mut tmp);
+    if let Some(p) = phases.as_deref_mut() {
+        p.attention_s += attn_t.elapsed().as_secs_f32();
+    }
     for (xi, &ti) in x.iter_mut().zip(&tmp) {
         *xi += ti;
     }
@@ -193,10 +219,24 @@ fn layer_forward(
         attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.post_ln, cfg.eps);
     }
     match &layer.ffn {
-        Ffn::Dense(w) => moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, &mut tmp),
+        Ffn::Dense(w) => {
+            let t = std::time::Instant::now();
+            moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, &mut tmp);
+            if let Some(p) = phases.as_deref_mut() {
+                p.expert_matmul_s += t.elapsed().as_secs_f32();
+            }
+        }
         Ffn::Moe(w) => {
             let cache = caches.0[li].as_mut().expect("MoE layer must have an ExpertCache");
+            let wait_before = cache.io_wait_nanos;
+            let t = std::time::Instant::now();
             moe::moe(cfg, w, cache, shards, li, model.ebits, &model.route_cfg, &nrm, s, &mut tmp)?;
+            let elapsed = t.elapsed().as_secs_f32();
+            if let Some(p) = phases {
+                let wait_delta = ((cache.io_wait_nanos - wait_before) as f32 / 1e9).max(0.0);
+                p.expert_wait_s += wait_delta;
+                p.expert_matmul_s += (elapsed - wait_delta).max(0.0);
+            }
         }
     }
     for (xi, &ti) in x.iter_mut().zip(&tmp) {
@@ -215,7 +255,8 @@ fn layer_forward(
 /// reduces to a single model-wide condition): a "full" indexer layer computes a fresh
 /// `Selection`; a "shared" layer reuses whichever `Selection` the most recent "full" layer
 /// produced. Decode calls (`pos_base>0`) always get dense (unrestricted) attention.
-pub fn layers_forward(model: &Model, shards: &Shards, caches: &mut ExpertCaches, x: &mut [f32], s: usize, pos_base: usize, kv: &mut KvState) -> Result<(), ModelError> {
+#[allow(clippy::too_many_arguments)]
+pub fn layers_forward(model: &Model, shards: &Shards, caches: &mut ExpertCaches, x: &mut [f32], s: usize, pos_base: usize, kv: &mut KvState, mut phases: Option<&mut Phases>) -> Result<(), ModelError> {
     let cfg = &model.cfg;
     let is_first_call = pos_base == 0;
     let mut last_selection: Option<Selection> = None;
@@ -236,7 +277,7 @@ pub fn layers_forward(model: &Model, shards: &Shards, caches: &mut ExpertCaches,
             Dsa::Off
         };
 
-        let fresh = layer_forward(cfg, model, li, shards, caches, x, s, pos_base, &mut kv.layers[li], dsa_mode)?;
+        let fresh = layer_forward(cfg, model, li, shards, caches, x, s, pos_base, &mut kv.layers[li], dsa_mode, phases.as_deref_mut())?;
         if let Some(sel) = fresh {
             last_selection = Some(sel);
         }
@@ -251,13 +292,34 @@ pub fn step(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &mut 
     let s = ids.len();
     let d = model.cfg.hidden as usize;
     let mut x = embed_tokens(model, ids);
-    layers_forward(model, shards, caches, &mut x, s, pos_base, kv)?;
+    layers_forward(model, shards, caches, &mut x, s, pos_base, kv, None)?;
 
     let mut last = x[(s - 1) * d..s * d].to_vec();
     attention::rmsnorm(&mut last, &model.final_norm, model.cfg.eps);
     let mut logit = vec![0f32; model.cfg.vocab as usize];
     matmul_qt(&mut logit, &last, &model.lm_head, 1);
     Ok(logit)
+}
+
+/// Like `step`, but also returns a [`StepProfile`] breaking down where this one forward pass
+/// spent its wall time: attention, expert wait (pure `io_uring` stall), expert matmul, and the
+/// final lm_head matmul. The only forward-pass entry point that times anything — used solely by
+/// the HTTP server's `/profile` dashboard (via `chat.rs`'s `generate_reply`); every other caller
+/// keeps using the untimed `step`/`step_all` above.
+pub fn step_profiled(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &mut KvState, ids: &[usize], pos_base: usize) -> Result<(Vec<f32>, StepProfile), ModelError> {
+    let s = ids.len();
+    let d = model.cfg.hidden as usize;
+    let mut x = embed_tokens(model, ids);
+    let mut phases = Phases::default();
+    layers_forward(model, shards, caches, &mut x, s, pos_base, kv, Some(&mut phases))?;
+
+    let mut last = x[(s - 1) * d..s * d].to_vec();
+    attention::rmsnorm(&mut last, &model.final_norm, model.cfg.eps);
+    let mut logit = vec![0f32; model.cfg.vocab as usize];
+    let t = std::time::Instant::now();
+    matmul_qt(&mut logit, &last, &model.lm_head, 1);
+    let lm_head_s = t.elapsed().as_secs_f32();
+    Ok((logit, StepProfile { phases, lm_head_s }))
 }
 
 /// Like `step`, but returns logits for EVERY new position `[S,vocab]` — teacher-forcing
@@ -267,7 +329,7 @@ pub fn step_all(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &
     let d = model.cfg.hidden as usize;
     let v = model.cfg.vocab as usize;
     let mut x = embed_tokens(model, ids);
-    layers_forward(model, shards, caches, &mut x, s, pos_base, kv)?;
+    layers_forward(model, shards, caches, &mut x, s, pos_base, kv, None)?;
 
     let mut lo = vec![0f32; s * v];
     for si in 0..s {
@@ -674,7 +736,7 @@ mod tests {
         let mut caches_a = ExpertCaches::new(&model, 8);
         let mut kv_a = KvState::new(&model);
         let mut x_lf = x0.clone();
-        layers_forward(&model, &shards, &mut caches_a, &mut x_lf, s, 0, &mut kv_a).unwrap();
+        layers_forward(&model, &shards, &mut caches_a, &mut x_lf, s, 0, &mut kv_a, None).unwrap();
 
         // ---- independent manual reference: same primitives, wiring re-derived by hand ----
         let mut caches_b = ExpertCaches::new(&model, 8);
@@ -743,6 +805,24 @@ mod tests {
         let last_row = &all[(ids.len() - 1) * v..ids.len() * v];
 
         assert_eq!(last_only, last_row);
+    }
+
+    #[test]
+    fn step_profiled_reports_nonzero_attention_and_expert_matmul_time() {
+        let (fixture, _dm) = build_three_layer_fixture("rabbit_test_step_profiled");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        let shards = Shards::open(&fixture.0).unwrap();
+        let ids = vec![1usize, 2, 3];
+
+        let mut caches = ExpertCaches::new(&model, 8);
+        let mut kv = KvState::new(&model);
+        let (logits, profile) = step_profiled(&model, &shards, &mut caches, &mut kv, &ids, 0).unwrap();
+
+        assert_eq!(logits.len(), model.cfg.vocab as usize);
+        assert!(profile.phases.attention_s > 0.0, "3 attention layers ran; attention_s must be nonzero");
+        assert!(profile.phases.expert_matmul_s > 0.0, "2 MoE layers ran; expert_matmul_s must be nonzero");
+        assert!(profile.phases.expert_wait_s >= 0.0);
+        assert!(profile.lm_head_s >= 0.0);
     }
 
     #[test]

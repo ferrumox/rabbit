@@ -158,7 +158,7 @@ fn run_single_shot(args: &Args, prompt: &str) -> Result<(), Box<dyn std::error::
 
     let mut kv = KvState::new(&sess.model);
     let t1 = std::time::Instant::now();
-    let (text, _pos, n) = chat::generate_reply(&mut sess, &mut kv, &prompt_ids, 0, print_progress)?;
+    let (text, _pos, n, _profile) = chat::generate_reply(&mut sess, &mut kv, &prompt_ids, 0, print_progress)?;
     let elapsed = t1.elapsed().as_secs_f32();
     println!("{text}");
     eprintln!("\n{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
@@ -230,7 +230,7 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let from_pos = pos;
         let t1 = std::time::Instant::now();
-        let (reply, new_pos, n) = chat::generate_reply(&mut sess, &mut kv, &turn_ids, pos, print_progress)?;
+        let (reply, new_pos, n, _profile) = chat::generate_reply(&mut sess, &mut kv, &turn_ids, pos, print_progress)?;
         let elapsed = t1.elapsed().as_secs_f32();
         eprintln!("{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
         pos = new_pos;
