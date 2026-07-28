@@ -24,7 +24,7 @@
 //! Expert dispatch is also simplified vs the C's block-of-64 batching — see
 //! `expert_cache.rs`'s module doc for why that's a pure performance cut.
 
-use crate::expert_cache::{ExpertCache, ExpertSlot};
+use crate::expert_cache::{ExpertCache, ExpertSlot, GateUp};
 use crate::glm52::config::Cfg;
 use crate::glm52::model::{DenseMlpWeights, ModelError, MoeWeights};
 use crate::kernels::matmul_qt;
@@ -424,11 +424,30 @@ fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize
     }
 
     let mut gg = vec![0f32; nr * i];
-    let mut uu = vec![0f32; nr * i];
-    matmul_qt(&mut gg, &xg, &slot.gate, nr);
-    matmul_qt(&mut uu, &xg, &slot.up, nr);
-    for z in 0..nr * i {
-        gg[z] = siluf(gg[z]) * uu[z];
+    match &slot.gate_up {
+        GateUp::Separate { gate, up } => {
+            let mut uu = vec![0f32; nr * i];
+            matmul_qt(&mut gg, &xg, gate, nr);
+            matmul_qt(&mut uu, &xg, up, nr);
+            for z in 0..nr * i {
+                gg[z] = siluf(gg[z]) * uu[z];
+            }
+        }
+        // One matmul against the fused `[2*i, d]` weight instead of two against `[i, d]` each —
+        // `gu`'s row layout matches `matmul`'s `y[S,O]` convention (`O = 2*i`), so each row's
+        // first `i` columns are gate's output and the next `i` are up's, a cheap contiguous
+        // per-row split (not a raw-byte split) — see `ROADMAP.md`'s "Fuse gate_proj + up_proj"
+        // entry for why that distinction is what makes this safe to do post-matmul.
+        GateUp::Fused { gate_up } => {
+            let mut gu = vec![0f32; nr * 2 * i];
+            matmul_qt(&mut gu, &xg, gate_up, nr);
+            for r in 0..nr {
+                let row = &gu[r * 2 * i..(r + 1) * 2 * i];
+                for k in 0..i {
+                    gg[r * i + k] = siluf(row[k]) * row[i + k];
+                }
+            }
+        }
     }
     let mut hh = vec![0f32; nr * d];
     matmul_qt(&mut hh, &gg, &slot.down, nr);
@@ -507,6 +526,49 @@ mod tests {
         let mut t = QT::alloc(rows, cols, 32, false);
         t.fill(&random_vec(rows * cols, seed));
         t
+    }
+
+    /// All `rows` rows of `t`, concatenated row-major into one flat `Vec<f32>` — the f32
+    /// analogue of what `bin/fuse_gate_up.rs` does at the raw-byte level to build a real
+    /// `gate_up_proj` tensor from `gate_proj`+`up_proj`.
+    fn qt_rows_f32(t: &QT, rows: usize) -> Vec<f32> {
+        (0..rows).flat_map(|r| t.row_f32(r)).collect()
+    }
+
+    #[test]
+    fn apply_single_expert_fused_gate_up_matches_separate_bit_exact() {
+        // d=hidden, i=moe_inter -- deliberately small and non-square so a transposition bug
+        // in the fused split would show up as a shape mismatch, not just wrong numbers.
+        let (d, i) = (6usize, 8usize);
+        let mut seed = 7u32;
+        let gate = random_qt_f32(i, d, &mut seed);
+        let up = random_qt_f32(i, d, &mut seed);
+        let down_vals = random_vec(d * i, &mut seed);
+        let down_for_separate = { let mut t = QT::alloc(d, i, 32, false); t.fill(&down_vals); t };
+        let down_for_fused = { let mut t = QT::alloc(d, i, 32, false); t.fill(&down_vals); t };
+
+        // The fused [2*i, d] tensor: gate's rows first, then up's -- matches
+        // `ExpertNaming::Glm52FusedGateUp`'s doc and `bin/fuse_gate_up.rs`'s own layout.
+        let mut fused_vals = qt_rows_f32(&gate, i);
+        fused_vals.extend(qt_rows_f32(&up, i));
+        let mut gate_up = QT::alloc(2 * i, d, 32, false);
+        gate_up.fill(&fused_vals);
+
+        let separate_slot = ExpertSlot::new_for_test(0, GateUp::Separate { gate, up }, down_for_separate);
+        let fused_slot = ExpertSlot::new_for_test(0, GateUp::Fused { gate_up }, down_for_fused);
+
+        let x = random_vec(3 * d, &mut seed); // 3 tokens, all routed to expert 0
+        let routing = Routing { choices: vec![vec![(0, 0.6)], vec![(0, 1.3)], vec![(0, -0.4)]] };
+
+        let mut out_separate = vec![0f32; 3 * d];
+        apply_single_expert(&separate_slot, &routing, &x, d, i, &mut out_separate);
+        let mut out_fused = vec![0f32; 3 * d];
+        apply_single_expert(&fused_slot, &routing, &x, d, i, &mut out_fused);
+
+        // Splitting a matmul's OUTPUT columns per row (what the fused path does) doesn't
+        // reassociate any single row's dot product -- same bytes, same accumulation order per
+        // row -- so this must be exact, not just within tolerance.
+        assert_eq!(out_separate, out_fused);
     }
 
     fn f32_bytes(vals: &[f32]) -> Vec<u8> {

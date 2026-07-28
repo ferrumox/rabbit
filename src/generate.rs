@@ -11,7 +11,7 @@
 //! once you delete all of that is exactly a plain greedy/sampling loop — that's `generate()`
 //! here.
 
-use crate::expert_cache::ExpertCache;
+use crate::expert_cache::{ExpertCache, ExpertNaming};
 use crate::glm52::attention::{self, Absorb, Dsa, DsaCache, KvCache, QProj, Rope, Selection};
 use crate::glm52::config::Cfg;
 use crate::glm52::model::{Ffn, Model, ModelError};
@@ -59,10 +59,11 @@ pub struct ExpertCaches(Vec<Option<ExpertCache>>);
 
 impl ExpertCaches {
     pub fn new(model: &Model, capacity: usize) -> ExpertCaches {
+        let naming = if model.fused_gate_up { ExpertNaming::Glm52FusedGateUp } else { ExpertNaming::Glm52 };
         let v = model
             .layers
             .iter()
-            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::new(capacity)) } else { None })
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, naming)) } else { None })
             .collect();
         ExpertCaches(v)
     }

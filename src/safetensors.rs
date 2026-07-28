@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
@@ -211,12 +211,34 @@ impl Shards {
     /// indexes every `*.safetensors` file in `dir` (sorted by filename, matching how the C
     /// engine orders `model-0000N-of-...` shards).
     pub fn open(dir: &Path) -> Result<Shards, SafetensorsError> {
-        let mut paths: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
-            .collect();
-        paths.sort();
+        Self::open_multi(std::slice::from_ref(&dir.to_path_buf()))
+    }
+
+    /// Same as `open`, but indexes `*.safetensors` files from MULTIPLE directories into one
+    /// unified `Shards` — lets a checkpoint's shards be split across separate drives/mounts
+    /// (e.g. a second NVMe added for capacity or read-bandwidth headroom, without needing an
+    /// OS-level RAID array), matching the spirit of colibrì's `COLI_MODEL_DIRS` (see the
+    /// project's colibri-backlog memory / `ROADMAP.md`'s hardware section for why this is safer
+    /// than reshaping an in-use root partition into a striped array). `config.json`/tokenizer
+    /// files are NOT looked for across these directories — those still come from the primary
+    /// `--model` directory alone; this only widens where `.safetensors` shards may live. Sorted
+    /// by filename (not full path) so the natural `model-0000N-of-...` shard order is preserved
+    /// regardless of which directory a given shard physically lives in — a tensor name appearing
+    /// in more than one directory is a checkpoint-authoring error, not something this function
+    /// tries to resolve, so the later directory silently wins (matches `HashMap::insert`'s own
+    /// last-write-wins semantics, same as if all shards had been dumped in one directory with a
+    /// clashing name).
+    pub fn open_multi(dirs: &[PathBuf]) -> Result<Shards, SafetensorsError> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            paths.extend(
+                fs::read_dir(dir)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors")),
+            );
+        }
+        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         let mut files = Vec::with_capacity(paths.len());
         let mut tensors = Vec::new();
@@ -556,6 +578,28 @@ mod tests {
 
         let bf16 = shards.read_f32("bf16.weight", false).unwrap();
         assert_eq!(bf16, vec![1.5, 3.0]);
+    }
+
+    #[test]
+    fn open_multi_indexes_shards_split_across_separate_directories() {
+        // Simulates a checkpoint split across two drives/mounts (e.g. `--model` plus
+        // `--shard-dirs`): two independent directories, each holding one shard, no directory
+        // aware of the other's existence.
+        let dir1 = TempDir::new("rabbit_test_st_multidir_1");
+        let dir2 = TempDir::new("rabbit_test_st_multidir_2");
+
+        let shard1 = build_safetensors(&[("dense.weight", "F32", vec![2, 3], f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))]);
+        fs::write(dir1.0.join("out-00000.safetensors"), shard1).unwrap();
+
+        let shard2 = build_safetensors(&[("expert.0.raw", "U8", vec![4], vec![10, 20, 30, 40])]);
+        fs::write(dir2.0.join("out-00001.safetensors"), shard2).unwrap();
+
+        let shards = Shards::open_multi(&[dir1.0.clone(), dir2.0.clone()]).unwrap();
+
+        assert!(shards.has("dense.weight"));
+        assert!(shards.has("expert.0.raw"));
+        assert_eq!(shards.read_f32("dense.weight", false).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(shards.read_raw("expert.0.raw", false).unwrap(), vec![10, 20, 30, 40]);
     }
 
     #[test]

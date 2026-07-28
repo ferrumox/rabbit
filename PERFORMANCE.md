@@ -55,10 +55,21 @@ the same unit as the historical table above, so the two are directly comparable.
 | v0.17.0 | 0.60 | **+49%** | Taught rabbit to use newer, wider CPU instructions for its single most common calculation |
 | v0.18.0 | 0.73 | **+21%** | Removed a redundant full copy of every piece of data fetched from disk (see below — this was found and measured as a *prefill* fix, but it turns out to speed up the ongoing generation too, since the same fetch code runs there as well) |
 | v0.19.0 | 0.84 | **+15%** | Each newly-fetched expert now starts its matmul the moment its own data lands, instead of waiting for the whole batch of experts to finish loading first (see below) |
+| v0.22.0† | 1.02 | **+7.6%** | Vectorized the attention math used while generating each word with newer, wider CPU instructions (see below) |
 
-**Overall: 0.29 → 0.84 words/sec, about 2.9× faster, same test, same machine, across these seven
-versions.** Zoomed out to the estimated/historical numbers above (~0.05 words/sec just before the
-multi-core change), the full picture is roughly **0.05 → 0.84 words/sec, about 17× faster.**
+**Overall: 0.29 → 1.02 words/sec, about 3.5× faster, across these eight versions** (v0.22.0's own
+step measured on the same machine, see the † note just below for why it isn't from quite the same
+test as the rows above it). Zoomed out to the estimated/historical numbers above (~0.05 words/sec
+just before the multi-core change), the full picture is roughly **0.05 → 1.02 words/sec, about
+20× faster.**
+
+**† v0.22.0 was measured differently on purpose, not with the "generate 30 words and time it"
+method every row above uses.** That method turned out to not be reliably repeatable once tested
+carefully (see the v0.22.0 section below for why) — so its 0.84→1.02 words/sec figure instead
+comes from a new, deterministic test built specifically to make an honest before/after comparison
+possible again: 0.951→1.023 words/sec, **~7.6% faster**, real checkpoint, real disk I/O, just not
+the model's own free-running word choices. The 1.02 entered above is that same result, rounded to
+match this table's other entries.
 
 **Opt-in, not shown above:** passing `--cache-route` on v0.16.0+ makes rabbit prefer expert data
 it already has close at hand instead of always fetching fresh from disk — **16.5% faster** in its
@@ -198,6 +209,108 @@ captured most of the slack available there. Decode has no equivalent trick of it
 is where the new overlap actually shows up: real, reproducible, consistent across all 3 "after"
 runs landing clearly above the tight 0.730/0.730 "before" control band.
 
+## v0.22.0: AVX-512/AVX2 for the MLA-absorb decode path
+
+Ported two optimizations found in colibrì's v1.1.0 release (pulled 2026-07-22) onto rabbit's
+absorbed-attention decode path — the path used for short decode sequences (the normal case while
+generating word by word). Two spots were still doing this math the plain, unvectorized way even
+though rabbit already had the AVX-512 building block sitting right next to them, unused, since
+v0.17.0's dual-accumulator kernel: the int4 weight-dequantizing helpers (`qt_addrow`/
+`qt_matvec_rows`) now use AVX-512 instead of a byte-by-byte unpacking loop, and the score/
+value-mixing step right after now uses AVX2 instead of a plain sequential sum.
+
+**Isolated kernel benchmarks** (no disk I/O involved — these measure only the math itself, at the
+real dimension this actually runs at on the real checkpoint):
+
+| Kernel | Before | After | Change |
+|---|---|---|---|
+| `qt_addrow` int4 | 473.9 ns | 22.3 ns | **~21× faster** |
+| `qt_matvec_rows` int4 | 428.1 ns | 23.1 ns | **~18.6× faster** |
+| MLA score dot-product | 277.1 ns | 224.3 ns | **~1.24× faster** |
+| MLA value-mix step | 265.5 ns | 87.3 ns | **~3× faster** |
+
+**Real, controlled, end-to-end result**: **0.951 → 1.023 words/sec, ~7.6% faster**, generating the
+same 30 words, 2 runs each side, before/after via `git worktree`, on the real checkpoint. The gap
+between the huge kernel-level numbers above and this smaller end-to-end number is the same story
+as everywhere else on this page: disk I/O still dominates a big share of every generated word's
+time on this machine, so even a dramatically faster attention calculation only speeds up the
+smaller, non-disk part of each step. Still a real, reproducible win — both "before" runs and both
+"after" runs landed within a fraction of a second of each other, with a clear, much bigger gap
+between the two groups.
+
+**A methodology problem discovered along the way, worth its own note**: the obvious way to measure
+this — generate 30 words with the model's own predictions and time it — turned out to not be
+reliably repeatable AT ALL, even running the exact same unmodified program twice in a row with the
+same prompt and the same random seed. Traced to v0.19.0's per-expert early-drain (above): it starts
+each expert's math the moment ITS OWN data lands from disk, so the order contributions get added
+up in depends on real disk-timing jitter, which genuinely differs run to run. A resulting
+razor-thin difference in the math can occasionally flip which word the model picks at a close
+call, and once that happens the entire rest of the generated text goes a different way — nothing
+wrong, just a real side effect of a change that was a genuine, worthwhile speed win on its own
+terms. It means "generate N words and time it" — the exact method the table above uses — can't
+reliably isolate ONE specific change's effect on its own via a single run. Built a different way to
+measure instead: a new test program (`examples/teacher_forced_decode_bench.rs`) feeds the model a
+fixed, predetermined sequence of words rather than letting it choose its own, so the exact same
+calculation happens on every run regardless of which version is being tested — the real,
+end-to-end number above comes from that, not from the usual generate-and-time method.
+
+**Status**: implemented and measured, sitting on branch `release/v0.22.0`, not yet merged into
+`develop`/`main`.
+
+## v0.22.0: reading the checkpoint from two drives at once
+
+A second NVMe drive was added to this machine for capacity and read-bandwidth headroom. A true
+RAID0 setup (combining both drives into one striped array at the operating-system level) turned
+out not to be practical: the original drive has no free space to shrink into an array without
+risky surgery on a live system (resizing its filesystem, reinstalling the boot loader). Instead,
+rabbit itself now knows how to read a checkpoint's files split across more than one directory —
+`--shard-dirs <dir1,dir2,...>` alongside `--model <dir>` — an idea borrowed from colibrì's own
+`COLI_MODEL_DIRS` feature. No operating-system array involved, and unlike RAID0, each drive keeps
+holding a genuinely complete, independently-readable portion of the checkpoint.
+
+Tested on the real checkpoint, split roughly in half by file count between the original drive and
+the new one (verified byte-for-byte: nothing lost in the split). Loads and generates correctly
+reading from both locations at once.
+
+**Raw disk-reading speed, measured with a small standalone test program** (reads many chunks
+concurrently, independent of rabbit's own code — same style as the very first probe used
+earlier on this page): **one drive alone: 4.2-4.6 GB/s. Both drives read at the same time:
+8.7-9.1 GB/s — essentially double**, close to the ideal outcome and better than the original
+conservative ~1.7-1.9x guess for a RAID0 setup. Repeated 3 times, each time reading a different,
+never-before-touched part of the files (an earlier, sloppier attempt at this same test re-read
+data already sitting in memory from the previous run and measured an impossible 20+ GB/s — a
+reminder that repeat runs of ANY disk-speed test need fresh data each time, not just a fresh
+timer).
+
+**Measured: this does NOT translate into a faster generation speed, at least not for a short
+30-word test with the default expert-cache size.** Same test as the rest of this page: one drive
+alone (measured earlier, before this feature existed at all) 1.0269 and 1.0196 words/sec; both
+drives split (two separate test rounds) 1.0286, 1.0403, 1.0179, 1.0389 words/sec. Averaging out to
+~1.02 either way — under 1% apart, well inside the normal run-to-run wobble already seen
+throughout this page. The doubled raw disk-reading speed measured above is real, but for a short
+run like this one, most of the words generated are already being served from the in-memory expert
+cache (not the disk) by the time a handful of words have gone by, so there usually isn't enough
+disk-bound work left in this particular test for faster reading to speed up much of anything.
+**`--shard-dirs` is still worth having** for its other real benefits (fitting a bigger checkpoint
+across two drives, surviving one drive failing instead of losing everything) — it's just not, on
+its own, a speed feature for a test shaped like this one.
+
+**Also tried the part of a run that reads the MOST from disk (processing a long prompt for the
+first time, before any word has been generated) — expected that part to show the doubled disk
+speed most clearly, since it's normally the most disk-bound moment in the whole process. Measured
+the opposite: reading from one drive alone was ~9-10% FASTER, not slower.** Same long test prompt
+used earlier on this page ("France is a country in Western Europe..."), read once (no words
+generated yet): one drive alone 112.6s and 114.2s (consistent); split across both drives 123.8s
+and 125.0s (also consistent) — a real, repeatable difference, not noise, and not the QLC-drive
+slow-recovery issue from below (checked for that specifically this time and it wasn't a factor).
+No confirmed explanation for why; best guess, unconfirmed: reading from two drives at once only
+actually pays off if rabbit's own reading code asks for enough of both drives' data at the same
+time to keep them both busy simultaneously, and it may not be doing that as fully as the earlier,
+dedicated raw-speed test did. **Bottom line, revised: on this machine, with this checkpoint,
+`--shard-dirs` doesn't make anything faster — reading a long prompt for the first time may even
+be a little slower split across two drives than reading it from one.** Still worth having for the
+capacity and reliability reasons above, just not for speed.
+
 ## Tried and didn't help
 
 - **Consolidating each expert's 3 tiny `.qs` scale-sidecar reads into 1** — the real checkpoint
@@ -258,6 +371,13 @@ several decode rounds got captured) plus a throwaway `io_uring` micro-benchmark 
 from the checkpoint's `.safetensors` shard files, independent of rabbit's own code — neither
 diagnostic was kept (both were reverted/deleted after use), so reproducing them means rebuilding
 the same kind of probe rather than running an existing command.
+
+**The v0.22.0 section's numbers**: isolated kernel benchmarks via `cargo
+bench --bench kernels -- "qt_addrow_i4|qt_matvec_rows_i4|mla_score_dot|mla_vmix_axpy"`. The
+end-to-end number via the new deterministic harness: `cargo run --release --example
+teacher_forced_decode_bench -- --model <checkpoint-dir> --steps 30 --expert-cache 64`, run twice
+per side via `git worktree` (before at the commit right before this branch's changes, after at the
+branch tip).
 
 Hardware throughout: AMD Ryzen AI 9 HX 370 (12 cores / 24 threads, AVX2 + AVX-512F/BW/VNNI),
 123 GB RAM, NVMe SSD, running the real

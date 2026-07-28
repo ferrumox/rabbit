@@ -16,7 +16,7 @@ use crate::glm52::moe::RouteConfig;
 use crate::quant::{PackedFormatError, QT};
 use crate::safetensors::{SafetensorsError, Shards};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct AttnWeights {
     pub q_a: QT,
@@ -85,6 +85,13 @@ pub struct Model {
     /// entry points flip `cache_route` on after `Model::load` returns, same reason `ebits`
     /// lives here instead of being threaded through every `moe()` call site.
     pub route_cfg: RouteConfig,
+    /// Whether this checkpoint's routed experts have `gate_proj`/`up_proj` pre-fused into one
+    /// `gate_up_proj` tensor by `bin/fuse_gate_up.rs` — auto-detected (`detect_fused_gate_up`),
+    /// same "check the concrete tensor on disk" precedent as `has_dsa`. Read by
+    /// `generate.rs`'s `ExpertCaches::new` to pick `ExpertNaming::Glm52` vs
+    /// `Glm52FusedGateUp` — routed experts themselves aren't loaded here (see this module's own
+    /// doc), so this flag is the only place that decision needs to be made.
+    pub fused_gate_up: bool,
 }
 
 #[derive(Debug)]
@@ -166,10 +173,32 @@ fn detect_has_dsa(cfg: &Cfg, shards: &Shards) -> bool {
     true
 }
 
+/// Whether this checkpoint's routed experts have been pre-fused by `bin/fuse_gate_up.rs`: checks
+/// the first MoE layer's expert 0 for a `gate_up_proj.weight` tensor rather than the original
+/// `gate_proj.weight` — a converted checkpoint is fused uniformly across every layer/expert (the
+/// converter has no partial mode), so one representative tensor is enough to decide for the
+/// whole load, same "concrete tensor on disk, not just a config flag" precedent as
+/// `detect_has_dsa` above. Returns `false` (not an error) when there are no MoE layers at all.
+fn detect_fused_gate_up(cfg: &Cfg, shards: &Shards) -> bool {
+    let first_moe = cfg.first_dense as usize;
+    if first_moe >= cfg.n_layers as usize {
+        return false;
+    }
+    shards.has(&format!("model.layers.{first_moe}.mlp.experts.0.gate_up_proj.weight"))
+}
+
 impl Model {
     pub fn load(snap_dir: &Path, dbits: u8, ebits: u8) -> Result<Model, ModelError> {
-        let cfg = Cfg::load(snap_dir)?;
-        let shards = Shards::open(snap_dir)?;
+        Self::load_multi(std::slice::from_ref(&snap_dir.to_path_buf()), dbits, ebits)
+    }
+
+    /// Same as `load`, but reads the checkpoint's `.safetensors` shards from MULTIPLE
+    /// directories (`dirs[0]` is still the primary directory — the only one `config.json` is
+    /// read from). Lets a checkpoint be split across separate drives — see
+    /// `Shards::open_multi`'s doc for why.
+    pub fn load_multi(dirs: &[PathBuf], dbits: u8, ebits: u8) -> Result<Model, ModelError> {
+        let cfg = Cfg::load(&dirs[0])?;
+        let shards = Shards::open_multi(dirs)?;
         let d = cfg.hidden as usize;
         let h = cfg.n_heads as usize;
         let qh = cfg.qk_head as usize;
@@ -188,6 +217,7 @@ impl Model {
         let final_norm = ld(&shards, "model.norm.weight")?;
 
         let has_dsa = detect_has_dsa(&cfg, &shards);
+        let fused_gate_up = detect_fused_gate_up(&cfg, &shards);
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for i in 0..cfg.n_layers as usize {
@@ -240,7 +270,7 @@ impl Model {
             layers.push(Layer { in_ln, post_ln, attn, dsa, ffn });
         }
 
-        Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa, ebits, route_cfg: RouteConfig::default() })
+        Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa, ebits, route_cfg: RouteConfig::default(), fused_gate_up })
     }
 
     /// Dequantizes token `tok`'s embedding row into `x[hidden]`.
@@ -405,6 +435,84 @@ mod tests {
 
             self.dir
         }
+    }
+
+    fn tiny_cfg_for_fusion_detection(n_layers: i32, first_dense: i32) -> Cfg {
+        Cfg {
+            hidden: 4,
+            n_layers,
+            n_heads: 1,
+            n_experts: 2,
+            topk: 1,
+            moe_inter: 3,
+            dense_inter: 1,
+            first_dense,
+            q_lora: 1,
+            kv_lora: 1,
+            qk_nope: 1,
+            qk_rope: 2,
+            qk_head: 3,
+            v_head: 1,
+            n_shared: 1,
+            vocab: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk: false,
+            stop_ids: vec![],
+            index_topk: 0,
+            index_nh: 0,
+            index_hd: 0,
+            idx_type: vec![false; n_layers as usize],
+            eps: 1e-5,
+            theta: 10000.0,
+            attn_scale: 1.0,
+            routed_scale: 1.0,
+            group_size: 0,
+        }
+    }
+
+    /// `detect_fused_gate_up` must check the FIRST MoE layer's expert 0, not layer 0 (which may
+    /// be dense) — this fixture has `first_dense=1` (layer 0 dense, layer 1+ MoE), so a
+    /// hardcoded "layer 0" check would silently always report unfused.
+    #[test]
+    fn detect_fused_gate_up_checks_the_first_moe_layer_not_layer_zero() {
+        let cfg = tiny_cfg_for_fusion_detection(2, 1);
+
+        let dir_unfused = TempDir::new("rabbit_test_model_fusion_unfused");
+        fs::write(dir_unfused.0.join("model.safetensors"), tiny_safetensors(&[("model.layers.1.mlp.experts.0.gate_proj.weight", 3, 4)])).unwrap();
+        let shards_unfused = Shards::open(&dir_unfused.0).unwrap();
+        assert!(!detect_fused_gate_up(&cfg, &shards_unfused));
+
+        let dir_fused = TempDir::new("rabbit_test_model_fusion_fused");
+        fs::write(dir_fused.0.join("model.safetensors"), tiny_safetensors(&[("model.layers.1.mlp.experts.0.gate_up_proj.weight", 6, 4)])).unwrap();
+        let shards_fused = Shards::open(&dir_fused.0).unwrap();
+        assert!(detect_fused_gate_up(&cfg, &shards_fused));
+
+        // no MoE layers at all (first_dense >= n_layers) -> false, not a panic/error.
+        let cfg_no_moe = tiny_cfg_for_fusion_detection(2, 2);
+        assert!(!detect_fused_gate_up(&cfg_no_moe, &shards_fused));
+    }
+
+    /// Minimal hand-built `.safetensors` bytes holding one F32 tensor per `(name, rows, cols)` —
+    /// just enough for `Shards::has`-style presence checks, not a full loadable model.
+    fn tiny_safetensors(tensors: &[(&str, usize, usize)]) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        for &(name, rows, cols) in tensors {
+            let vals = vec![0f32; rows * cols];
+            let bytes = f32_bytes(&vals);
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name.to_string(), json!({"dtype": "F32", "shape": [rows, cols], "data_offsets": [start, end]}));
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        out
     }
 
     #[test]

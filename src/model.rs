@@ -17,7 +17,7 @@ use crate::kimi_linear::model::ModelError as KimiModelError;
 use serde_json::Value;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub enum Model {
     Glm52(crate::glm52::model::Model),
@@ -98,9 +98,17 @@ fn read_model_type(snap_dir: &Path) -> Result<Option<String>, ModelError> {
 
 impl Model {
     pub fn load(snap_dir: &Path, dbits: u8, ebits: u8) -> Result<Model, ModelError> {
-        match read_model_type(snap_dir)?.as_deref() {
-            Some("glm_moe_dsa") => Ok(Model::Glm52(crate::glm52::model::Model::load(snap_dir, dbits, ebits)?)),
-            Some("kimi_linear") => Ok(Model::KimiLinear(crate::kimi_linear::model::Model::load(snap_dir, dbits, ebits)?)),
+        Self::load_multi(std::slice::from_ref(&snap_dir.to_path_buf()), dbits, ebits)
+    }
+
+    /// Same as `load`, but reads the checkpoint's `.safetensors` shards from MULTIPLE
+    /// directories (`dirs[0]` is still the primary directory — the only one `config.json` is
+    /// read from, both here to detect the architecture and inside each family's own loader).
+    /// Lets a checkpoint be split across separate drives — see `Shards::open_multi`'s doc.
+    pub fn load_multi(dirs: &[PathBuf], dbits: u8, ebits: u8) -> Result<Model, ModelError> {
+        match read_model_type(&dirs[0])?.as_deref() {
+            Some("glm_moe_dsa") => Ok(Model::Glm52(crate::glm52::model::Model::load_multi(dirs, dbits, ebits)?)),
+            Some("kimi_linear") => Ok(Model::KimiLinear(crate::kimi_linear::model::Model::load_multi(dirs, dbits, ebits)?)),
             found => Err(ModelError::UnknownArchitecture { found: found.map(String::from) }),
         }
     }

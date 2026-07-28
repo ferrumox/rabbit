@@ -12,13 +12,21 @@
 //! benchmark toward an unrealistically huge single dot product).
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rabbit::kernels::{dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar};
+use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar};
 #[cfg(target_arch = "x86_64")]
-use rabbit::kernels::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512};
+use rabbit::kernels::{
+    axpy_f32_avx2, axpy_i4_f32_avx512, dot_f32_avx2, dot_i4_f32_avx512, dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2,
+    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512,
+};
 use std::hint::black_box;
 
 const I: usize = 4096;
 const O: usize = 4096;
+
+/// GLM-5.2's `kv_lora_rank` — the dimension the MLA-absorb helpers (`qt_addrow`/
+/// `qt_matvec_rows`'s int4 branch, and the score/value-mix reductions) actually run at in the
+/// real decode path, per `rabbit-plan.md`/`attention.rs`'s own `kv_lora <= 512` gate.
+const KV_LORA: usize = 512;
 
 fn xorshift(seed: &mut u32) -> u32 {
     *seed ^= *seed << 13;
@@ -110,5 +118,94 @@ fn bench_matmul_i4(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dot_i8i8, bench_dot_i4i8, bench_matmul_i4);
+/// `qt_addrow`'s int4 branch (MLA-absorb `q_nope` absorption) at the real `kv_lora=512` this
+/// runs at in `attention.rs`'s absorbed decode path — see that module's doc for why this and
+/// `qt_matvec_rows` are fixed O(kv_lora) per call, independent of context length.
+fn bench_qt_addrow_i4(c: &mut Criterion) {
+    let w = random_bytes(KV_LORA.div_ceil(2), 7);
+    let coef = 1.7f32;
+    let mut group = c.benchmark_group("qt_addrow_i4");
+
+    group.bench_function("scalar", |b| {
+        let mut acc = vec![0f32; KV_LORA];
+        b.iter(|| axpy_i4_f32_scalar(black_box(&w), black_box(coef), black_box(&mut acc), KV_LORA))
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        group.bench_function("avx512", |b| {
+            let mut acc = vec![0f32; KV_LORA];
+            b.iter(|| unsafe { axpy_i4_f32_avx512(black_box(&w), black_box(coef), black_box(&mut acc), KV_LORA) })
+        });
+    }
+
+    group.finish();
+}
+
+/// `qt_matvec_rows`'s int4 branch (MLA-absorb value projection) at `kv_lora=512`.
+fn bench_qt_matvec_rows_i4(c: &mut Criterion) {
+    let w = random_bytes(KV_LORA.div_ceil(2), 8);
+    let x = random_i8(KV_LORA, 9).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let mut group = c.benchmark_group("qt_matvec_rows_i4");
+
+    group.bench_function("scalar", |b| b.iter(|| dot_i4_f32_scalar(black_box(&w), black_box(&x), KV_LORA)));
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        group.bench_function("avx512", |b| {
+            b.iter(|| unsafe { dot_i4_f32_avx512(black_box(&w), black_box(&x), KV_LORA) })
+        });
+    }
+
+    group.finish();
+}
+
+/// The MLA-absorb score dot-product (`dot(qabs, Lt)`) and value-mix axpy
+/// (`clat[i] += sc[jj]*Lt[i]`) at `kv_lora=512` — both operate on already-dequantized f32
+/// latents, so unlike the two benches above these run regardless of the KV weight's quant
+/// format. See `kernels.rs`'s `dot_f32_avx2`/`axpy_f32_avx2` docs for the bit-identity discussion.
+fn bench_mla_score_and_vmix(c: &mut Criterion) {
+    let qabs = random_i8(KV_LORA, 10).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let lt = random_i8(KV_LORA, 11).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let coef = 0.3f32;
+
+    let mut group = c.benchmark_group("mla_score_dot");
+    group.bench_function("scalar", |b| {
+        b.iter(|| black_box(&qabs).iter().zip(black_box(&lt)).map(|(&x, &y)| x * y).sum::<f32>())
+    });
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        group.bench_function("avx2", |b| b.iter(|| unsafe { dot_f32_avx2(black_box(&qabs), black_box(&lt), KV_LORA) }));
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("mla_vmix_axpy");
+    group.bench_function("scalar", |b| {
+        let mut clat = vec![0f32; KV_LORA];
+        b.iter(|| {
+            for i in 0..KV_LORA {
+                clat[i] += coef * lt[i];
+            }
+            black_box(&clat);
+        })
+    });
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        group.bench_function("avx2", |b| {
+            let mut clat = vec![0f32; KV_LORA];
+            b.iter(|| unsafe { axpy_f32_avx2(black_box(coef), black_box(&lt), black_box(&mut clat), KV_LORA) })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_dot_i8i8,
+    bench_dot_i4i8,
+    bench_matmul_i4,
+    bench_qt_addrow_i4,
+    bench_qt_matvec_rows_i4,
+    bench_mla_score_and_vmix
+);
 criterion_main!(benches);

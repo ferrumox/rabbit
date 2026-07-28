@@ -66,6 +66,12 @@ use std::collections::HashMap;
 pub enum ExpertNaming {
     /// `model.layers.{layer}.mlp.experts.{eid}.{gate_proj,up_proj,down_proj}.weight`.
     Glm52,
+    /// Like `Glm52`, but `gate_proj`/`up_proj` have been pre-fused into one
+    /// `gate_up_proj.weight` tensor (`[2*moe_inter, hidden]`, gate's rows first, then up's) by
+    /// a converter — see `bin/fuse_gate_up.rs`. Auto-detected per checkpoint at `Model::load`
+    /// time (`glm52::model::detect_fused_gate_up`) — a checkpoint is either fully fused or not
+    /// at all, never a mix, so this and `Glm52` are mutually exclusive for a given load.
+    Glm52FusedGateUp,
     /// `model.layers.{layer}.block_sparse_moe.experts.{eid}.{w1,w2,w3}.weight` — `w1` is the
     /// gate projection, `w2` is down, `w3` is up (confirmed via `KimiBlockSparseMLP`'s own code
     /// comments in the real `modeling_kimi.py`, not guessed; see `kimi_linear::model`'s doc).
@@ -73,19 +79,33 @@ pub enum ExpertNaming {
 }
 
 impl ExpertNaming {
-    /// Returns `[gate, up, down]` tensor names, in that fixed order — every caller in this file
-    /// (the `io_uring` batch path and the sequential fallback alike) already indexes reads
-    /// positionally as gate/up/down (see `complete_batch_streaming`'s `base+0/1/2`), so this is
-    /// the one place that ordering has to be gotten right.
-    fn tensor_names(&self, layer: usize, eid: usize) -> [String; 3] {
+    /// How many `.safetensors` tensors this naming reads per expert — `submit_batch`'s ring
+    /// sizing and `complete_batch_streaming`'s per-expert read-count bookkeeping both key off
+    /// this instead of a hardcoded `3`.
+    fn tensor_count(&self) -> usize {
+        match self {
+            ExpertNaming::Glm52FusedGateUp => 2,
+            ExpertNaming::Glm52 | ExpertNaming::KimiLinear => 3,
+        }
+    }
+
+    /// Returns `(tensor_name, rows, cols)` in read order — every caller in this file (the
+    /// `io_uring` batch path and the sequential fallback alike) indexes reads positionally in
+    /// this same order (see `complete_batch_streaming`'s `base+0/1/...`), so this is the one
+    /// place that ordering has to be gotten right.
+    fn tensor_specs(&self, layer: usize, eid: usize, moe_inter: usize, hidden: usize) -> Vec<(String, usize, usize)> {
         match self {
             ExpertNaming::Glm52 => {
                 let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
-                [p("gate_proj"), p("up_proj"), p("down_proj")]
+                vec![(p("gate_proj"), moe_inter, hidden), (p("up_proj"), moe_inter, hidden), (p("down_proj"), hidden, moe_inter)]
+            }
+            ExpertNaming::Glm52FusedGateUp => {
+                let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
+                vec![(p("gate_up_proj"), 2 * moe_inter, hidden), (p("down_proj"), hidden, moe_inter)]
             }
             ExpertNaming::KimiLinear => {
                 let p = |suf: &str| format!("model.layers.{layer}.block_sparse_moe.experts.{eid}.{suf}.weight");
-                [p("w1"), p("w3"), p("w2")]
+                vec![(p("w1"), moe_inter, hidden), (p("w3"), moe_inter, hidden), (p("w2"), hidden, moe_inter)]
             }
         }
     }
@@ -93,7 +113,7 @@ impl ExpertNaming {
 
 #[cfg(target_os = "linux")]
 mod uring_load {
-    use super::{Cfg, ExpertNaming, ExpertSlot, ModelError, QT};
+    use super::{Cfg, ExpertNaming, ExpertSlot, GateUp, ModelError, QT};
     use crate::safetensors::{DType, SafetensorsError, Shards, TensorLocation, dequant_fp8_blockscale};
     use io_uring::{IoUring, opcode, types};
 
@@ -144,16 +164,16 @@ mod uring_load {
         }
     }
 
-    /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity: 3
-    /// tensors/expert, plus up to one scale-sidecar read per tensor (`.qs` packed scale or FP8
-    /// `_scale_inv` — mutually exclusive per tensor, so this is a worst-case upper bound, not a
-    /// typical one) submitted in the SAME batch instead of a synchronous pre-read — see
-    /// `submit_batch`'s doc for why. Returns `None` if `io_uring` isn't usable on this host (the
-    /// `io_uring_disabled` sysctl, a seccomp profile blocking the syscalls, ...) — every
-    /// `submit_batch` call then falls back to a synchronous load, same as a hard per-call
-    /// failure would.
-    pub(super) fn new_ring(cache_capacity: usize) -> Option<Ring> {
-        Ring::new(cache_capacity * 3 * 2).ok()
+    /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity:
+    /// `naming.tensor_count()` tensors/expert (3, or 2 for a fused-gate-up checkpoint), plus up
+    /// to one scale-sidecar read per tensor (`.qs` packed scale or FP8 `_scale_inv` — mutually
+    /// exclusive per tensor, so this is a worst-case upper bound, not a typical one) submitted
+    /// in the SAME batch instead of a synchronous pre-read — see `submit_batch`'s doc for why.
+    /// Returns `None` if `io_uring` isn't usable on this host (the `io_uring_disabled` sysctl, a
+    /// seccomp profile blocking the syscalls, ...) — every `submit_batch` call then falls back
+    /// to a synchronous load, same as a hard per-call failure would.
+    pub(super) fn new_ring(cache_capacity: usize, naming: ExpertNaming) -> Option<Ring> {
+        Ring::new(cache_capacity * naming.tensor_count() * 2).ok()
     }
 
     /// A batch of expert reads submitted to `ring` but not yet awaited — `complete_batch` must
@@ -180,25 +200,25 @@ mod uring_load {
         }
     }
 
-    /// Submits reads for every tensor in `misses` (3/expert) — plus, in the SAME `io_uring`
-    /// round, any `.qs`/FP8 scale sidecar those tensors need — WITHOUT waiting for completion.
-    /// Locating a sidecar (`shards.tensor_location`) is a plain in-memory header lookup, not
-    /// I/O, so nothing here blocks; only the actual byte reads are deferred to the ring.
-    /// Returns `Ok(None)` — not an error — when the ring is unavailable, the batch doesn't fit
-    /// in one submission round, or the submission itself fails; every one of these just means
-    /// "the caller should fall back to a synchronous load for this batch," same as a hard
-    /// `load_batch` failure always meant before this split existed.
+    /// Submits reads for every tensor in `misses` (`naming.tensor_count()`/expert) — plus, in
+    /// the SAME `io_uring` round, any `.qs`/FP8 scale sidecar those tensors need — WITHOUT
+    /// waiting for completion. Locating a sidecar (`shards.tensor_location`) is a plain
+    /// in-memory header lookup, not I/O, so nothing here blocks; only the actual byte reads are
+    /// deferred to the ring. Returns `Ok(None)` — not an error — when the ring is unavailable,
+    /// the batch doesn't fit in one submission round, or the submission itself fails; every one
+    /// of these just means "the caller should fall back to a synchronous load for this batch,"
+    /// same as a hard `load_batch` failure always meant before this split existed.
     pub(super) fn submit_batch(ring: &mut Option<Ring>, shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], naming: ExpertNaming) -> Result<Option<Pending>, ModelError> {
         let Some(r) = ring.as_mut() else { return Ok(None) };
 
         let i = cfg.moe_inter as usize;
         let d = cfg.hidden as usize;
 
-        let mut reqs = Vec::with_capacity(misses.len() * 3);
+        let mut reqs = Vec::with_capacity(misses.len() * naming.tensor_count());
         let mut scale_locs: Vec<TensorLocation> = Vec::new();
         for &eid in misses {
-            let names = naming.tensor_names(layer, eid);
-            for (name, rows, cols) in [(&names[0], i, d), (&names[1], i, d), (&names[2], d, i)] {
+            let specs = naming.tensor_specs(layer, eid, i, d);
+            for (name, rows, cols) in &specs {
                 let loc = shards.tensor_location(name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name.clone())))?;
 
                 let mut packed_scale = None;
@@ -212,7 +232,7 @@ mod uring_load {
                     fp8_scale = Some(scale_locs.len());
                     scale_locs.push(sloc);
                 }
-                reqs.push(Req { rows, cols, loc, packed_scale, fp8_scale });
+                reqs.push(Req { rows: *rows, cols: *cols, loc, packed_scale, fp8_scale });
             }
         }
 
@@ -272,18 +292,27 @@ mod uring_load {
     /// id, like `finish_loading`, don't care) plus, separately, how many nanoseconds were spent
     /// purely waiting on completions — split out from `load_nanos` the same way the previous
     /// non-streaming version was, for the same reason (see `PERFORMANCE.md`).
-    pub(super) fn complete_batch_streaming(ring: &mut Ring, pending: Pending, bits: u8, group_size: usize, used: u64, mut on_slot: impl FnMut(&ExpertSlot)) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
+    pub(super) fn complete_batch_streaming(
+        ring: &mut Ring,
+        pending: Pending,
+        bits: u8,
+        group_size: usize,
+        used: u64,
+        naming: ExpertNaming,
+        mut on_slot: impl FnMut(&ExpertSlot),
+    ) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
+        let tensors = naming.tensor_count();
         let Pending { reqs, mut bufs, scale_bufs, eids } = pending;
         let total = reqs.len() + scale_bufs.len();
         let n_experts = eids.len();
 
         // `scale_owner[s]` = which expert (index into `eids`) scale-sidecar read `s` belongs
-        // to; `needed[e]` = how many of expert `e`'s reads (3 main + 0-3 scale) must land
-        // before it's fully decodable.
+        // to; `needed[e]` = how many of expert `e`'s reads (`tensors` main + 0-`tensors` scale)
+        // must land before it's fully decodable.
         let mut scale_owner = vec![usize::MAX; scale_bufs.len()];
-        let mut needed = vec![3usize; n_experts];
+        let mut needed = vec![tensors; n_experts];
         for (local, req) in reqs.iter().enumerate() {
-            let owner = local / 3;
+            let owner = local / tensors;
             if let Some(idx) = req.packed_scale {
                 scale_owner[idx] = owner;
                 needed[owner] += 1;
@@ -316,7 +345,7 @@ mod uring_load {
                         }
                         n => return Err(std::io::Error::from_raw_os_error(-n)),
                     }
-                    owner = idx / 3;
+                    owner = idx / tensors;
                 } else {
                     let sidx = idx - reqs.len();
                     let buf = &scale_bufs[sidx];
@@ -342,11 +371,18 @@ mod uring_load {
                     // VALUE (straight into `QT::from_packed`, which already wants an owned
                     // `Vec<u8>`) instead of `raw.to_vec()`-cloning it — same reasoning as the
                     // buffer-copy fix this replaced (see `PERFORMANCE.md`).
-                    let base = owner * 3;
-                    let gate = qt_from_raw(std::mem::take(&mut bufs[base]), &reqs[base], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let up = qt_from_raw(std::mem::take(&mut bufs[base + 1]), &reqs[base + 1], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let down = qt_from_raw(std::mem::take(&mut bufs[base + 2]), &reqs[base + 2], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let slot = ExpertSlot { eid: eids[owner], gate, up, down, used };
+                    let base = owner * tensors;
+                    let mut take = |k: usize| qt_from_raw(std::mem::take(&mut bufs[base + k]), &reqs[base + k], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()));
+                    let slot = if tensors == 2 {
+                        let gate_up = take(0)?;
+                        let down = take(1)?;
+                        ExpertSlot { eid: eids[owner], gate_up: GateUp::Fused { gate_up }, down, used }
+                    } else {
+                        let gate = take(0)?;
+                        let up = take(1)?;
+                        let down = take(2)?;
+                        ExpertSlot { eid: eids[owner], gate_up: GateUp::Separate { gate, up }, down, used }
+                    };
                     on_slot(&slot);
                     out.push(slot);
                 }
@@ -373,12 +409,48 @@ mod uring_load {
     }
 }
 
+/// The gate/up half of an expert's FFN weights — either the original two separate tensors, or
+/// (see `bin/fuse_gate_up.rs`) one pre-fused `[2*moe_inter, hidden]` tensor read and matmul'd in
+/// a single shot. `moe.rs`'s `apply_single_expert` matches on this to pick the right compute
+/// path; every other consumer of an `ExpertSlot` (the cache/LRU/pinning machinery here) doesn't
+/// care which variant it holds.
+pub enum GateUp {
+    Separate { gate: QT, up: QT },
+    Fused { gate_up: QT },
+}
+
 pub struct ExpertSlot {
     pub eid: usize,
-    pub gate: QT,
-    pub up: QT,
+    pub gate_up: GateUp,
     pub down: QT,
     used: u64,
+}
+
+#[cfg(test)]
+impl ExpertSlot {
+    /// Test-only constructor — `used` stays private in production code (only `expert_cache.rs`
+    /// itself sets it, via the LRU/pin bookkeeping), but `moe.rs`'s own tests need to build an
+    /// `ExpertSlot` directly to compare `GateUp::Fused` against `GateUp::Separate` for the same
+    /// underlying weights, without going through a real (or fixture) `.safetensors` load.
+    pub(crate) fn new_for_test(eid: usize, gate_up: GateUp, down: QT) -> ExpertSlot {
+        ExpertSlot { eid, gate_up, down, used: 0 }
+    }
+
+    /// Test-only convenience accessors for the pre-fusion `Separate` shape — every existing
+    /// test fixture builds an unfused checkpoint, so these panic (loudly, not silently wrong)
+    /// if ever called against a `Fused` slot, same as indexing past the end of a `Vec` would.
+    fn gate(&self) -> &QT {
+        match &self.gate_up {
+            GateUp::Separate { gate, .. } => gate,
+            GateUp::Fused { .. } => panic!("expected GateUp::Separate, got Fused"),
+        }
+    }
+    fn up(&self) -> &QT {
+        match &self.gate_up {
+            GateUp::Separate { up, .. } => up,
+            GateUp::Fused { .. } => panic!("expected GateUp::Separate, got Fused"),
+        }
+    }
 }
 
 /// A batch of experts `ExpertCache::begin_loading` started resolving — opaque to callers other
@@ -485,7 +557,7 @@ impl ExpertCache {
             load_nanos: 0,
             io_wait_nanos: 0,
             #[cfg(target_os = "linux")]
-            ring: uring_load::new_ring(capacity),
+            ring: uring_load::new_ring(capacity, naming),
             naming,
         }
     }
@@ -621,7 +693,7 @@ impl ExpertCache {
                 let eids_for_fallback = p.eids_for_fallback();
                 let load_t = std::time::Instant::now();
                 let ring = self.ring.as_mut().expect("Async pending implies the ring existed when begin_loading submitted it");
-                let result = uring_load::complete_batch_streaming(ring, p, bits, cfg.group_size as usize, self.clock, &mut on_slot);
+                let result = uring_load::complete_batch_streaming(ring, p, bits, cfg.group_size as usize, self.clock, self.naming, &mut on_slot);
                 self.load_nanos += load_t.elapsed().as_nanos() as u64;
                 match result {
                     Ok((v, io_wait_nanos)) => {
@@ -733,11 +805,18 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
     let i = cfg.moe_inter as usize;
     let d = cfg.hidden as usize;
     let gs = cfg.group_size as usize;
-    let names = naming.tensor_names(layer, eid);
-    let gate = qt_load(shards, gs, &names[0], i, d, bits)?;
-    let up = qt_load(shards, gs, &names[1], i, d, bits)?;
-    let down = qt_load(shards, gs, &names[2], d, i, bits)?;
-    Ok(ExpertSlot { eid, gate, up, down, used })
+    let specs = naming.tensor_specs(layer, eid, i, d);
+    let (gate_up, down) = if specs.len() == 2 {
+        let gate_up = qt_load(shards, gs, &specs[0].0, specs[0].1, specs[0].2, bits)?;
+        let down = qt_load(shards, gs, &specs[1].0, specs[1].1, specs[1].2, bits)?;
+        (GateUp::Fused { gate_up }, down)
+    } else {
+        let gate = qt_load(shards, gs, &specs[0].0, specs[0].1, specs[0].2, bits)?;
+        let up = qt_load(shards, gs, &specs[1].0, specs[1].1, specs[1].2, bits)?;
+        let down = qt_load(shards, gs, &specs[2].0, specs[2].1, specs[2].2, bits)?;
+        (GateUp::Separate { gate, up }, down)
+    };
+    Ok(ExpertSlot { eid, gate_up, down, used })
 }
 
 /// Best-effort `mlock` on a pinned expert's backing buffers, so the OS can't swap out memory
@@ -747,7 +826,11 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
 /// ignored: losing the OS-level guarantee just means a pinned expert *could* get swapped under
 /// real memory pressure, same risk profile as not pinning it at all — not a correctness issue.
 fn mlock_best_effort(slot: &ExpertSlot) {
-    for qt in [&slot.gate, &slot.up, &slot.down] {
+    let gate_up_qts: Vec<&QT> = match &slot.gate_up {
+        GateUp::Separate { gate, up } => vec![gate, up],
+        GateUp::Fused { gate_up } => vec![gate_up],
+    };
+    for qt in gate_up_qts.into_iter().chain(std::iter::once(&slot.down)) {
         let bufs: Vec<(*const u8, usize)> = match &qt.kind {
             QTKind::F32(v) => vec![(v.as_ptr() as *const u8, std::mem::size_of_val(v.as_slice()))],
             QTKind::I8 { data, scale } => {
@@ -821,6 +904,45 @@ mod tests {
             push(&mut header, format!("model.layers.0.mlp.experts.{eid}.gate_proj.weight"), moe_inter, hidden);
             push(&mut header, format!("model.layers.0.mlp.experts.{eid}.up_proj.weight"), moe_inter, hidden);
             push(&mut header, format!("model.layers.0.mlp.experts.{eid}.down_proj.weight"), hidden, moe_inter);
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+        dir
+    }
+
+    /// Like `build_experts_fixture`, but writes the FUSED layout `bin/fuse_gate_up.rs` would
+    /// produce FROM that exact fixture: `gate_up_proj.weight` (`[2*moe_inter, hidden]`, gate's
+    /// rows first then up's — same xorshift seed sequence, so byte-for-byte the same values)
+    /// instead of separate `gate_proj`/`up_proj` tensors. `down_proj` is unchanged (fusion never
+    /// touches it). Used to prove the `Glm52FusedGateUp` read path lands on the exact same
+    /// numbers `Glm52`'s separate read of the pre-fusion fixture would.
+    fn build_fused_experts_fixture(name: &str, n_experts: usize, moe_inter: usize, hidden: usize) -> TempDir {
+        let dir = TempDir::new(name);
+        let mut seed = 1u32;
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut push = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, rows: usize, cols: usize, vals: Vec<f32>| {
+            let bytes = f32_bytes(&vals);
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": "F32", "shape": [rows, cols], "data_offsets": [start, end]}));
+        };
+        for eid in 0..n_experts {
+            // Same order `build_experts_fixture` draws from the same seed: gate, then up, then
+            // down — critical for the two fixtures to describe the SAME logical checkpoint.
+            let gate_vals: Vec<f32> = (0..moe_inter * hidden).map(|_| xorshift(&mut seed)).collect();
+            let up_vals: Vec<f32> = (0..moe_inter * hidden).map(|_| xorshift(&mut seed)).collect();
+            let down_vals: Vec<f32> = (0..hidden * moe_inter).map(|_| xorshift(&mut seed)).collect();
+            let mut gate_up_vals = gate_vals;
+            gate_up_vals.extend(up_vals);
+            push(&mut header, format!("model.layers.0.mlp.experts.{eid}.gate_up_proj.weight"), 2 * moe_inter, hidden, gate_up_vals);
+            push(&mut header, format!("model.layers.0.mlp.experts.{eid}.down_proj.weight"), hidden, moe_inter, down_vals);
         }
         let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
         let mut out = Vec::new();
@@ -906,8 +1028,8 @@ mod tests {
 
         let slot = cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
         assert_eq!(slot.eid, 1);
-        assert_eq!(slot.gate.rows, 4);
-        assert_eq!(slot.gate.cols, 6);
+        assert_eq!(slot.gate().rows, 4);
+        assert_eq!(slot.gate().cols, 6);
         assert_eq!(slot.down.rows, 6);
         assert_eq!(slot.down.cols, 4);
         assert_eq!(cache.hits, 0);
@@ -933,12 +1055,12 @@ mod tests {
         let mut cache = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
 
         let slot = cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
-        assert_eq!(slot.gate.rows, 4);
-        assert_eq!(slot.gate.cols, 6);
+        assert_eq!(slot.gate().rows, 4);
+        assert_eq!(slot.gate().cols, 6);
         assert_eq!(slot.down.rows, 6);
         assert_eq!(slot.down.cols, 4);
-        assert!(qt_values(&slot.gate).iter().all(|&v| (v - 1.0).abs() < 1e-6), "w1 must land in gate");
-        assert!(qt_values(&slot.up).iter().all(|&v| (v - 3.0).abs() < 1e-6), "w3 must land in up");
+        assert!(qt_values(slot.gate()).iter().all(|&v| (v - 1.0).abs() < 1e-6), "w1 must land in gate");
+        assert!(qt_values(slot.up()).iter().all(|&v| (v - 3.0).abs() < 1e-6), "w3 must land in up");
         assert!(qt_values(&slot.down).iter().all(|&v| (v - 2.0).abs() < 1e-6), "w2 must land in down");
     }
 
@@ -964,8 +1086,8 @@ mod tests {
         for &eid in &eids {
             let a = cache_seq.get(eid).unwrap();
             let b = cache_batch.get(eid).unwrap();
-            assert_eq!(qt_values(&a.gate), qt_values(&b.gate), "expert {eid} gate");
-            assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up");
+            assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} gate");
+            assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} up");
             assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down");
         }
     }
@@ -997,6 +1119,78 @@ mod tests {
         (0..t.rows).flat_map(|r| t.row_f32(r)).collect()
     }
 
+    /// Same as `fused_gate_up_naming_matches_separate_naming_values` below, but through
+    /// `ensure_loaded` — the batched `io_uring` path (Linux) — instead of `get_or_load`'s
+    /// always-sequential `load_expert`. `submit_batch`/`complete_batch_streaming`'s ring-sizing
+    /// and per-expert read-count bookkeeping both had to learn `tensor_count()` isn't always 3
+    /// for this to pass; a shape-only check wouldn't catch a bufs-index-off-by-one there.
+    #[test]
+    fn ensure_loaded_fused_gate_up_matches_get_or_load_separate_values() {
+        let (n_experts, moe_inter, hidden) = (3, 5, 7);
+        let sep_fixture = build_experts_fixture("rabbit_test_ecache_fused_uring_sep", n_experts, moe_inter, hidden);
+        let fused_fixture = build_fused_experts_fixture("rabbit_test_ecache_fused_uring_fused", n_experts, moe_inter, hidden);
+        let sep_shards = Shards::open(&sep_fixture.0).unwrap();
+        let fused_shards = Shards::open(&fused_fixture.0).unwrap();
+        let cfg = tiny_cfg(n_experts as i32, moe_inter as i32, hidden as i32);
+        let eids: Vec<usize> = (0..n_experts).collect();
+
+        let mut sep_cache = ExpertCache::new(8);
+        for &eid in &eids {
+            sep_cache.get_or_load(&sep_shards, &cfg, 0, eid, 32).unwrap();
+        }
+
+        let mut fused_cache = ExpertCache::for_family(8, ExpertNaming::Glm52FusedGateUp);
+        fused_cache.ensure_loaded(&fused_shards, &cfg, 0, &eids, 32).unwrap();
+
+        for &eid in &eids {
+            let sep_slot = sep_cache.get(eid).unwrap();
+            let expected_gate = qt_values(sep_slot.gate());
+            let expected_up = qt_values(sep_slot.up());
+            let expected_down = qt_values(&sep_slot.down);
+
+            let fused_slot = fused_cache.get(eid).unwrap();
+            let GateUp::Fused { gate_up } = &fused_slot.gate_up else { panic!("expected GateUp::Fused") };
+            let gate_up_vals = qt_values(gate_up);
+            let (got_gate, got_up) = gate_up_vals.split_at(moe_inter * hidden);
+            assert_eq!(got_gate, expected_gate.as_slice(), "expert {eid}: gate half (via ensure_loaded/io_uring)");
+            assert_eq!(got_up, expected_up.as_slice(), "expert {eid}: up half (via ensure_loaded/io_uring)");
+            assert_eq!(qt_values(&fused_slot.down), expected_down, "expert {eid}: down_proj (via ensure_loaded/io_uring)");
+        }
+    }
+
+    /// `ExpertNaming::Glm52FusedGateUp` (`bin/fuse_gate_up.rs`'s output format) must decode to
+    /// the EXACT same weight values as `ExpertNaming::Glm52` reading the pre-fusion checkpoint
+    /// it was produced from — this is the whole correctness contract the converter and this
+    /// read path both depend on. Checked through `get_or_load` (the sequential fallback).
+    #[test]
+    fn fused_gate_up_naming_matches_separate_naming_values() {
+        let (n_experts, moe_inter, hidden) = (2, 4, 6);
+        let sep_fixture = build_experts_fixture("rabbit_test_ecache_fused_vs_sep_sep", n_experts, moe_inter, hidden);
+        let fused_fixture = build_fused_experts_fixture("rabbit_test_ecache_fused_vs_sep_fused", n_experts, moe_inter, hidden);
+        let sep_shards = Shards::open(&sep_fixture.0).unwrap();
+        let fused_shards = Shards::open(&fused_fixture.0).unwrap();
+        let cfg = tiny_cfg(n_experts as i32, moe_inter as i32, hidden as i32);
+
+        let mut sep_cache = ExpertCache::new(8);
+        let mut fused_cache = ExpertCache::for_family(8, ExpertNaming::Glm52FusedGateUp);
+
+        for eid in 0..n_experts {
+            let sep_slot = sep_cache.get_or_load(&sep_shards, &cfg, 0, eid, 32).unwrap();
+            let expected_gate = qt_values(sep_slot.gate());
+            let expected_up = qt_values(sep_slot.up());
+            let expected_down = qt_values(&sep_slot.down);
+
+            let fused_slot = fused_cache.get_or_load(&fused_shards, &cfg, 0, eid, 32).unwrap();
+            let GateUp::Fused { gate_up } = &fused_slot.gate_up else { panic!("expected GateUp::Fused") };
+            assert_eq!(gate_up.rows, 2 * moe_inter, "expert {eid}: gate_up_proj row count");
+            let gate_up_vals = qt_values(gate_up);
+            let (got_gate, got_up) = gate_up_vals.split_at(moe_inter * hidden);
+            assert_eq!(got_gate, expected_gate.as_slice(), "expert {eid}: gate half of gate_up_proj");
+            assert_eq!(got_up, expected_up.as_slice(), "expert {eid}: up half of gate_up_proj");
+            assert_eq!(qt_values(&fused_slot.down), expected_down, "expert {eid}: down_proj");
+        }
+    }
+
     /// The whole point of Fase 8: `ensure_loaded` (batched `io_uring`, Linux) and
     /// `get_or_load` (sequential `pread`) must decode the exact same bytes — same dequantized
     /// weight values, not just matching shapes — for every expert in a batch.
@@ -1018,8 +1212,8 @@ mod tests {
         for &eid in &eids {
             let a = batch_cache.get(eid).unwrap();
             let b = sequential_cache.get(eid).unwrap();
-            assert_eq!(qt_values(&a.gate), qt_values(&b.gate), "expert {eid} gate_proj");
-            assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up_proj");
+            assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} gate_proj");
+            assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} up_proj");
             assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down_proj");
         }
     }
@@ -1050,8 +1244,8 @@ mod tests {
         for &eid in &eids {
             let a = split_cache.get(eid).unwrap();
             let b = plain_cache.get(eid).unwrap();
-            assert_eq!(qt_values(&a.gate), qt_values(&b.gate), "expert {eid} gate_proj");
-            assert_eq!(qt_values(&a.up), qt_values(&b.up), "expert {eid} up_proj");
+            assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} gate_proj");
+            assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} up_proj");
             assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down_proj");
         }
 
@@ -1148,10 +1342,10 @@ mod tests {
         let cfg = tiny_cfg(1, moe_inter as i32, hidden as i32);
 
         let check = |slot: &ExpertSlot| {
-            let crate::quant::QTKind::I8 { data, scale } = &slot.gate.kind else { panic!("expected I8 gate") };
+            let crate::quant::QTKind::I8 { data, scale } = &slot.gate().kind else { panic!("expected I8 gate") };
             assert_eq!(data, &gate_bytes.iter().map(|&b| b as i8).collect::<Vec<i8>>());
             assert_eq!(scale, &gate_scale);
-            let crate::quant::QTKind::I8 { data, scale } = &slot.up.kind else { panic!("expected I8 up") };
+            let crate::quant::QTKind::I8 { data, scale } = &slot.up().kind else { panic!("expected I8 up") };
             assert_eq!(data, &up_bytes.iter().map(|&b| b as i8).collect::<Vec<i8>>());
             assert_eq!(scale, &up_scale);
             let crate::quant::QTKind::I8 { data, scale } = &slot.down.kind else { panic!("expected I8 down") };
@@ -1227,13 +1421,13 @@ mod tests {
         sequential_cache.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
         let sequential_slot = sequential_cache.get(eid).unwrap();
 
-        assert_eq!(qt_values(&batch_slot.gate), qt_values(&sequential_slot.gate), "gate_proj");
-        assert_eq!(qt_values(&batch_slot.up), qt_values(&sequential_slot.up), "up_proj");
+        assert_eq!(qt_values(batch_slot.gate()), qt_values(sequential_slot.gate()), "gate_proj");
+        assert_eq!(qt_values(batch_slot.up()), qt_values(sequential_slot.up()), "up_proj");
         assert_eq!(qt_values(&batch_slot.down), qt_values(&sequential_slot.down), "down_proj");
 
         // and the scale was actually applied, not silently skipped -> magnitude ~2.0/3.0/4.0,
         // not ~1.0 (which is what the pre-fix bug's unscaled decode would have produced).
-        let gate_vals = qt_values(&batch_slot.gate);
+        let gate_vals = qt_values(batch_slot.gate());
         assert!(gate_vals.iter().any(|&v| v.abs() > 1.5), "gate scale (2.0) doesn't look applied: {gate_vals:?}");
     }
 

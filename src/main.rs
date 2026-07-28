@@ -12,10 +12,14 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
-[--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K]";
+[--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K] \
+[--shard-dirs <dir1,dir2,...>]";
 
 struct Args {
     model_dir: PathBuf,
+    /// Extra directories to also scan for `.safetensors` shards — see `LoadArgs::shard_dirs`'s
+    /// doc. Comma-separated on the CLI (`--shard-dirs /mnt/data/shards2,/mnt/more/shards3`).
+    shard_dirs: Vec<PathBuf>,
     prompt: Option<String>,
     chat: bool,
     serve: bool,
@@ -40,6 +44,7 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut model_dir = None;
+    let mut shard_dirs = Vec::new();
     let mut prompt = None;
     let mut chat = false;
     let mut serve = false;
@@ -64,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
         let mut next = |flag: &str| args.next().ok_or_else(|| format!("{flag} needs a value"));
         match a.as_str() {
             "--model" => model_dir = Some(PathBuf::from(next("--model")?)),
+            "--shard-dirs" => shard_dirs = next("--shard-dirs")?.split(',').map(PathBuf::from).collect(),
             "--prompt" => prompt = Some(next("--prompt")?),
             "--chat" => chat = true,
             "--serve" => serve = true,
@@ -96,6 +102,7 @@ fn parse_args() -> Result<Args, String> {
 
     Ok(Args {
         model_dir: model_dir.ok_or_else(|| format!("--model is required\n\n{USAGE}"))?,
+        shard_dirs,
         prompt,
         chat,
         serve,
@@ -120,6 +127,7 @@ fn parse_args() -> Result<Args, String> {
 fn load_args(args: &Args) -> LoadArgs {
     LoadArgs {
         model_dir: args.model_dir.clone(),
+        shard_dirs: args.shard_dirs.clone(),
         max_tokens: args.max_tokens,
         temperature: args.temperature,
         nucleus: args.nucleus,

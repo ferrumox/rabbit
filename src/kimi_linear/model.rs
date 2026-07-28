@@ -43,7 +43,7 @@ use crate::kimi_linear::config::{Cfg, ConfigError};
 use crate::quant::{PackedFormatError, QT};
 use crate::safetensors::{SafetensorsError, Shards};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One KDA layer's attention weights — see this module's doc for every field's real on-disk
 /// name/shape.
@@ -201,8 +201,16 @@ pub fn to_glm_cfg(kcfg: &Cfg) -> GlmCfg {
 
 impl Model {
     pub fn load(snap_dir: &Path, dbits: u8, ebits: u8) -> Result<Model, ModelError> {
-        let cfg = Cfg::load(snap_dir)?;
-        let shards = Shards::open(snap_dir)?;
+        Self::load_multi(std::slice::from_ref(&snap_dir.to_path_buf()), dbits, ebits)
+    }
+
+    /// Same as `load`, but reads the checkpoint's `.safetensors` shards from MULTIPLE
+    /// directories (`dirs[0]` is still the primary directory — the only one `config.json` is
+    /// read from). Lets a checkpoint be split across separate drives — see
+    /// `Shards::open_multi`'s doc for why.
+    pub fn load_multi(dirs: &[PathBuf], dbits: u8, ebits: u8) -> Result<Model, ModelError> {
+        let cfg = Cfg::load(&dirs[0])?;
+        let shards = Shards::open_multi(dirs)?;
         let d = cfg.hidden as usize;
         let h = cfg.n_heads as usize;
         let qh = cfg.qk_head as usize;

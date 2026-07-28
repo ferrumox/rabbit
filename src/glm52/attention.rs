@@ -20,6 +20,8 @@
 
 use crate::glm52::config::Cfg;
 use crate::glm52::model::{AttnWeights, DsaWeights};
+#[cfg(target_arch = "x86_64")]
+use crate::kernels::{axpy_f32_avx2, dot_f32_avx2};
 use crate::kernels::{matmul_qt, qt_addrow, qt_matvec_rows};
 use rayon::prelude::*;
 
@@ -465,10 +467,24 @@ pub fn attention(
                     qt_addrow(&w.kv_b, rbase + dd, qpd, &mut qabs);
                 }
 
+                // Both reductions below are ported from colibrì's PR #442 (commit `d469c54`,
+                // upstream v1.1.0): the score dot and the value-mix axpy are the two hottest
+                // scalar f32 loops on this path (each runs `nt` times per (s,h), scaling with
+                // context length, unlike `qt_addrow`/`qt_matvec_rows` above which are fixed
+                // O(kv_lora) regardless of `nt`). See `dot_f32_avx2`/`axpy_f32_avx2`'s own docs
+                // in `kernels.rs` for the bit-identity discussion (score reassociates, softmax
+                // downstream absorbs it; value-mix is bit-identical).
                 let mut sc = vec![0f32; nt];
                 for (jj, &t) in positions.iter().enumerate() {
                     let lt = kv.l_row(t);
                     let kr = kv.r_row(t);
+                    #[cfg(target_arch = "x86_64")]
+                    let mut a: f32 = if is_x86_feature_detected!("avx2") {
+                        unsafe { dot_f32_avx2(&qabs, lt, kv_lora) }
+                    } else {
+                        qabs.iter().zip(lt).map(|(&x, &y)| x * y).sum()
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
                     let mut a: f32 = qabs.iter().zip(lt).map(|(&x, &y)| x * y).sum();
                     a += qr.iter().zip(kr).map(|(&x, &y)| x * y).sum::<f32>();
                     sc[jj] = a * cfg.attn_scale;
@@ -479,6 +495,11 @@ pub fn attention(
                 for (jj, &t) in positions.iter().enumerate() {
                     let lt = kv.l_row(t);
                     let a = sc[jj];
+                    #[cfg(target_arch = "x86_64")]
+                    if is_x86_feature_detected!("avx2") {
+                        unsafe { axpy_f32_avx2(a, lt, &mut clat, kv_lora) };
+                        continue;
+                    }
                     for i in 0..kv_lora {
                         clat[i] += a * lt[i];
                     }

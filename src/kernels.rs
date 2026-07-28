@@ -85,6 +85,18 @@ fn has_avx2() -> bool {
     false
 }
 
+/// Gate for the MLA-absorption helpers' (`qt_addrow`/`qt_matvec_rows`) AVX-512 tier — same
+/// feature pair `matmul_i4`'s dispatcher checks, factored out since both call sites live outside
+/// `mod simd` and need the same two-flag check.
+#[cfg(target_arch = "x86_64")]
+fn has_avx512_i4() -> bool {
+    is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn has_avx512_i4() -> bool {
+    false
+}
+
 /// y[S,O] = x[S,I] @ W^T, W[O,I] f32.
 pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], s: usize, i: usize, o: usize) {
     with_yt_scratch(o * s, |yt| {
@@ -405,6 +417,64 @@ mod simd {
         }
     }
 
+    /// Plain f32 dot product, AVX2: 8-lane fmadd + `hsum256`, scalar tail. Used by the
+    /// absorbed-attention decode path's MLA-absorb score reduction (`attention.rs`,
+    /// `dot(qabs, Lt)` over `kv_lora` already-dequantized latent elements — NOT a dequant
+    /// helper like the other functions here) — ported from colibrì's PR #442 (commit
+    /// `d469c54`, upstream v1.1.0). Reassociates vs. the scalar sequential sum (8-wide partial
+    /// sums combined via `hsum256` at the end, instead of one running scalar accumulator) — NOT
+    /// bit-identical, but colibrì measured the rounding delta at ~1.8e-6 there, softened by the
+    /// softmax immediately downstream (never crosses a near-tie threshold in practice).
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx2")`. `a` and `b` must each have
+    /// length >= `n`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_f32_avx2(a: &[f32], b: &[f32], n: usize) -> f32 {
+        unsafe {
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
+            while i + 8 <= n {
+                acc = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i)), _mm256_loadu_ps(b.as_ptr().add(i)), acc);
+                i += 8;
+            }
+            let mut s = hsum256(acc);
+            while i < n {
+                s += a[i] * b[i];
+                i += 1;
+            }
+            s
+        }
+    }
+
+    /// `acc[0..n) += coef * b[0..n)`, AVX2: 8-lane fmadd, per-lane writeback, scalar tail. Used
+    /// by the absorbed-attention decode path's MLA-absorb value-mix accumulation
+    /// (`attention.rs`, `clat[i] += sc[jj] * Lt[i]`) — ported from the same colibrì PR as
+    /// `dot_f32_avx2` above. Each `acc[i]` receives exactly one fma with no cross-element
+    /// reduction, so this IS bit-identical to the scalar loop (colibrì measured diff 0.0),
+    /// unlike `dot_f32_avx2`.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx2")`. `b` and `acc` must each
+    /// have length >= `n`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn axpy_f32_avx2(coef: f32, b: &[f32], acc: &mut [f32], n: usize) {
+        unsafe {
+            let cv = _mm256_set1_ps(coef);
+            let mut i = 0;
+            while i + 8 <= n {
+                let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+                let av = _mm256_loadu_ps(acc.as_ptr().add(i));
+                _mm256_storeu_ps(acc.as_mut_ptr().add(i), _mm256_fmadd_ps(cv, bv, av));
+                i += 8;
+            }
+            while i < n {
+                acc[i] += coef * b[i];
+                i += 1;
+            }
+        }
+    }
+
     /// int4-packed weight row · f32 activation row -> f32. `n` = logical (unpacked) length.
     #[target_feature(enable = "avx2")]
     unsafe fn dot_i4_f32_avx2(w: &[u8], xs: &[f32], n: usize) -> f32 {
@@ -447,8 +517,17 @@ mod simd {
     /// accumulating into a single running vector — see the module doc for why this makes it
     /// NOT bit-identical to `dot_i4_f32_avx2`/scalar despite the same lossless nibble-unpack
     /// math. `n` = logical (unpacked) length.
+    ///
+    /// `pub` (beyond the AVX-512 tier's own `matmul_i4_avx512` use below) so `qt_matvec_rows`
+    /// can reuse it for the MLA-absorption value projection (same accumulation-order tradeoff
+    /// there as here, both accepted for the same reason — colibrì's own
+    /// `I4_ACC512`/`g_i4_acc512` precedent) and so `benches/kernels.rs` can measure it directly.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx512f")` and `"avx512bw"`. `w`
+    /// must have length >= `ceil(n/2)`, `xs` length >= `n`.
     #[target_feature(enable = "avx512f,avx512bw")]
-    unsafe fn dot_i4_f32_avx512(w: &[u8], xs: &[f32], n: usize) -> f32 {
+    pub unsafe fn dot_i4_f32_avx512(w: &[u8], xs: &[f32], n: usize) -> f32 {
         unsafe {
             let m4 = _mm_set1_epi8(0x0F);
             let b8 = _mm512_set1_epi32(8);
@@ -483,6 +562,54 @@ mod simd {
                 a += xs[i] * lo as f32;
             }
             a
+        }
+    }
+
+    /// `acc[0..n) += coef * dequant(int4 row)`, AVX-512F/BW — the axpy twin of
+    /// `dot_i4_f32_avx512` for the MLA-absorption path's `qt_addrow` (`q_nope` absorption:
+    /// `acc` accumulates `W_K^T q_nope` one scaled row at a time). Each `acc[k]` receives
+    /// exactly ONE fma (no cross-element accumulation, unlike `dot_i4_f32_avx512`'s tree-sum),
+    /// so this IS bit-identical to the scalar loop — ported from colibrì's `axpy_i4f_avx512`
+    /// (commit `a66c99a`, upstream v1.1.0), which makes the same claim and backs it with its own
+    /// bit-exact CI check.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx512f")` and `"avx512bw"`. `w`
+    /// must have length >= `ceil(n/2)`, `acc` length >= `n`.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub unsafe fn axpy_i4_f32_avx512(w: &[u8], coef: f32, acc: &mut [f32], n: usize) {
+        unsafe {
+            let m4 = _mm_set1_epi8(0x0F);
+            let b8 = _mm512_set1_epi32(8);
+            let cv = _mm512_set1_ps(coef);
+            let mut i = 0;
+            while i + 32 <= n {
+                let by = _mm_loadu_si128(w.as_ptr().add(i >> 1) as *const __m128i);
+                let lo = _mm_and_si128(by, m4);
+                let hi = _mm_and_si128(_mm_srli_epi16::<4>(by), m4);
+                let n0 = _mm_unpacklo_epi8(lo, hi);
+                let n1 = _mm_unpackhi_epi8(lo, hi);
+                let w0 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0), b8));
+                let w1 = _mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1), b8));
+                let a0 = _mm512_loadu_ps(acc.as_ptr().add(i));
+                let a1 = _mm512_loadu_ps(acc.as_ptr().add(i + 16));
+                _mm512_storeu_ps(acc.as_mut_ptr().add(i), _mm512_fmadd_ps(cv, w0, a0));
+                _mm512_storeu_ps(acc.as_mut_ptr().add(i + 16), _mm512_fmadd_ps(cv, w1, a1));
+                i += 32;
+            }
+            while i + 1 < n {
+                let byte = w[i >> 1];
+                let lo = (byte & 0xF) as i32 - 8;
+                let hi = (byte >> 4) as i32 - 8;
+                acc[i] += coef * lo as f32;
+                acc[i + 1] += coef * hi as f32;
+                i += 2;
+            }
+            if i < n {
+                let byte = w[i >> 1];
+                let lo = (byte & 0xF) as i32 - 8;
+                acc[i] += coef * lo as f32;
+            }
         }
     }
 
@@ -745,7 +872,10 @@ use simd::*;
 // `dot_i8i8_scalar`/`dot_i4i8_scalar` for why the auto-dispatching `dot_i8i8`/`dot_i4i8`
 // functions can't be used for a scalar-vs-AVX2-vs-AVX-512 comparison.
 #[cfg(target_arch = "x86_64")]
-pub use simd::{dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2, dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512};
+pub use simd::{
+    axpy_f32_avx2, axpy_i4_f32_avx512, dot_f32_avx2, dot_i4_f32_avx512, dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2,
+    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512,
+};
 
 // mirrors matmul_q_idot/matmul_i4_idot's C signature 1:1; both are private, single-call-site
 // helpers for matmul_qt, so a wrapper struct would be indirection with no real caller benefit.
@@ -818,11 +948,37 @@ fn quantize_activations(x: &[f32], s: usize, cols: usize) -> (Vec<i8>, Vec<f32>)
     (xq, sx)
 }
 
+/// Scalar reference for `qt_addrow`'s int4 branch — factored out of the inline loop so
+/// `axpy_i4_f32_avx512` can be checked for bit-exactness against this SAME logic (not a
+/// differently-associated reference like `QT::row_f32`), and so the AVX-512 dispatch's fallback
+/// arm has something to call instead of duplicating the loop body.
+pub fn axpy_i4_f32_scalar(w: &[u8], coef: f32, acc: &mut [f32], n: usize) {
+    for k in 0..n {
+        let byte = w[k >> 1];
+        let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+        acc[k] += coef * (nibble as i32 - 8) as f32;
+    }
+}
+
+/// Scalar reference for `qt_matvec_rows`'s int4 branch — same reasoning as
+/// `axpy_i4_f32_scalar` above, for the `dot_i4_f32_avx512` dispatch.
+pub fn dot_i4_f32_scalar(w: &[u8], x: &[f32], n: usize) -> f32 {
+    let mut acc = 0f32;
+    for k in 0..n {
+        let byte = w[k >> 1];
+        let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+        acc += (nibble as i32 - 8) as f32 * x[k];
+    }
+    acc
+}
+
 /// `acc[0..I) += coef * W[row,:]` — dequantizes one row of `w` on the fly and scales it by
 /// `coef` before accumulating. This is the "weight absorption" building block: MLA's decode
 /// path folds `q_nope · k_nope_t = q_nope · (W_K L_t) = (W_K^T q_nope) · L_t`, so instead of
 /// reconstructing `k_nope_t` per cached token it accumulates `W_K^T q_nope` once (a sum of
-/// `qk_nope` scaled rows) and dot-products that against the raw latents directly.
+/// `qk_nope` scaled rows) and dot-products that against the raw latents directly. Int4 dispatches
+/// AVX-512F/BW (bit-identical axpy, see `axpy_i4_f32_avx512`'s doc) when available, else scalar —
+/// the other formats stay scalar-only (colibrì never vectorized this helper beyond int4 either).
 pub fn qt_addrow(w: &QT, row: usize, coef: f32, acc: &mut [f32]) {
     let i = w.cols;
     match &w.kind {
@@ -843,11 +999,12 @@ pub fn qt_addrow(w: &QT, row: usize, coef: f32, acc: &mut [f32]) {
             let c = coef * scale[row];
             let rb = i.div_ceil(2);
             let wr = &data[row * rb..(row + 1) * rb];
-            for k in 0..i {
-                let byte = wr[k >> 1];
-                let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
-                acc[k] += c * (nibble as i32 - 8) as f32;
+            #[cfg(target_arch = "x86_64")]
+            if has_avx512_i4() {
+                unsafe { axpy_i4_f32_avx512(wr, c, acc, i) };
+                return;
             }
+            axpy_i4_f32_scalar(wr, c, acc, i);
         }
         QTKind::I2 { data, scale } => {
             let c = coef * scale[row];
@@ -908,12 +1065,14 @@ pub fn qt_matvec_rows(w: &QT, r0: usize, n: usize, x: &[f32], y: &mut [f32]) {
             QTKind::I4 { data, scale } => {
                 let rb = i.div_ceil(2);
                 let wr = &data[row * rb..(row + 1) * rb];
-                let mut acc = 0f32;
-                for k in 0..i {
-                    let byte = wr[k >> 1];
-                    let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
-                    acc += (nibble as i32 - 8) as f32 * x[k];
-                }
+                #[cfg(target_arch = "x86_64")]
+                let acc = if has_avx512_i4() {
+                    unsafe { dot_i4_f32_avx512(wr, x, i) }
+                } else {
+                    dot_i4_f32_scalar(wr, x, i)
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let acc = dot_i4_f32_scalar(wr, x, i);
                 acc as f64 * scale[row] as f64
             }
             QTKind::I2 { data, scale } => {
@@ -1104,6 +1263,89 @@ mod tests {
         matmul_qt(&mut y, &x, &t, s);
         for (a, b) in y.iter().zip(&expected) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn axpy_i4_f32_avx512_matches_scalar_bit_exact() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")) {
+            eprintln!("SKIP: no AVX-512F/BW on this CPU");
+            return;
+        }
+        // include a case past the first 32-wide chunk (33) so the tail-handling path (both the
+        // 2-at-a-time scalar tail and the final odd element) is actually exercised.
+        for &n in &[1usize, 7, 16, 17, 32, 33, 65] {
+            let rows = 1;
+            let w = random_vec(rows * n, n as u32 * 3 + 9);
+            let mut t = QT::alloc(rows, n, 4, false);
+            t.fill(&w);
+            let data = match &t.kind {
+                QTKind::I4 { data, .. } => data.clone(),
+                _ => panic!("expected I4"),
+            };
+            let coef = 1.7_f32;
+
+            let mut acc_scalar = vec![0.0f32; n];
+            axpy_i4_f32_scalar(&data, coef, &mut acc_scalar, n);
+            let mut acc_avx512 = vec![0.0f32; n];
+            unsafe { axpy_i4_f32_avx512(&data, coef, &mut acc_avx512, n) };
+            assert_eq!(acc_scalar, acc_avx512, "n={n}");
+        }
+    }
+
+    #[test]
+    fn qt_addrow_i4_dispatch_matches_scalar_reference_bit_exact() {
+        // Exercises qt_addrow's real dispatch (whichever tier this CPU actually picks) against
+        // the SAME scalar logic the AVX-512 arm falls back to — proving the bit-identical claim
+        // holds end-to-end through the public API, not just for the low-level kernel in
+        // isolation (see `axpy_i4_f32_avx512_matches_scalar_bit_exact` above).
+        let (rows, cols) = (3, 40);
+        let w = random_vec(rows * cols, 51);
+        let mut t = QT::alloc(rows, cols, 4, false);
+        t.fill(&w);
+        let (data, scale) = match &t.kind {
+            QTKind::I4 { data, scale } => (data.clone(), scale.clone()),
+            _ => panic!("expected I4"),
+        };
+        let coef = 2.3_f32;
+        let row = 1;
+
+        let mut acc = vec![0.0f32; cols];
+        qt_addrow(&t, row, coef, &mut acc);
+
+        let rb = cols.div_ceil(2);
+        let wr = &data[row * rb..(row + 1) * rb];
+        let c = coef * scale[row];
+        let mut expected = vec![0.0f32; cols];
+        axpy_i4_f32_scalar(wr, c, &mut expected, cols);
+        assert_eq!(acc, expected);
+    }
+
+    #[test]
+    fn qt_matvec_rows_i4_dispatch_matches_scalar_reference_within_tolerance() {
+        // Not bit-exact when this CPU picks the AVX-512 tier (dot_i4_f32_avx512's tree-sum
+        // reduction reorders vs the scalar loop, same accepted tradeoff as matmul_i4's own
+        // AVX-512 tier) — tolerance-based, matching this file's precedent for that kernel.
+        let (rows, cols) = (4, 48);
+        let w = random_vec(rows * cols, 52);
+        let mut t = QT::alloc(rows, cols, 4, false);
+        t.fill(&w);
+        let x = random_vec(cols, 53);
+
+        let mut y = vec![0.0f32; 2];
+        qt_matvec_rows(&t, 1, 2, &x, &mut y);
+
+        let (data, scale) = match &t.kind {
+            QTKind::I4 { data, scale } => (data.clone(), scale.clone()),
+            _ => panic!("expected I4"),
+        };
+        let rb = cols.div_ceil(2);
+        for (j, &yj) in y.iter().enumerate() {
+            let row = 1 + j;
+            let wr = &data[row * rb..(row + 1) * rb];
+            let dot = dot_i4_f32_scalar(wr, &x, cols);
+            let expected = dot as f64 * scale[row] as f64;
+            assert!((yj as f64 - expected).abs() < 1e-3, "{yj} vs {expected}");
         }
     }
 

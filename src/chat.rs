@@ -26,6 +26,12 @@ pub struct LoadArgs {
     /// opt-in CACHE_ROUTE (see `moe::RouteConfig`) — off by default, matching colibrì's own
     /// stance, since it's still unmeasured on rabbit's own architecture.
     pub cache_route: bool,
+    /// Extra directories to scan for `.safetensors` shards, alongside `model_dir` — lets a
+    /// checkpoint's shards be split across separate drives (e.g. a second NVMe added for
+    /// capacity/bandwidth, without an OS-level RAID array — see `Shards::open_multi`'s doc).
+    /// `config.json`/tokenizer files still come from `model_dir` alone. Empty by default (every
+    /// shard in `model_dir`, matching every version of rabbit before this option existed).
+    pub shard_dirs: Vec<PathBuf>,
 }
 
 pub struct Session {
@@ -48,16 +54,20 @@ pub struct Session {
 }
 
 pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Error>> {
+    let mut shard_dirs = Vec::with_capacity(1 + args.shard_dirs.len());
+    shard_dirs.push(args.model_dir.clone());
+    shard_dirs.extend(args.shard_dirs.iter().cloned());
+
     eprintln!("loading model (dbits={}, ebits={})...", args.dbits, args.ebits);
     let t0 = std::time::Instant::now();
-    let mut model = Model::load(&args.model_dir, args.dbits, args.ebits)?;
+    let mut model = Model::load_multi(&shard_dirs, args.dbits, args.ebits)?;
     model.set_cache_route(args.cache_route);
     eprintln!("model loaded in {:.1}s ({} layers), cache_route={}", t0.elapsed().as_secs_f32(), model.n_layers(), args.cache_route);
 
     eprintln!("loading tokenizer...");
     let tokenizer = Tokenizer::load(&args.model_dir, &model)?;
 
-    let shards = Shards::open(&args.model_dir)?;
+    let shards = Shards::open_multi(&shard_dirs)?;
     let mut caches = ExpertCaches::new(&model, args.cache_capacity);
     let usage_cache_enabled = !args.no_usage_cache;
     if usage_cache_enabled {
