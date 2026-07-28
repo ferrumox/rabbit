@@ -20,7 +20,7 @@
 
 use crate::expert_cache::{ExpertCache, ExpertNaming};
 use crate::generate::{Phases, StepProfile};
-use crate::glm52::attention::{self, rmsnorm};
+use crate::glm52::attention::{self, rmsnorm, OutputGate};
 use crate::glm52::model::{Ffn, ModelError};
 use crate::glm52::moe;
 use crate::kernels::matmul_qt;
@@ -281,7 +281,7 @@ fn kda_step(cfg: &Cfg, w: &KdaWeights, state: &mut KdaLayerState, x: &[f32], out
     state.heads.par_iter_mut().zip(o.par_chunks_mut(head_dim)).enumerate().for_each(|(h, (head_state, o_slot))| {
         let sl = h * head_dim..(h + 1) * head_dim;
         let mut alpha = vec![0f32; head_dim];
-        decay_gate(w.a_log[h], &g[sl.clone()], &w.dt_bias[sl.clone()], &mut alpha);
+        decay_gate(w.a_log[h], &g[sl.clone()], &w.dt_bias[sl.clone()], None, &mut alpha);
         let beta = sigmoid(beta_pre[h]);
         head_state.step(&q[sl.clone()], &k[sl.clone()], &v[sl.clone()], &alpha, beta, o_slot);
         head_output_gate(o_slot, &w.o_norm, &g2[sl], eps);
@@ -326,7 +326,7 @@ fn layer_forward(
         }
         (Attn::Mla(w), LayerState::Mla(kv)) => {
             let (glm_cfg, dsa, absorb, rope, qproj) = model::mla_call_args(cfg);
-            attention::attention(&glm_cfg, w, kv, &nrm, s, pos_base, dsa, absorb, rope, qproj, &mut tmp);
+            attention::attention(&glm_cfg, w, kv, &nrm, s, pos_base, dsa, absorb, rope, qproj, OutputGate::Off, &mut tmp);
         }
         _ => unreachable!("Attn/LayerState variant mismatch -- KvState::new always pairs them per layer"),
     }
@@ -345,7 +345,7 @@ fn layer_forward(
     match &layer.ffn {
         Ffn::Dense(w) => {
             let t = std::time::Instant::now();
-            moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, &mut tmp);
+            moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, moe::Activation::Silu, &mut tmp);
             if let Some(p) = phases.as_deref_mut() {
                 p.expert_matmul_s += t.elapsed().as_secs_f32();
             }
@@ -354,7 +354,7 @@ fn layer_forward(
             let cache = caches.0[li].as_mut().expect("MoE layer must have an ExpertCache");
             let wait_before = cache.io_wait_nanos;
             let t = std::time::Instant::now();
-            moe::moe(&glm_cfg, w, cache, shards, li, model.ebits, &model.route_cfg, &nrm, s, &mut tmp)?;
+            moe::moe(&glm_cfg, w, cache, shards, li, model.ebits, &model.route_cfg, &nrm, s, moe::Activation::Silu, &mut tmp)?;
             let elapsed = t.elapsed().as_secs_f32();
             if let Some(p) = phases {
                 let wait_delta = ((cache.io_wait_nanos - wait_before) as f32 / 1e9).max(0.0);

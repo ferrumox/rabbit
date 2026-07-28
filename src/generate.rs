@@ -12,7 +12,7 @@
 //! here.
 
 use crate::expert_cache::{ExpertCache, ExpertNaming};
-use crate::glm52::attention::{self, Absorb, Dsa, DsaCache, KvCache, QProj, Rope, Selection};
+use crate::glm52::attention::{self, Absorb, Dsa, DsaCache, KvCache, OutputGate, QProj, Rope, Selection};
 use crate::glm52::config::Cfg;
 use crate::glm52::model::{Ffn, Model, ModelError};
 use crate::glm52::moe;
@@ -207,7 +207,7 @@ fn layer_forward(
         attention::rmsnorm(&mut nrm[si * d..(si + 1) * d], &layer.in_ln, cfg.eps);
     }
     let attn_t = std::time::Instant::now();
-    let fresh_selection = attention::attention(cfg, &layer.attn, kv_layer, &nrm, s, pos_base, dsa, Absorb::Auto, Rope::Interleaved, QProj::Lora, &mut tmp);
+    let fresh_selection = attention::attention(cfg, &layer.attn, kv_layer, &nrm, s, pos_base, dsa, Absorb::Auto, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut tmp);
     if let Some(p) = phases.as_deref_mut() {
         p.attention_s += attn_t.elapsed().as_secs_f32();
     }
@@ -222,7 +222,7 @@ fn layer_forward(
     match &layer.ffn {
         Ffn::Dense(w) => {
             let t = std::time::Instant::now();
-            moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, &mut tmp);
+            moe::dense_mlp(w, &nrm, s, cfg.dense_inter as usize, moe::Activation::Silu, &mut tmp);
             if let Some(p) = phases.as_deref_mut() {
                 p.expert_matmul_s += t.elapsed().as_secs_f32();
             }
@@ -231,7 +231,7 @@ fn layer_forward(
             let cache = caches.0[li].as_mut().expect("MoE layer must have an ExpertCache");
             let wait_before = cache.io_wait_nanos;
             let t = std::time::Instant::now();
-            moe::moe(cfg, w, cache, shards, li, model.ebits, &model.route_cfg, &nrm, s, &mut tmp)?;
+            moe::moe(cfg, w, cache, shards, li, model.ebits, &model.route_cfg, &nrm, s, moe::Activation::Silu, &mut tmp)?;
             let elapsed = t.elapsed().as_secs_f32();
             if let Some(p) = phases {
                 let wait_delta = ((cache.io_wait_nanos - wait_before) as f32 / 1e9).max(0.0);
@@ -759,7 +759,7 @@ mod tests {
                 Dsa::Off
             };
             let mut attn_out = vec![0f32; s * d];
-            let fresh = attention::attention(&model.cfg, &layer.attn, &mut kv_b.layers[li], &nrm, s, 0, dsa_mode, Absorb::Auto, Rope::Interleaved, QProj::Lora, &mut attn_out);
+            let fresh = attention::attention(&model.cfg, &layer.attn, &mut kv_b.layers[li], &nrm, s, 0, dsa_mode, Absorb::Auto, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut attn_out);
             if let Some(sel) = fresh {
                 last_selection = Some(sel);
             }
@@ -773,10 +773,10 @@ mod tests {
             }
             let mut ffn_out = vec![0f32; s * d];
             match &layer.ffn {
-                Ffn::Dense(w) => moe::dense_mlp(w, &nrm2, s, dm.dense_inter, &mut ffn_out),
+                Ffn::Dense(w) => moe::dense_mlp(w, &nrm2, s, dm.dense_inter, moe::Activation::Silu, &mut ffn_out),
                 Ffn::Moe(w) => {
                     let cache = caches_b.0[li].as_mut().unwrap();
-                    moe::moe(&model.cfg, w, cache, &shards, li, model.ebits, &model.route_cfg, &nrm2, s, &mut ffn_out).unwrap();
+                    moe::moe(&model.cfg, w, cache, &shards, li, model.ebits, &model.route_cfg, &nrm2, s, moe::Activation::Silu, &mut ffn_out).unwrap();
                 }
             }
             for (xi, &fi) in x_manual.iter_mut().zip(&ffn_out) {

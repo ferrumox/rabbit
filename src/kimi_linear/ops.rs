@@ -67,6 +67,28 @@ pub fn head_output_gate(o: &mut [f32], o_norm_weight: &[f32], g2: &[f32], eps: f
     }
 }
 
+/// Kimi K3's MLP gating activation (replaces plain `swish`-gated SwiGLU in `KimiMLP`/
+/// `KimiBlockSparseMLP` for K3-family checkpoints — confirmed against the real
+/// `SituAndMul` class in `moonshotai/Kimi-K3`'s `modeling_kimi_linear.py`, fetched 2026-07-27,
+/// not guessed from prose): `situ = beta*tanh(gate/beta)*sigmoid(gate)`, optionally
+/// `up = linear_beta*tanh(up/linear_beta)` first when `linear_beta` is set (K3's config always
+/// sets it — `activation_situ_beta: 4.0`, `activation_situ_linear_beta: 25.0` — `None` only
+/// covers a checkpoint that omits it), result written into `gate` in place
+/// (`gate[i] = situ[i] * up[i]`), matching `glm52::moe.rs::dense_mlp`'s
+/// `g[k] = siluf(g[k]) * u[k]` in-place convention. `up` is mutated in place too when
+/// `linear_beta` is set, since its transformed value (not the original) feeds the product.
+pub fn situ_and_mul(gate: &mut [f32], up: &mut [f32], beta: f32, linear_beta: Option<f32>) {
+    if let Some(lb) = linear_beta {
+        for u in up.iter_mut() {
+            *u = lb * (*u / lb).tanh();
+        }
+    }
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        let situ = beta * (*g / beta).tanh() * sigmoid(*g);
+        *g = situ * u;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +217,63 @@ mod tests {
         // RMSNorm([4,-4], w=[1,1]): mean(v^2)=16, r=1/4 -> normed=[1,-1]; * 0.5 -> [0.5,-0.5].
         assert!((gated[0] - 0.5).abs() < 1e-4);
         assert!((gated[1] - (-0.5)).abs() < 1e-4);
+    }
+
+    fn naive_situ_and_mul(gate: &[f32], up: &[f32], beta: f32, linear_beta: Option<f32>) -> Vec<f32> {
+        gate.iter()
+            .zip(up)
+            .map(|(&g, &u)| {
+                let situ = beta * (g / beta).tanh() * (1.0 / (1.0 + (-g).exp()));
+                let u = match linear_beta {
+                    Some(lb) => lb * (u / lb).tanh(),
+                    None => u,
+                };
+                situ * u
+            })
+            .collect()
+    }
+
+    #[test]
+    fn situ_and_mul_matches_naive_reference_with_linear_beta() {
+        let mut gate = vec![-3.0f32, -0.5, 0.0, 0.5, 3.0, 10.0];
+        let up = vec![2.0f32, -1.0, 4.0, -4.0, 0.1, 30.0];
+        let expected = naive_situ_and_mul(&gate, &up, 4.0, Some(25.0));
+        let mut up_mut = up.clone();
+        situ_and_mul(&mut gate, &mut up_mut, 4.0, Some(25.0));
+        for (a, b) in gate.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn situ_and_mul_matches_naive_reference_without_linear_beta() {
+        let mut gate = vec![-2.0f32, 0.0, 1.5];
+        let up = vec![3.0f32, -2.0, 0.5];
+        let expected = naive_situ_and_mul(&gate, &up, 4.0, None);
+        let mut up_mut = up.clone();
+        situ_and_mul(&mut gate, &mut up_mut, 4.0, None);
+        for (a, b) in gate.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        // No linear_beta: up must pass through unchanged.
+        assert_eq!(up_mut, up);
+    }
+
+    #[test]
+    fn situ_and_mul_at_zero_gate_is_zero_regardless_of_up() {
+        // gate=0 -> tanh(0)=0 -> situ=0 -> product is 0 no matter what up is.
+        let mut gate = vec![0.0f32, 0.0];
+        let mut up = vec![123.0f32, -456.0];
+        situ_and_mul(&mut gate, &mut up, 4.0, Some(25.0));
+        assert_eq!(gate, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn situ_and_mul_large_positive_gate_saturates_toward_beta_times_up() {
+        // gate >> beta -> tanh(gate/beta) -> 1, sigmoid(gate) -> 1 -> situ -> beta.
+        let mut gate = vec![1000.0f32];
+        let mut up = vec![2.0f32];
+        situ_and_mul(&mut gate, &mut up, 4.0, None);
+        assert!((gate[0] - 4.0 * 2.0).abs() < 1e-3, "got {}", gate[0]);
     }
 }

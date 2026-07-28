@@ -180,6 +180,19 @@ impl Cfg {
             None => return Err(ConfigError::UnsupportedArchitecture { found: None }),
         }
 
+        Self::from_fields(&r)
+    }
+
+    /// The field-parsing/validation half of `load`, taking an already-parsed `config.json`
+    /// object directly rather than reading a file — factored out so `kimi_k3::config::Cfg::load`
+    /// can reuse it against `config.json`'s nested `text_config` object (K3's real checkpoint has
+    /// `model_type: "kimi_k3"` at the top level and `text_config.model_type: "kimi_linear"`
+    /// underneath, with every field below this point identical in shape/name to a standalone
+    /// Kimi Linear checkpoint's top-level fields — confirmed against the real
+    /// `moonshotai/Kimi-K3/config.json`, fetched 2026-07-27). Does NOT check `model_type` itself
+    /// — callers are expected to have already confirmed they're looking at the right object
+    /// (`load` above does so for the top-level case; `kimi_k3`'s loader does so for both levels).
+    pub(crate) fn from_fields(r: &Value) -> Result<Cfg, ConfigError> {
         if r.get("mla_use_nope").and_then(Value::as_bool) == Some(false) {
             return Err(ConfigError::RopeNotSupported);
         }
@@ -190,9 +203,9 @@ impl Cfg {
             return Err(ConfigError::UnsupportedRouterActivation { found: activation.to_string() });
         }
 
-        let n_layers = gi(&r, "num_hidden_layers");
-        let qk_nope = gi(&r, "qk_nope_head_dim");
-        let qk_rope = gi(&r, "qk_rope_head_dim");
+        let n_layers = gi(r, "num_hidden_layers");
+        let qk_nope = gi(r, "qk_nope_head_dim");
+        let qk_rope = gi(r, "qk_rope_head_dim");
         let qk_head = qk_nope + qk_rope;
 
         let norm_topk = r.get("moe_renormalize").and_then(Value::as_bool).unwrap_or(false);
@@ -252,32 +265,32 @@ impl Cfg {
             is_kda.push(!is_full_attn);
         }
 
-        let n_group = gi(&r, "num_expert_group").max(1);
-        let n_experts = gi(&r, "num_experts");
-        let topk_group = gi(&r, "topk_group").max(1);
+        let n_group = gi(r, "num_expert_group").max(1);
+        let n_experts = gi(r, "num_experts");
+        let topk_group = gi(r, "topk_group").max(1);
         if n_experts % n_group != 0 {
             return Err(ConfigError::InvalidGrouping { n_experts, n_group });
         }
 
         let c = Cfg {
-            hidden: gi(&r, "hidden_size"),
+            hidden: gi(r, "hidden_size"),
             n_layers,
-            n_heads: gi(&r, "num_attention_heads"),
-            first_dense: gi(&r, "first_k_dense_replace"),
-            q_lora: gi(&r, "q_lora_rank"),
-            kv_lora: gi(&r, "kv_lora_rank"),
+            n_heads: gi(r, "num_attention_heads"),
+            first_dense: gi(r, "first_k_dense_replace"),
+            q_lora: gi(r, "q_lora_rank"),
+            kv_lora: gi(r, "kv_lora_rank"),
             qk_nope,
             qk_rope,
             qk_head,
-            v_head: gi(&r, "v_head_dim"),
+            v_head: gi(r, "v_head_dim"),
             n_experts,
-            topk: gi(&r, "num_experts_per_token"),
-            n_shared: gi(&r, "num_shared_experts"),
+            topk: gi(r, "num_experts_per_token"),
+            n_shared: gi(r, "num_shared_experts"),
             n_group,
             topk_group,
-            moe_inter: gi(&r, "moe_intermediate_size"),
-            dense_inter: gi(&r, "intermediate_size"),
-            vocab: gi(&r, "vocab_size"),
+            moe_inter: gi(r, "moe_intermediate_size"),
+            dense_inter: gi(r, "intermediate_size"),
+            vocab: gi(r, "vocab_size"),
             norm_topk,
             eps,
             theta,

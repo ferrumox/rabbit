@@ -1,8 +1,10 @@
 [package]
 name = "rabbit"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
-description = "A Rust inference engine for GLM-5.2 (744B-parameter MoE), streaming routed experts from disk on demand"
+description = "A Rust inference engine for GLM-5.2, Kimi Linear, and Kimi K3 (2.8T-parameter MoE), streaming routed experts from disk on demand"
+repository = "https://github.com/ferrumox/rabbit"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

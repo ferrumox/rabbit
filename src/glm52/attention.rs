@@ -23,7 +23,12 @@ use crate::glm52::model::{AttnWeights, DsaWeights};
 #[cfg(target_arch = "x86_64")]
 use crate::kernels::{axpy_f32_avx2, dot_f32_avx2};
 use crate::kernels::{matmul_qt, qt_addrow, qt_matvec_rows};
+use crate::quant::QT;
 use rayon::prelude::*;
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
 
 pub fn rmsnorm(v: &mut [f32], w: &[f32], eps: f32) {
     let n = v.len() as f64;
@@ -241,6 +246,21 @@ pub enum QProj {
     Direct,
 }
 
+/// K3-only: `attn_output = attn_output * sigmoid(g_proj(hidden_states))`, applied right before
+/// `o_proj` (`w.o`) — confirmed against the real `KimiMLAAttention.forward` (`modeling_kimi_
+/// linear.py`, `moonshotai/Kimi-K3`, fetched 2026-07-27): `if self.use_output_gate: g =
+/// self.g_proj(hidden_states).sigmoid(); attn_output = attn_output * g`, gated on
+/// `mla_use_output_gate` (absent/`false` on every checkpoint this attention() already serves —
+/// GLM-5.2 and Kimi Linear 48B both pass `Off`, zero behavior change). `hidden_states` there is
+/// exactly `attention()`'s own `x` parameter (both real callers pass the POST-`input_layernorm`
+/// value — confirmed via `_forward_attn_residual`'s own call order), and `g_proj`'s output width
+/// (`n_heads * v_head_dim`) matches `ctx`'s width exactly, so the gate applies elementwise
+/// against `ctx` before `w.o`'s matmul, not as a separate post-`o_proj` step.
+pub enum OutputGate<'a> {
+    Off,
+    On(&'a QT),
+}
+
 /// Computes the DSA lightning indexer's key embeddings for the new tokens (always) and a
 /// top-k selection (only when the context already exceeds `index_topk`, or `force`).
 /// Mirrors the C's parameter list 1:1 — bundling these into a struct would just move the
@@ -357,6 +377,7 @@ pub fn attention(
     absorb: Absorb,
     rope: Rope,
     qproj: QProj,
+    output_gate: OutputGate,
     out: &mut [f32],
 ) -> Option<Selection> {
     let h = cfg.n_heads as usize;
@@ -548,6 +569,14 @@ pub fn attention(
         }
     }
 
+    if let OutputGate::On(g_proj) = output_gate {
+        let mut g = vec![0f32; s * h * vh];
+        matmul_qt(&mut g, x, g_proj, s);
+        for (c, gi) in ctx.iter_mut().zip(&g) {
+            *c *= sigmoid(*gi);
+        }
+    }
+
     matmul_qt(out, &ctx, &w.o, s);
     if computed_fresh { selection } else { None }
 }
@@ -718,11 +747,11 @@ mod tests {
 
         let mut kv_a = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_absorb = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Interleaved, QProj::Lora, &mut out_absorb);
+        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut out_absorb);
 
         let mut kv_d = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_dense = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, &mut out_dense);
+        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut out_dense);
 
         for (a, b) in out_absorb.iter().zip(&out_dense) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
@@ -754,11 +783,11 @@ mod tests {
 
         let mut kv_a = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_absorb = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Interleaved, QProj::Direct, &mut out_absorb);
+        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Interleaved, QProj::Direct, OutputGate::Off, &mut out_absorb);
 
         let mut kv_d = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_dense = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, &mut out_dense);
+        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, OutputGate::Off, &mut out_dense);
 
         for (a, b) in out_absorb.iter().zip(&out_dense) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
@@ -778,7 +807,7 @@ mod tests {
 
         let mut kv1 = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_before = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv1, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, &mut out_before);
+        attention(&cfg, &w, &mut kv1, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, OutputGate::Off, &mut out_before);
 
         w.q_a_ln = vec![f32::NAN; w.q_a_ln.len()];
         let mut junk_seed = 12345;
@@ -786,7 +815,7 @@ mod tests {
 
         let mut kv2 = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_after = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv2, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, &mut out_after);
+        attention(&cfg, &w, &mut kv2, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Direct, OutputGate::Off, &mut out_after);
 
         assert_eq!(out_before, out_after, "QProj::Direct must never read q_a_ln (NaN'd) or q_b (reshaped+randomized)");
     }
@@ -805,11 +834,11 @@ mod tests {
 
         let mut kv_a = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_absorb = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Off, QProj::Lora, &mut out_absorb);
+        attention(&cfg, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Always, Rope::Off, QProj::Lora, OutputGate::Off, &mut out_absorb);
 
         let mut kv_d = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_dense = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_dense);
+        attention(&cfg, &w, &mut kv_d, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, OutputGate::Off, &mut out_dense);
 
         for (a, b) in out_absorb.iter().zip(&out_dense) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
@@ -831,11 +860,11 @@ mod tests {
 
         let mut kv_on = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_on = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_on, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, &mut out_on);
+        attention(&cfg, &w, &mut kv_on, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut out_on);
 
         let mut kv_off = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_off = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_off, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_off);
+        attention(&cfg, &w, &mut kv_off, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, OutputGate::Off, &mut out_off);
 
         let differs = out_on.iter().zip(&out_off).any(|(a, b)| (a - b).abs() > 1e-4);
         assert!(differs, "Rope::Off must produce different output than Rope::Interleaved");
@@ -859,13 +888,67 @@ mod tests {
 
         let mut kv_a = KvCache::new(cfg_a.kv_lora as usize, cfg_a.qk_rope as usize);
         let mut out_a = vec![0.0; s * d];
-        attention(&cfg_a, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_a);
+        attention(&cfg_a, &w, &mut kv_a, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, OutputGate::Off, &mut out_a);
 
         let mut kv_b = KvCache::new(cfg_b.kv_lora as usize, cfg_b.qk_rope as usize);
         let mut out_b = vec![0.0; s * d];
-        attention(&cfg_b, &w, &mut kv_b, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, &mut out_b);
+        attention(&cfg_b, &w, &mut kv_b, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Off, QProj::Lora, OutputGate::Off, &mut out_b);
 
         assert_eq!(out_a, out_b, "theta must be irrelevant when Rope::Off");
+    }
+
+    #[test]
+    fn output_gate_on_differs_from_off() {
+        let cfg = tiny_cfg();
+        let mut seed = 71;
+        let w = tiny_attn_weights(&cfg, &mut seed);
+        let s = 2;
+        let d = cfg.hidden as usize;
+        let h = cfg.n_heads as usize;
+        let v_head = cfg.v_head as usize;
+        let x = random_vec(s * d, &mut seed);
+        let g_proj = random_qt_f32(h * v_head, d, &mut seed);
+
+        let mut kv_off = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_off = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_off, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut out_off);
+
+        let mut kv_on = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_on = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_on, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::On(&g_proj), &mut out_on);
+
+        let differs = out_on.iter().zip(&out_off).any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(differs, "OutputGate::On must produce different output than Off");
+    }
+
+    #[test]
+    fn output_gate_with_a_zero_weight_g_proj_scales_output_by_exactly_half() {
+        // g_proj is an all-zero matrix -> g_proj(x) = 0 for every row, regardless of x ->
+        // sigmoid(0) = 0.5 uniformly -> ctx gets scaled by a flat 0.5 before w.o's matmul, and
+        // since that matmul is linear, the FINAL output must also be exactly half of the
+        // ungated output -- a hand-computable anchor, same spirit as ops.rs's
+        // head_output_gate_matches_hand_computed_half_open_gate.
+        let cfg = tiny_cfg();
+        let mut seed = 73;
+        let w = tiny_attn_weights(&cfg, &mut seed);
+        let s = 2;
+        let d = cfg.hidden as usize;
+        let h = cfg.n_heads as usize;
+        let v_head = cfg.v_head as usize;
+        let x = random_vec(s * d, &mut seed);
+        let g_proj = { let mut t = QT::alloc(h * v_head, d, 32, false); t.fill(&vec![0.0; h * v_head * d]); t };
+
+        let mut kv_off = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_off = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_off, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut out_off);
+
+        let mut kv_on = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let mut out_on = vec![0.0; s * d];
+        attention(&cfg, &w, &mut kv_on, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::On(&g_proj), &mut out_on);
+
+        for (a, b) in out_on.iter().zip(&out_off) {
+            assert!((a - 0.5 * b).abs() < 1e-4, "{a} vs {}", 0.5 * b);
+        }
     }
 
     #[test]
@@ -886,7 +969,7 @@ mod tests {
 
         let mut kv_plain = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut out_plain = vec![0.0; s * d];
-        attention(&cfg, &w, &mut kv_plain, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, &mut out_plain);
+        attention(&cfg, &w, &mut kv_plain, &x, s, 0, Dsa::Off, Absorb::Never, Rope::Interleaved, QProj::Lora, OutputGate::Off, &mut out_plain);
 
         let mut kv_dsa = KvCache::new(cfg.kv_lora as usize, cfg.qk_rope as usize);
         let mut dsa_cache = DsaCache::new(cfg.index_hd as usize);
@@ -902,6 +985,7 @@ mod tests {
             Absorb::Never,
             Rope::Interleaved,
             QProj::Lora,
+            OutputGate::Off,
             &mut out_dsa,
         );
         assert!(sel.is_some(), "Dsa::Compute must return the freshly computed selection");

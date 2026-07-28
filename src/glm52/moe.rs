@@ -34,17 +34,60 @@ fn siluf(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// The 3 dense layers before `first_k_dense_replace`: plain SiLU-gated MLP, no routing.
-/// `hidden` isn't a parameter here (unlike the C's `dense_mlp`, which takes but never uses
-/// `D`) — the output width is already fixed by `down_proj`'s shape.
-pub fn dense_mlp(w: &DenseMlpWeights, x: &[f32], s: usize, i: usize, out: &mut [f32]) {
+/// MLP gating activation choice — threaded through `dense_mlp`, `apply_single_expert`, and
+/// `moe()`'s own inline shared-expert compute, the three places this project's MLP gating math
+/// is duplicated for different callers (dense-only, per-routed-expert, shared-expert). `Silu` is
+/// GLM-5.2's and Kimi Linear 48B's `siluf(gate)*up` (every existing caller, zero behavior
+/// change). `Situ` is Kimi K3's `SituAndMul` (`beta*tanh(gate/beta)*sigmoid(gate) *
+/// [linear_beta*tanh(up/linear_beta) if set else up]` — same formula as
+/// `kimi_linear::ops::situ_and_mul`, duplicated here rather than imported: `glm52` is the shared
+/// base every architecture module builds on, so a dependency the other direction — `glm52`
+/// reaching into `kimi_linear` — would invert that, the same reasoning `ops.rs`'s own
+/// `swish`/`rmsnorm` doc comments give for why THEY duplicate a `glm52` primitive instead of
+/// sharing it).
+#[derive(Clone, Copy)]
+pub enum Activation {
+    Silu,
+    Situ { beta: f32, linear_beta: Option<f32> },
+}
+
+impl Activation {
+    /// The single-element gating formula — `apply_single_expert`'s `Fused` gate_up branch reads
+    /// gate/up from two positions within the SAME contiguous row buffer (not two separate
+    /// slices), so it calls this directly per-element rather than through `apply` below.
+    fn combine(self, g: f32, u: f32) -> f32 {
+        match self {
+            Activation::Silu => siluf(g) * u,
+            Activation::Situ { beta, linear_beta } => {
+                let u = match linear_beta {
+                    Some(lb) => lb * (u / lb).tanh(),
+                    None => u,
+                };
+                let situ = beta * (g / beta).tanh() * (1.0 / (1.0 + (-g).exp()));
+                situ * u
+            }
+        }
+    }
+
+    /// `gate[i] = combine(gate[i], up[i])`, applied in place across two separate contiguous
+    /// buffers — matches every existing call site's `g[k] = siluf(g[k]) * u[k]` convention
+    /// (result written into the gate buffer).
+    fn apply(self, gate: &mut [f32], up: &[f32]) {
+        for (g, &u) in gate.iter_mut().zip(up) {
+            *g = self.combine(*g, u);
+        }
+    }
+}
+
+/// The 3 dense layers before `first_k_dense_replace`: a SiLU- or Situ-gated MLP (see
+/// `Activation`), no routing. `hidden` isn't a parameter here (unlike the C's `dense_mlp`, which
+/// takes but never uses `D`) — the output width is already fixed by `down_proj`'s shape.
+pub fn dense_mlp(w: &DenseMlpWeights, x: &[f32], s: usize, i: usize, activation: Activation, out: &mut [f32]) {
     let mut g = vec![0f32; s * i];
     let mut u = vec![0f32; s * i];
     matmul_qt(&mut g, x, &w.gate_proj, s);
     matmul_qt(&mut u, x, &w.up_proj, s);
-    for k in 0..s * i {
-        g[k] = siluf(g[k]) * u[k];
-    }
+    activation.apply(&mut g, &u);
     matmul_qt(out, &g, &w.down_proj, s);
 }
 
@@ -282,7 +325,12 @@ fn cache_route_select(choice: &[f32], logit: &[f32], k: usize, cache: &ExpertCac
 /// Distinct expert ids across the whole batch's routing, in first-occurrence order — loaded
 /// (or cache-hit) once each and applied to every row that picked them, instead of once per
 /// (token, k-slot) pair.
-fn unique_experts(routing: &Routing) -> Vec<usize> {
+///
+/// `pub(crate)`, not private: `kimi_k3::moe`'s latent-MoE wrapper (routed experts operate at a
+/// narrower width than the model's real hidden size — see that module's doc) reuses this
+/// directly instead of duplicating the dedup, rather than reimplementing/re-tuning this
+/// perf-critical function's own dispatch loop for a second, differently-shaped case.
+pub(crate) fn unique_experts(routing: &Routing) -> Vec<usize> {
     let mut seen = std::collections::HashSet::new();
     let mut uniq = Vec::new();
     for choices in &routing.choices {
@@ -309,6 +357,7 @@ pub fn moe(
     route_cfg: &RouteConfig,
     x: &[f32],
     s: usize,
+    activation: Activation,
     out: &mut [f32],
 ) -> Result<(), ModelError> {
     let d = cfg.hidden as usize;
@@ -360,9 +409,7 @@ pub fn moe(
     let mut su = vec![0f32; s * s_i];
     matmul_qt(&mut sg, x, &w.sh_gate, s);
     matmul_qt(&mut su, x, &w.sh_up, s);
-    for z in 0..s * s_i {
-        sg[z] = siluf(sg[z]) * su[z];
-    }
+    activation.apply(&mut sg, &su);
     let mut hh = vec![0f32; s * d];
     matmul_qt(&mut hh, &sg, &w.sh_down, s);
 
@@ -379,15 +426,15 @@ pub fn moe(
     if let (Some(chunk), Some(pending)) = (first_chunk, pending) {
         for &eid in chunk {
             if let Some(slot) = cache.get(eid) {
-                apply_single_expert(slot, &routing, x, d, i, out);
+                apply_single_expert(slot, &routing, x, d, i, activation, out);
             }
         }
         cache.finish_loading_streaming(pending, shards, cfg, layer, ebits, |slot| {
-            apply_single_expert(slot, &routing, x, d, i, out);
+            apply_single_expert(slot, &routing, x, d, i, activation, out);
         })?;
     }
     for chunk in chunks {
-        dispatch_chunk_streaming(cache, shards, cfg, layer, chunk, ebits, &routing, x, d, i, out)?;
+        dispatch_chunk_streaming(cache, shards, cfg, layer, chunk, ebits, &routing, x, d, i, activation, out)?;
     }
 
     // shared expert's contribution, added last — same relative accumulation order into `out`
@@ -404,8 +451,13 @@ pub fn moe(
 /// `apply_expert_chunk` used to loop over a whole chunk with; split out so it can be called
 /// either from that loop (hits, already resident) or from `finish_loading_streaming`'s
 /// per-expert callback (misses, as each one's reads land) without waiting for its neighbors.
+///
+/// `pub(crate)`, not private, for the same reason as `unique_experts` above — `kimi_k3::moe`
+/// calls this directly against its own down-projected `x`/narrower `d`/latent-width `out` buffer,
+/// getting the exact same tested `Separate`-vs-`Fused` gate_up matmul logic for free instead of
+/// duplicating it.
 #[allow(clippy::too_many_arguments)]
-fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize, i: usize, out: &mut [f32]) {
+pub(crate) fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize, i: usize, activation: Activation, out: &mut [f32]) {
     let eid = slot.eid;
     let rows: Vec<(usize, f32)> = routing
         .choices
@@ -429,9 +481,7 @@ fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize
             let mut uu = vec![0f32; nr * i];
             matmul_qt(&mut gg, &xg, gate, nr);
             matmul_qt(&mut uu, &xg, up, nr);
-            for z in 0..nr * i {
-                gg[z] = siluf(gg[z]) * uu[z];
-            }
+            activation.apply(&mut gg, &uu);
         }
         // One matmul against the fused `[2*i, d]` weight instead of two against `[i, d]` each —
         // `gu`'s row layout matches `matmul`'s `y[S,O]` convention (`O = 2*i`), so each row's
@@ -444,7 +494,7 @@ fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize
             for r in 0..nr {
                 let row = &gu[r * 2 * i..(r + 1) * 2 * i];
                 for k in 0..i {
-                    gg[r * i + k] = siluf(row[k]) * row[i + k];
+                    gg[r * i + k] = activation.combine(row[k], row[i + k]);
                 }
             }
         }
@@ -477,16 +527,17 @@ fn dispatch_chunk_streaming(
     x: &[f32],
     d: usize,
     i: usize,
+    activation: Activation,
     out: &mut [f32],
 ) -> Result<(), ModelError> {
     let pending = cache.begin_loading(shards, cfg, layer, chunk, ebits)?;
     for &eid in chunk {
         if let Some(slot) = cache.get(eid) {
-            apply_single_expert(slot, routing, x, d, i, out);
+            apply_single_expert(slot, routing, x, d, i, activation, out);
         }
     }
     cache.finish_loading_streaming(pending, shards, cfg, layer, ebits, |slot| {
-        apply_single_expert(slot, routing, x, d, i, out);
+        apply_single_expert(slot, routing, x, d, i, activation, out);
     })
 }
 
@@ -561,9 +612,9 @@ mod tests {
         let routing = Routing { choices: vec![vec![(0, 0.6)], vec![(0, 1.3)], vec![(0, -0.4)]] };
 
         let mut out_separate = vec![0f32; 3 * d];
-        apply_single_expert(&separate_slot, &routing, &x, d, i, &mut out_separate);
+        apply_single_expert(&separate_slot, &routing, &x, d, i, Activation::Silu, &mut out_separate);
         let mut out_fused = vec![0f32; 3 * d];
-        apply_single_expert(&fused_slot, &routing, &x, d, i, &mut out_fused);
+        apply_single_expert(&fused_slot, &routing, &x, d, i, Activation::Silu, &mut out_fused);
 
         // Splitting a matmul's OUTPUT columns per row (what the fused path does) doesn't
         // reassociate any single row's dot product -- same bytes, same accumulation order per
@@ -746,12 +797,12 @@ mod tests {
 
         let mut cache_off = ExpertCache::new(n_experts);
         let mut out_off = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache_off, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out_off).unwrap();
+        moe(&cfg, &w, &mut cache_off, &shards, 0, 32, &RouteConfig::default(), &x, s, Activation::Silu, &mut out_off).unwrap();
 
         let mut cache_on = ExpertCache::new(n_experts);
         let mut out_on = vec![0f32; s * hidden];
         let route_cfg = RouteConfig { cache_route: true, route_j: 2, route_m: 12 };
-        moe(&cfg, &w, &mut cache_on, &shards, 0, 32, &route_cfg, &x, s, &mut out_on).unwrap();
+        moe(&cfg, &w, &mut cache_on, &shards, 0, 32, &route_cfg, &x, s, Activation::Silu, &mut out_on).unwrap();
 
         for (a, b) in out_off.iter().zip(&out_on) {
             assert!((a - b).abs() < 1e-6, "{a} vs {b}");
@@ -771,7 +822,7 @@ mod tests {
         let x = random_vec(d, &mut seed);
 
         let mut out = vec![0f32; d];
-        dense_mlp(&w, &x, 1, i, &mut out);
+        dense_mlp(&w, &x, 1, i, Activation::Silu, &mut out);
 
         // hand-reference using the same primitives, computed independently of dense_mlp's body.
         let mut g = vec![0f32; i];
@@ -783,6 +834,84 @@ mod tests {
         matmul_qt(&mut expected, &gated, &w.down_proj, 1);
 
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn dense_mlp_with_situ_activation_matches_a_naive_independent_reference() {
+        // Kimi K3's activation (see Activation::Situ's doc) -- an independent re-derivation of
+        // the formula (not reusing Activation::combine), with a linear_beta transform on `up`.
+        let mut seed = 5;
+        let d = 4;
+        let i = 3;
+        let w = DenseMlpWeights {
+            gate_proj: random_qt_f32(i, d, &mut seed),
+            up_proj: random_qt_f32(i, d, &mut seed),
+            down_proj: random_qt_f32(d, i, &mut seed),
+        };
+        let x = random_vec(d, &mut seed);
+        let beta = 4.0f32;
+        let linear_beta = 25.0f32;
+
+        let mut out = vec![0f32; d];
+        dense_mlp(&w, &x, 1, i, Activation::Situ { beta, linear_beta: Some(linear_beta) }, &mut out);
+
+        let mut g = vec![0f32; i];
+        let mut u = vec![0f32; i];
+        matmul_qt(&mut g, &x, &w.gate_proj, 1);
+        matmul_qt(&mut u, &x, &w.up_proj, 1);
+        let gated: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(&gv, &uv)| {
+                let situ = beta * (gv / beta).tanh() * (1.0 / (1.0 + (-gv).exp()));
+                let uv2 = linear_beta * (uv / linear_beta).tanh();
+                situ * uv2
+            })
+            .collect();
+        let mut expected = vec![0f32; d];
+        matmul_qt(&mut expected, &gated, &w.down_proj, 1);
+
+        for (a, b) in out.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        // Must genuinely differ from the plain SiLU path against the same weights/input.
+        let mut out_silu = vec![0f32; d];
+        dense_mlp(&w, &x, 1, i, Activation::Silu, &mut out_silu);
+        assert_ne!(out, out_silu);
+    }
+
+    #[test]
+    fn apply_single_expert_with_situ_activation_fused_matches_separate() {
+        // Same cross-check as apply_single_expert_fused_gate_up_matches_separate_bit_exact
+        // above, but with Activation::Situ instead of the default Silu -- proves the Fused
+        // branch's per-element Activation::combine call (not Activation::apply, since Fused
+        // reads gate/up from one shared row buffer) agrees with the Separate branch's.
+        let (d, i) = (6usize, 8usize);
+        let mut seed = 8u32;
+        let gate = random_qt_f32(i, d, &mut seed);
+        let up = random_qt_f32(i, d, &mut seed);
+        let down_vals = random_vec(d * i, &mut seed);
+        let down_for_separate = { let mut t = QT::alloc(d, i, 32, false); t.fill(&down_vals); t };
+        let down_for_fused = { let mut t = QT::alloc(d, i, 32, false); t.fill(&down_vals); t };
+
+        let mut fused_vals = qt_rows_f32(&gate, i);
+        fused_vals.extend(qt_rows_f32(&up, i));
+        let mut gate_up = QT::alloc(2 * i, d, 32, false);
+        gate_up.fill(&fused_vals);
+
+        let separate_slot = ExpertSlot::new_for_test(0, GateUp::Separate { gate, up }, down_for_separate);
+        let fused_slot = ExpertSlot::new_for_test(0, GateUp::Fused { gate_up }, down_for_fused);
+
+        let x = random_vec(3 * d, &mut seed);
+        let routing = Routing { choices: vec![vec![(0, 0.6)], vec![(0, 1.3)], vec![(0, -0.4)]] };
+        let activation = Activation::Situ { beta: 4.0, linear_beta: Some(25.0) };
+
+        let mut out_separate = vec![0f32; 3 * d];
+        apply_single_expert(&separate_slot, &routing, &x, d, i, activation, &mut out_separate);
+        let mut out_fused = vec![0f32; 3 * d];
+        apply_single_expert(&fused_slot, &routing, &x, d, i, activation, &mut out_fused);
+
+        assert_eq!(out_separate, out_fused);
     }
 
     #[test]
@@ -954,7 +1083,7 @@ mod tests {
 
         let mut cache = ExpertCache::new(n_experts);
         let mut out = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out).unwrap();
+        moe(&cfg, &w, &mut cache, &shards, 0, 32, &RouteConfig::default(), &x, s, Activation::Silu, &mut out).unwrap();
 
         // independent reference: route (to get weights) + sum every expert directly, bypassing moe()'s dispatch.
         let routing = route(&cfg, &w, &x, s);
@@ -1057,12 +1186,12 @@ mod tests {
 
         let mut cache_unpinned = ExpertCache::new(n_experts);
         let mut out_unpinned = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache_unpinned, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out_unpinned).unwrap();
+        moe(&cfg, &w, &mut cache_unpinned, &shards, 0, 32, &RouteConfig::default(), &x, s, Activation::Silu, &mut out_unpinned).unwrap();
 
         let mut cache_pinned = ExpertCache::new(n_experts);
         cache_pinned.mark_pin_candidates(std::iter::once(0usize)); // lazy: promotes on moe()'s own first load of it
         let mut out_pinned = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache_pinned, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out_pinned).unwrap();
+        moe(&cfg, &w, &mut cache_pinned, &shards, 0, 32, &RouteConfig::default(), &x, s, Activation::Silu, &mut out_pinned).unwrap();
         assert!(cache_pinned.is_pinned(0), "topk==n_experts guarantees moe() touched expert 0, so it must have been promoted");
 
         for (a, b) in out_unpinned.iter().zip(&out_pinned) {
@@ -1133,7 +1262,7 @@ mod tests {
         // capacity (3) < uniq.len() (8, since topk==n_experts) -> forces moe() to chunk.
         let mut cache = ExpertCache::new(3);
         let mut out = vec![0f32; s * hidden];
-        moe(&cfg, &w, &mut cache, &shards, 0, 32, &RouteConfig::default(), &x, s, &mut out).unwrap();
+        moe(&cfg, &w, &mut cache, &shards, 0, 32, &RouteConfig::default(), &x, s, Activation::Silu, &mut out).unwrap();
 
         let routing = route(&cfg, &w, &x, s);
         let mut expected = vec![0f32; s * hidden];

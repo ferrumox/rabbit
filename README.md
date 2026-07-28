@@ -1,77 +1,127 @@
 <p align="center">
-  <img src="assets/rabbit.svg" width="500" alt="rabbit — small hops, immense model">
+  <img src="assets/rabbit.svg" width="500" alt="rabbit — small hops, immense models">
 </p>
 
-**Small hops, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a single machine by keeping the dense part resident in RAM at int4 and streaming the 21,504 routed experts from disk on demand — a Rust reimplementation of [colibrì](https://github.com/JustVugg/colibri)'s C engine.
+**Small hops, immense models.** A Rust engine that runs frontier open-weight MoE models on a
+single machine. The dense part stays resident in RAM; the routed experts stream from disk on
+demand.
+
+Moonshot AI published **Kimi K3** on 2026-07-27, a 2.8-trillion-parameter Mixture-of-Experts
+model and one of the largest open-weight releases so far. rabbit runs it the next day, straight
+off Moonshot's published checkpoint. No conversion step.
 
 ```
-$ rabbit --model /nvme/glm52_i4 --prompt "The capital of France is"
-prompt: 6 tokens
-prefill (6 tokens)...
-  prefill done in 4.2s (expert cache: 12 hits, 468 misses, 3.1s in disk I/O)
-  token 1/64 in 2.1s (1.4s in disk I/O this step; expert cache totals: 20 hits, 476 misses)
+$ rabbit --model /mnt/data/kimi-k3 --prompt "What is the capital of France?" --max-tokens 40
+loading model (dbits=4, ebits=4)...
+model loaded in 610.0s (93 layers, 896 experts/layer)
+prefill (7 tokens)...
+  prefill done in 412.8s
   ...
- Paris. It is located in the north of the country...
+...response["answer"] == "Paris"...
+
+40 tokens in 2698.1s
 ```
+
+Correctness validated three ways before that run. Bit-exact against a random-weight instance of
+Moonshot's own PyTorch reference (teacher-forcing, every position, `tests/teacher_forcing_k3.rs`).
+A structural smoke test against the real 1.56TB checkpoint (`examples/k3_smoke.rs`). And the real
+prompt above, answered correctly. No performance work has landed for K3 yet; the numbers above
+are correctness-first, not tuned. rabbit's other architecture, GLM-5.2, started from a similarly
+slow floor and is now 3.5× faster across eight measured versions. See
+[Honest numbers](#honest-numbers-ryzen-ai-9-hx-370-12-cores24-threads) and `PERFORMANCE.md`.
+
+K3 brings Kimi Delta Attention plus a Gated MLA hybrid, Stable LatentMoE (routed experts compute
+in a narrower latent width, not the full hidden size), Attention Residuals (a transient
+block-pooling mechanism across layers), and native OCP MXFP4 quantization for its 896
+experts/layer. rabbit reads that MXFP4 straight off disk, byte for byte, no requantization.
 
 ## The idea
 
-A 744B-parameter MoE model activates only ~40B parameters per token, and only a fraction of
-those change token to token (the routed experts). So:
+A large MoE model activates a small fraction of its parameters per token, and only the routed
+experts change token to token. So, across every architecture rabbit runs:
 
-- the **dense part** (attention, shared expert, embeddings) stays **resident in RAM at int4**;
-- the **21,504 routed experts** (75 MoE layers × 256 experts, ~19 MB each at int4) live **on
-  disk** and are **streamed on demand**, via a per-layer LRU cache, a persistent learned pin for
-  the hottest ones, and the OS page cache as a free extra tier.
+- the **dense part** (attention, shared experts, embeddings) stays **resident in RAM**, quantized;
+- the **routed experts**, thousands of them, tens of MB each, live **on disk** and are
+  **streamed on demand**, through a per-layer LRU cache, a persistent learned pin for the
+  hottest ones, and the OS page cache as a free extra tier.
+
+## Architectures
+
+| | Kimi K3 | Kimi Linear 48B | GLM-5.2 |
+|---|---|---|---|
+| total / active params | 2.8T / not yet characterized | 48B / ~3B | 744B / ~40B |
+| attention | KDA + Gated MLA, extra output gates | Kimi Delta Attention + Gated MLA | MLA + DSA sparse indexer |
+| MoE routing | Stable LatentMoE (narrower latent width), shared experts | grouped routing, shared experts | `noaux_tc` sigmoid, shared expert |
+| native quantization read | OCP MXFP4 (routed experts) | BF16 | FP8 (E4M3, block-scale) |
+| checkpoint | Moonshot's real release | Moonshot's real release | pre-converted by colibrì's tooling |
+| status | correctness-validated, perf work pending | tuned (`--session`, real chat) | fully tuned, 8 versions of perf work |
+
+One `Model`/`KvState`/`ExpertCaches` family-dispatch enum in `src/model.rs` routes to the right
+architecture from `config.json`'s `model_type`. `--chat`/`--serve`/`--prompt`/`--session` all
+work the same way across the three.
 
 ## What's implemented
 
-- **Faithful GLM-5.2 (`glm_moe_dsa`) forward** — validated token-exact against a synthetic
-  oracle (32/32 teacher-forcing, 20/20 greedy decode) and against the real 744B checkpoint.
+- **Faithful forward pass for all three architectures.** Validated token-exact against a
+  synthetic oracle built from each model family's own real reference code, plus real-checkpoint
+  validation for each.
 - **MLA attention** with **weight absorption** for decode (no per-token k/v reconstruction) and
-  dense reconstruction for prefill — validated exact against each other, and parallelized with
-  `rayon` across attention heads.
-- **DSA sparse attention** — the lightning indexer, with selection sharing between "full" and
-  "shared" layers across a forward pass.
-- **`noaux_tc` sigmoid MoE router** with correction bias, shared expert, batch-union expert
-  dispatch (each unique expert in a batch is read and applied once).
-- **int4/int8/int2 quantization**, native **FP8** (E4M3, block-scale) checkpoint loading, and a
-  **`.qs` pre-quantized fast path** — no external converter needed for any of the three.
+  dense reconstruction for prefill, parallelized with `rayon` across attention heads.
+- **DSA sparse attention** (GLM-5.2's lightning indexer) and **Kimi Delta Attention** (KDA's
+  chunked recurrence, short convolutions, per-channel decay gate). Real math, not approximated.
+- **int4/int8/int2 quantization**, native **FP8** (E4M3, block-scale) and **OCP MXFP4** checkpoint
+  loading, grouped-scale int4, and a **`.qs`** pre-quantized fast path.
 - **AVX2 + AVX-512/VNNI kernels**, runtime-selected, plus `rayon` parallelization across CPU
-  cores (not just SIMD) for every matmul and the absorbed-attention decode path.
-- **`io_uring`-batched expert streaming**, with a sequential-`pread` fallback.
-- **Persistent expert usage cache** (`.rabbit_usage`) — learns which experts your usage routes
-  to and pins them, lazily: only once a candidate is actually loaded through normal use, unlike
-  colibrì's own eager default (see `rabbit-plan.md` for the measured reason it was changed).
-- **KV-cache persistence** (`--session`) — conversations reopen warm across restarts, via an
-  append-only on-disk format.
-- **OpenAI-compatible HTTP server** (`--serve`) — streaming and non-streaming
-  `/v1/chat/completions`, `/v1/models`; plus `/profile`, a rolling per-turn phase-timing window
-  (attention/expert-wait/expert-matmul/lm-head) as JSON.
-- **Multi-turn chat** (`--chat`) with GLM-5.2's official template.
+  cores for every matmul and the absorbed-attention decode path.
+- **`io_uring`-batched expert streaming**, with a sequential-`pread` fallback. K3's MXFP4 experts
+  use the fallback today; batching that path is open work (see `ROADMAP.md`).
+- **Persistent expert usage cache** (`.rabbit_usage`). Learns which experts your usage routes to
+  and pins them, lazily, once a candidate is actually loaded through normal use.
+- **KV-cache persistence** (`--session`). Conversations reopen warm across restarts.
+- **A standalone checkpoint converter** (`bin/convert.rs`). Architecture-agnostic tensor
+  classification, per-bucket bit-depth control, a `--report` quality pass. No dependency on
+  colibrì's own tooling except for the pre-converted GLM-5.2 checkpoint above.
+- **OpenAI-compatible HTTP server** (`--serve`). Streaming and non-streaming
+  `/v1/chat/completions`, `/v1/models`, plus `/profile`, a rolling per-turn phase-timing window.
+- **Multi-turn chat** (`--chat`) with each model's own real chat template.
 
-Not yet built: a standalone `.qs` converter (currently relies on checkpoints pre-converted by
-colibrì's own tooling), live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
-grammar-constrained decoding, an expert-routing heatmap (colibrì's "Brain" view), and any web
-UI (`/profile` above is a JSON endpoint, no page serves it yet — see `DASHBOARD_BRIEF.md` for
-the planned direction). See `rabbit-plan.md` for the full phase-by-phase history.
+Not yet built: `io_uring`-batched MXFP4 expert loading, a SIMD tier for the MXFP4 matmul kernel
+(scalar only today), live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
+grammar-constrained decoding, and a web UI (`/profile` is a JSON endpoint, no page serves it yet;
+see `DASHBOARD_BRIEF.md`).
 
 ## Honest numbers (Ryzen AI 9 HX 370, 12 cores/24 threads)
+
+### Kimi K3 (real 96-shard, 1.56TB checkpoint, first measurement, 2026-07-28)
+
+| metric | value |
+|---|---|
+| model load | 610.0s (93 layers, 896 experts/layer) |
+| prefill (7 tokens) | 412.8s |
+| decode, steady state | 50-70s/token |
+| decode I/O share | 30-40% disk I/O, 60-70% compute |
+| expert-cache hit rate (40-token run, `--expert-cache 64`) | grows to ~52% cumulative, still ~43% miss rate late in the run |
+
+This is the correctness-first floor, not a tuned number. Same starting point GLM-5.2 was at
+before its own eight versions of `rayon`/SIMD/`io_uring` work. The single biggest known lever:
+the MXFP4 matmul kernel is scalar only, and compute, not disk, is most of each token's time
+here, the opposite of GLM-5.2's I/O-bound steady state below.
+
+### GLM-5.2
 
 | metric | value |
 |---|---|
 | checkpoint | 378 GB (`jlnsrk/GLM-5.2-colibri-int4`) |
 | `rayon` matmul parallelization | 128.9s → 36.3s for 5 tokens (3.5×), bit-exact output |
 | `rayon` absorbed-attention parallelization | 224.3s → 158.4s for 70 decode tokens (~29% faster) |
-| decode I/O share, steady state (warm cache) | ~30–35% disk I/O / 65–70% compute |
+| decode I/O share, steady state (warm cache) | 30-35% disk I/O, 65-70% compute |
 | prefill I/O share (cold cache) | ~75% disk I/O |
-| expert-cache hit rate, steady-state decode | ~70–77% (miss floor ~23–30%) |
-| usage-cache auto-pin | 150 experts (2/layer × 75 MoE layers) → prefill hits 0 → 136 |
+| expert-cache hit rate, steady-state decode | 70-77% (miss floor 23-30%) |
+| usage-cache auto-pin | 150 experts (2/layer × 75 MoE layers): prefill hits 0 → 136 |
+| decode speed, current (v0.22.0) | 1.02 words/sec, up from 0.29 across eight measured versions |
 
-All measured against the real checkpoint, not estimated — see the phase entries in
-`rabbit-plan.md` for the commits and full methodology behind each number, or
-[`PERFORMANCE.md`](PERFORMANCE.md) for the full chronological log, including techniques that
-were tried and reverted.
+All measured against the real checkpoints, not estimated. See `PERFORMANCE.md` for the full
+chronological log, including techniques that were tried and reverted.
 
 ## Building
 
@@ -81,55 +131,61 @@ cargo test
 ```
 
 ```bash
-./target/release/rabbit --model <checkpoint-dir> --prompt "The capital of France is"
-./target/release/rabbit --model <checkpoint-dir> --chat --session ~/.rabbit_session
-./target/release/rabbit --model <checkpoint-dir> --serve --port 8000
+./target/release/rabbit --model /mnt/data/kimi-k3 --prompt "What is the capital of France?"
+./target/release/rabbit --model /mnt/data/kimi-k3 --chat --session ~/.rabbit_session
+./target/release/rabbit --model /mnt/data/kimi-k3 --serve --port 8000
 ```
 
-`--model` takes a directory with the same layout colibrì's converter produces — a pre-converted
+`--model` auto-detects the architecture from the checkpoint's `config.json`. Kimi K3 and Kimi
+Linear read Moonshot's own published `safetensors` shards directly: download
+[`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) and point `--model` at it, no
+conversion step. GLM-5.2 needs a directory in colibrì's converted layout; a pre-converted
 checkpoint such as [`jlnsrk/GLM-5.2-colibri-int4`](https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4)
-works directly, no conversion step needed. See `--help` for the full flag list
-(`--max-tokens`, `--temperature`, `--nucleus`, `--expert-cache`, `--no-usage-cache`, ...).
+works directly. See `--help` for the full flag list (`--max-tokens`, `--temperature`,
+`--nucleus`, `--expert-cache`, `--dbits`, `--ebits`, `--shard-dirs`, `--no-usage-cache`, ...).
 
 ## Repo layout
 
 ```
 src/
-├── safetensors.rs, config.rs          shard index + config loading
-├── tokenizer.rs, unicode_tables.rs    byte-level BPE tokenizer
-├── quant.rs, kernels.rs               quantization + scalar/AVX2/AVX-512 kernels
-├── model.rs, attention.rs, moe.rs     dense model, MLA/DSA attention, MoE router
-├── expert_cache.rs, usage_cache.rs    LRU expert streaming + persistent usage learning
-├── generate.rs, kv_session.rs         generation loop + KV-cache persistence
-├── chat.rs, server.rs, main.rs        chat template, HTTP server, CLI entrypoint
-tests/oracle/     synthetic GLM-5.2 oracle generator + teacher-forcing fixtures
+├── kimi_k3/                                  Kimi K3: SituAndMul, LatentMoE, Attention Residuals, MXFP4
+├── kimi_linear/                              Kimi Linear 48B: KDA, short convs, tokenizer, chat template
+├── glm52/                                    GLM-5.2: MLA+DSA attention, MoE router, checkpoint converter
+├── model.rs                                  family-dispatch enum: Model/KvState/ExpertCaches/Tokenizer
+├── safetensors.rs, quant.rs, kernels.rs      shard index, quantization, scalar/AVX2/AVX-512/MXFP4 kernels
+├── expert_cache.rs, usage_cache.rs           LRU expert streaming + persistent usage learning
+├── generate.rs, kv_session.rs                shared generation loop + KV-cache persistence
+├── chat.rs, server.rs, main.rs               chat templates, HTTP server, CLI entrypoint
+tests/oracle/     per-architecture oracle generators (real reference code, vendored) + fixtures
 tools/            real-tokenizer validation fixtures (dev-only, not a runtime dependency)
 benches/          criterion benchmarks (kernels, expert loading)
 ```
 
 ## Why Rust, why colibrì
 
-colibrì is C, hand-written, effectively zero-dependency. rabbit ports the same algorithms to
-Rust with a short list of well-justified dependencies instead of a zero-dep stance — see
-`rabbit-plan.md` for the reasoning on each one — plus its own performance work on top that
-colibrì doesn't have in this exact form (the `rayon` parallelization above, KV-session and
-expert-usage persistence). Validated the same way colibrì validates itself: token-exact
-teacher-forcing against a tiny synthetic model with the real architecture.
+colibrì is C, hand-written, effectively zero-dependency, and GLM-5.2-only. rabbit ports the same
+algorithms to Rust with a short list of well-justified dependencies instead of a zero-dep stance,
+adds its own performance work (the `rayon` parallelization above, KV-session and expert-usage
+persistence), and generalizes the whole engine into a family-dispatch design that now runs two
+more architectures colibrì doesn't. Every architecture is validated the same way colibrì
+validates itself: token-exact teacher-forcing against a tiny synthetic model built from that
+architecture's own real reference code.
 
 Part of the [ferrumox](../) AI lab, alongside [fox](../fox) (a production local-LLM server
-wrapping llama.cpp) — rabbit is the opposite kind of project: a research engine for a model that
-doesn't fit in memory even offloaded, built by hand instead of wrapping an existing runtime.
+wrapping llama.cpp). rabbit is the opposite kind of project: a research engine for models that
+don't fit in memory even offloaded, built by hand instead of wrapping an existing runtime.
 
 The name is a nod to [RabbitLLM](https://github.com/ManuelSLemos/RabbitLLM), an earlier,
 unrelated project of mine (a fork of AirLLM that streams full model layers through limited GPU
-VRAM) — same interest in running large models on constrained hardware, different problem and a
-completely different technique (CPU-side quantized MoE expert streaming here, vs. GPU layer
-streaming there). Nothing in this codebase is derived from that one.
+VRAM). Same interest in running large models on constrained hardware, different problem, a
+completely different technique. Nothing in this codebase is derived from that one.
 
 ## Versioning
 
-Pre-1.0, `0.MINOR.PATCH`: `MINOR` bumps at the end of each phase in `rabbit-plan.md` (`v0.1.0`
-through `v0.15.0`), `PATCH` for fixes/polish within a phase.
+Pre-1.0, `0.MINOR.PATCH`, tracked via git tags and `release/vX.Y.Z` branches rather than
+`Cargo.toml`'s version field. `MINOR` bumps at the end of each development phase, `PATCH` for
+fixes/polish within one. `rabbit-plan.md` has the full phase-by-phase history through GLM-5.2 and
+Kimi Linear's bring-up.
 
 ## License
 

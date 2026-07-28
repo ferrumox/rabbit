@@ -1,32 +1,21 @@
-//! Kimi Linear's own tokenizer — a real `tiktoken`-format byte-level BPE, genuinely different
-//! from `crate::tokenizer`'s GLM-5.2 port (a separate `merges: [(left,right)]` list, GPT-2/
-//! `tokenizers`-crate convention). Tiktoken's vocabulary IS the merge priority: `mergeable_ranks`
-//! maps whole byte sequences directly to a rank, and the merge loop repeatedly joins whichever
-//! ADJACENT pair's combined bytes have the lowest rank — ported faithfully from OpenAI's real
-//! `tiktoken` Rust core (`_byte_pair_merge`/`byte_pair_encode`,
-//! <https://github.com/openai/tiktoken/blob/main/src/lib.rs>, fetched and read this session, not
-//! guessed), skipping only that source's large-piece (`>= 100` bytes) heap-optimized variant —
-//! real text pretokenizes into much smaller pieces (punctuation/whitespace breaks long before
-//! 100 bytes), so the small-piece `O(mn)` algorithm alone is correct, just not the fastest
-//! possible on pathological inputs; matches this crate's "correctness first, perf later"
-//! discipline (see `PERFORMANCE.md`) if that path is ever needed.
+//! Kimi K3's own `tiktoken`-format tokenizer — the sibling of `kimi_linear::tokenizer.rs`, not a
+//! variant: `tokenization_kimi.py`'s `pat_str` (the pre-tokenizer regex) and its `tiktoken.model`/
+//! `tokenizer_config.json` FILE FORMATS are byte-for-byte identical to Kimi Linear 48B's — same
+//! real source file, confirmed by comparing both this session — so this module reuses
+//! `kimi_linear::tokenizer::byte_pair_encode` directly (widened to `pub(crate)`) rather than
+//! duplicating that intricate merge algorithm a second time.
 //!
-//! The pre-tokenizer pattern itself comes from Moonshot's real `tokenization_kimi.py`
-//! (`TikTokenTokenizer.pat_str`) — it needs Unicode SET INTERSECTION syntax
-//! (`[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`, excluding Han from the non-Han-letter
-//! alternatives) that Rust's plain `regex` crate does not support. Confirmed this session (a
-//! standalone smoke test) that `fancy-regex` DOES support this syntax and produces the expected
-//! split — the same crate family real tiktoken's own Rust core depends on.
-//!
-//! Special tokens: Kimi Linear reserves 258 ids past the base vocabulary (`num_base_tokens` —
-//! confirmed `163584` on the real checkpoint — `..= num_base_tokens + 256 + 1`), 17 of which have
-//! real names (`tokenizer_config.json`'s `added_tokens_decoder`); the rest fall back to
-//! `<|reserved_token_{id}|>`, matching `tokenization_kimi.py`'s own
-//! `special_tokens_mapping.get(i, f"<|reserved_token_{i}|>")` exactly. **The last 2 of those 258
-//! ids (`num_base_tokens + 256`, `+ 257`) exceed the real checkpoint's `vocab_size` (163840) —
-//! a real quirk in the reference tokenizer itself, not a bug here** — callers must never feed
-//! those two ids into the model (`kimi_linear::model`'s embedding table has no rows for them).
+//! **One real, checkpoint-independent difference, confirmed by re-reading `tokenization_kimi.py`
+//! itself (not assumed from the 48B port)**: the class hardcodes `num_reserved_special_tokens =
+//! 256` and its `__init__` loop is `range(num_base_tokens, num_base_tokens + 256)` — exactly 256,
+//! not 258. `kimi_linear::tokenizer.rs`'s own `NUM_RESERVED_SPECIAL_TOKENS + 2` was an empirical
+//! adjustment for a quirk observed in the 48B checkpoint's `tokenizer_config.json` (extra
+//! `added_tokens_decoder` entries beyond what that 256-entry loop actually reads) — checked
+//! against K3's real `tokenizer_config.json` this session: its `added_tokens_decoder`'s highest
+//! key is `163839` = `num_base_tokens (163584) + 255`, safely inside a plain 256-entry range with
+//! no overflow, so K3 does NOT need (and must NOT use) that same "+2" adjustment.
 
+use crate::kimi_linear::tokenizer::byte_pair_encode;
 use base64::Engine;
 use fancy_regex::Regex;
 use serde_json::Value;
@@ -37,9 +26,11 @@ use std::path::Path;
 
 pub type Rank = u32;
 
-/// Verbatim from `tokenization_kimi.py`'s `TikTokenTokenizer.pat_str` — do not reorder or
-/// "simplify" any alternative; each one governs a real split boundary case (contractions, CJK
-/// runs, mixed-case runs, digit runs capped at 3, punctuation runs, whitespace runs).
+/// Verbatim from `tokenization_kimi.py`'s `TikTokenTokenizer.pat_str`, confirmed
+/// character-for-character identical to `kimi_linear::tokenizer::PAT_STR` this session (same
+/// real source file backs both checkpoints) — duplicated rather than shared as a `pub(crate)`
+/// constant purely because a `&str` constant carries none of the "easy to get subtly wrong"
+/// risk `byte_pair_encode` does; see this module's doc for why THAT function is reused instead.
 const PAT_STR: &str = concat!(
     r"[\p{Han}]+",
     "|",
@@ -58,9 +49,8 @@ const PAT_STR: &str = concat!(
     r"\s+",
 );
 
-/// `tokenization_kimi.py`'s own default `additional_special_tokens` list, used when
-/// `tokenizer_config.json` doesn't override it — not read from disk since it's a fixed constant
-/// in the reference code, not data.
+/// `tokenization_kimi.py`'s real `num_reserved_special_tokens` class attribute — 256, not
+/// Kimi Linear 48B's own tokenizer.rs's `+2`-adjusted 258. See this module's doc.
 const NUM_RESERVED_SPECIAL_TOKENS: u32 = 256;
 
 #[derive(Debug)]
@@ -114,72 +104,8 @@ pub struct Tokenizer {
     special_regex: Regex,
 }
 
-/// OpenAI tiktoken's real `_byte_pair_merge` (small-piece path), ported line-for-line from
-/// `tiktoken`'s own `src/lib.rs`: returns split BOUNDARIES (byte offsets into `piece`, paired
-/// with the rank of the pair starting there), not token ids themselves — `byte_pair_encode`
-/// below turns consecutive boundaries into the final ids via a second lookup.
-fn byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
-    let mut parts: Vec<(usize, Rank)> = Vec::with_capacity(piece.len() + 1);
-
-    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
-    for i in 0..piece.len() - 1 {
-        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
-        if rank < min_rank.0 {
-            min_rank = (rank, i);
-        }
-        parts.push((i, rank));
-    }
-    parts.push((piece.len() - 1, Rank::MAX));
-    parts.push((piece.len(), Rank::MAX));
-
-    let get_rank = |parts: &[(usize, Rank)], i: usize| -> Rank {
-        if i + 3 < parts.len() {
-            *ranks.get(&piece[parts[i].0..parts[i + 3].0]).unwrap_or(&Rank::MAX)
-        } else {
-            Rank::MAX
-        }
-    };
-
-    while min_rank.0 != Rank::MAX {
-        let i = min_rank.1;
-        if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
-        }
-        parts[i].1 = get_rank(&parts, i);
-        parts.remove(i + 1);
-
-        min_rank = (Rank::MAX, usize::MAX);
-        for (idx, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
-            if rank < min_rank.0 {
-                min_rank = (rank, idx);
-            }
-        }
-    }
-    parts
-}
-
-/// `tiktoken`'s real `byte_pair_encode` (small-piece dispatch only — see this module's doc for
-/// why the large-piece heap variant is deliberately not ported).
-///
-/// `pub(crate)`, not private: `kimi_k3::tokenizer` reuses this directly (same real `tiktoken`
-/// merge algorithm — `tokenization_kimi.py`'s `pat_str`/BPE logic is byte-for-byte identical
-/// between Kimi Linear 48B and K3, confirmed by comparing both real files this session; only the
-/// reserved-special-token COUNT differs) rather than duplicating this intricate, easy-to-get-
-/// subtly-wrong merge algorithm a second time — unlike this crate's usual "duplicate small
-/// elementwise primitives across architecture-sibling modules" precedent (see `ops.rs`'s
-/// `swish`/`rmsnorm` doc comments), this one is complex/hot enough that reuse (matching
-/// `glm52::moe.rs`'s `apply_single_expert`/`unique_experts`, widened to `pub(crate)` for the same
-/// reason) is the safer call.
-pub(crate) fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
-    debug_assert!(!piece.is_empty(), "byte_pair_encode called on an empty piece");
-    if piece.len() == 1 {
-        return vec![ranks[piece]];
-    }
-    byte_pair_merge(ranks, piece).windows(2).map(|w| ranks[&piece[w[0].0..w[1].0]]).collect()
-}
-
 impl Tokenizer {
-    /// Loads `tiktoken.model` + `tokenizer_config.json` from a real Kimi Linear checkpoint
+    /// Loads `tiktoken.model` + `tokenizer_config.json` from a real Kimi K3 checkpoint
     /// directory — both files this needs, no separate fixture format.
     pub fn load(dir: &Path) -> Result<Tokenizer, TokenizerError> {
         let model_text = fs::read_to_string(dir.join("tiktoken.model"))?;
@@ -218,7 +144,7 @@ impl Tokenizer {
             .collect();
 
         let mut special_encoder: HashMap<String, Rank> = HashMap::new();
-        for i in num_base_tokens..num_base_tokens + NUM_RESERVED_SPECIAL_TOKENS + 2 {
+        for i in num_base_tokens..num_base_tokens + NUM_RESERVED_SPECIAL_TOKENS {
             let name = added.get(&i).cloned().unwrap_or_else(|| format!("<|reserved_token_{i}|>"));
             special_encoder.insert(name, i);
         }
@@ -226,8 +152,7 @@ impl Tokenizer {
 
         let regex = Regex::new(PAT_STR)?;
         // Longest-first alternation, same "longest match wins" precedent
-        // `crate::tokenizer::Tokenizer::load`'s own `specials` list already follows — avoids a
-        // short special token's literal text shadowing a longer one that starts the same way.
+        // `kimi_linear::tokenizer::Tokenizer::load`'s own `specials` list already follows.
         let mut special_strs: Vec<&String> = special_encoder.keys().collect();
         special_strs.sort_by_key(|s| std::cmp::Reverse(s.len()));
         let special_pattern = special_strs.iter().map(|s| fancy_regex::escape(s)).collect::<Vec<_>>().join("|");
@@ -236,13 +161,9 @@ impl Tokenizer {
         Ok(Tokenizer { encoder, decoder, special_encoder, special_decoder, regex, special_regex })
     }
 
-    /// Encodes text into token ids. Any of the 258 special-token strings that appear literally
-    /// in `text` (e.g. `<|im_user|>`, inserted by the chat-template renderer) are always
-    /// recognized as a single id — no allow-list distinction, matching
-    /// `crate::tokenizer::Tokenizer::encode`'s own existing (simpler) behavior for consistency
-    /// across rabbit's two tokenizers, rather than porting `tiktoken`'s real
-    /// `allowed_special: &HashSet<&str>` gating (meant for untrusted-input safety in a
-    /// general-purpose library; rabbit's callers only ever encode text they built themselves).
+    /// Encodes text into token ids — same "any literal special-token string is always
+    /// recognized" behavior as `kimi_linear::tokenizer::Tokenizer::encode` (see that function's
+    /// doc for why this doesn't port `tiktoken`'s real `allowed_special` gating).
     pub fn encode(&self, text: &str) -> Vec<i32> {
         let mut out = Vec::new();
         let mut start = 0usize;
@@ -272,9 +193,8 @@ impl Tokenizer {
         out
     }
 
-    /// Decodes ids back into raw bytes. Ids with no matching entry (e.g. negative, or one of
-    /// the two out-of-`vocab_size` reserved ids — see this module's doc) are silently skipped,
-    /// same permissive policy as `crate::tokenizer::Tokenizer::decode`.
+    /// Decodes ids back into raw bytes. Ids with no matching entry are silently skipped, same
+    /// permissive policy as `kimi_linear::tokenizer::Tokenizer::decode`.
     pub fn decode(&self, ids: &[i32]) -> Vec<u8> {
         let mut out = Vec::new();
         for &id in ids {
@@ -289,7 +209,7 @@ impl Tokenizer {
         out
     }
 
-    /// Id of a special token given its literal content (e.g. `"<|im_end|>"`).
+    /// Id of a special token given its literal content (e.g. `"<|end_of_msg|>"`).
     pub fn id_of(&self, content: &str) -> Option<i32> {
         self.special_encoder.get(content).map(|&id| id as i32)
     }
@@ -307,7 +227,7 @@ mod tests {
     /// 'a'..'z' plus a couple of real merges, and one named special token among the reserved
     /// range.
     fn build_fixture(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("rabbit_test_kimi_tok_{name}"));
+        let dir = std::env::temp_dir().join(format!("rabbit_test_k3_tok_{name}"));
         fs::create_dir_all(&dir).unwrap();
 
         let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
@@ -323,7 +243,7 @@ mod tests {
         let num_base = n + 2;
         let cfg = serde_json::json!({
             "added_tokens_decoder": {
-                num_base.to_string(): {"content": "<|special_a|>"},
+                num_base.to_string(): {"content": "<|end_of_msg|>"},
             }
         });
         write(&dir, "tokenizer_config.json", &cfg.to_string());
@@ -336,8 +256,6 @@ mod tests {
         let tok = Tokenizer::load(&dir).unwrap();
         fs::remove_dir_all(&dir).ok();
 
-        // "hel" is itself a vocab entry (whole-piece shortcut) -> single id, the highest rank
-        // assigned (built last, from "he"+"l").
         let ids = tok.encode("hel");
         assert_eq!(ids.len(), 1);
         assert_eq!(tok.decode(&ids), b"hel");
@@ -349,7 +267,6 @@ mod tests {
         let tok = Tokenizer::load(&dir).unwrap();
         fs::remove_dir_all(&dir).ok();
 
-        // "row" has no registered merges among these letters -> one id per byte.
         let ids = tok.encode("row");
         assert_eq!(ids.len(), 3);
         assert_eq!(tok.decode(&ids), b"row");
@@ -361,11 +278,10 @@ mod tests {
         let tok = Tokenizer::load(&dir).unwrap();
         fs::remove_dir_all(&dir).ok();
 
-        assert!(tok.id_of("<|special_a|>").is_some());
-        let ids = tok.encode("hello<|special_a|>world");
-        assert_eq!(tok.decode(&ids), b"hello<|special_a|>world");
-        // the special token must be exactly ONE id, not BPE-split.
-        let special_id = tok.id_of("<|special_a|>").unwrap();
+        assert!(tok.id_of("<|end_of_msg|>").is_some());
+        let ids = tok.encode("hello<|end_of_msg|>world");
+        assert_eq!(tok.decode(&ids), b"hello<|end_of_msg|>world");
+        let special_id = tok.id_of("<|end_of_msg|>").unwrap();
         assert_eq!(ids.iter().filter(|&&i| i == special_id).count(), 1);
     }
 
@@ -375,10 +291,21 @@ mod tests {
         let tok = Tokenizer::load(&dir).unwrap();
         fs::remove_dir_all(&dir).ok();
 
-        // num_base_tokens is 12 ("helowrd, !".len()=10 distinct chars + "he" + "hel" = 12);
-        // id 12 is named "<|special_a|>", id 13 is NOT named -> placeholder.
-        assert_eq!(tok.id_of("<|special_a|>"), Some(12));
+        assert_eq!(tok.id_of("<|end_of_msg|>"), Some(12));
         assert_eq!(tok.id_of("<|reserved_token_13|>"), Some(13));
+    }
+
+    #[test]
+    fn exactly_256_reserved_ids_no_plus_two_quirk() {
+        // Unlike kimi_linear::tokenizer.rs's 48B-specific +2 adjustment, K3's real class
+        // attribute is exactly 256 -- the 257th offset must NOT resolve to anything.
+        let dir = build_fixture("exact_256");
+        let tok = Tokenizer::load(&dir).unwrap();
+        fs::remove_dir_all(&dir).ok();
+
+        let num_base = 12u32; // "helowrd, !".len()=10 distinct chars + "he" + "hel"
+        assert!(tok.id_of(&format!("<|reserved_token_{}|>", num_base + 255)).is_some(), "offset 255 (the 256th id) must exist");
+        assert!(tok.id_of(&format!("<|reserved_token_{}|>", num_base + 256)).is_none(), "offset 256 (a 257th id) must NOT exist for K3");
     }
 
     #[test]

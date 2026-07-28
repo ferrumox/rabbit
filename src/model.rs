@@ -22,26 +22,30 @@ use std::path::{Path, PathBuf};
 pub enum Model {
     Glm52(crate::glm52::model::Model),
     KimiLinear(crate::kimi_linear::model::Model),
+    KimiK3(crate::kimi_k3::model::Model),
 }
 
 pub enum KvState {
     Glm52(crate::generate::KvState),
     KimiLinear(crate::kimi_linear::generate::KvState),
+    KimiK3(crate::kimi_k3::generate::KvState),
 }
 
 pub enum ExpertCaches {
     Glm52(crate::generate::ExpertCaches),
     KimiLinear(crate::kimi_linear::generate::ExpertCaches),
+    KimiK3(crate::kimi_k3::generate::ExpertCaches),
 }
 
 #[derive(Debug)]
 pub enum ModelError {
     Glm52(crate::glm52::model::ModelError),
     KimiLinear(KimiModelError),
+    KimiK3(crate::kimi_k3::model::ModelError),
     Io(std::io::Error),
     Json(serde_json::Error),
-    /// `config.json`'s `model_type` was missing or matched neither `glm52`'s nor
-    /// `kimi_linear`'s loader.
+    /// `config.json`'s `model_type` was missing or matched none of `glm52`'s/`kimi_linear`'s/
+    /// `kimi_k3`'s loaders.
     UnknownArchitecture { found: Option<String> },
 }
 
@@ -50,6 +54,7 @@ impl fmt::Display for ModelError {
         match self {
             ModelError::Glm52(e) => write!(f, "{e}"),
             ModelError::KimiLinear(e) => write!(f, "{e}"),
+            ModelError::KimiK3(e) => write!(f, "{e}"),
             ModelError::Io(e) => write!(f, "config.json: {e}"),
             ModelError::Json(e) => write!(f, "config.json: {e}"),
             ModelError::UnknownArchitecture { found: Some(m) } => {
@@ -71,6 +76,12 @@ impl From<crate::glm52::model::ModelError> for ModelError {
 impl From<KimiModelError> for ModelError {
     fn from(e: KimiModelError) -> Self {
         ModelError::KimiLinear(e)
+    }
+}
+
+impl From<crate::kimi_k3::model::ModelError> for ModelError {
+    fn from(e: crate::kimi_k3::model::ModelError) -> Self {
+        ModelError::KimiK3(e)
     }
 }
 
@@ -109,6 +120,7 @@ impl Model {
         match read_model_type(&dirs[0])?.as_deref() {
             Some("glm_moe_dsa") => Ok(Model::Glm52(crate::glm52::model::Model::load_multi(dirs, dbits, ebits)?)),
             Some("kimi_linear") => Ok(Model::KimiLinear(crate::kimi_linear::model::Model::load_multi(dirs, dbits, ebits)?)),
+            Some("kimi_k3") => Ok(Model::KimiK3(crate::kimi_k3::model::Model::load_multi(dirs, dbits, ebits)?)),
             found => Err(ModelError::UnknownArchitecture { found: found.map(String::from) }),
         }
     }
@@ -119,26 +131,30 @@ impl Model {
         match self {
             Model::Glm52(m) => m.layers.len(),
             Model::KimiLinear(m) => m.layers.len(),
+            Model::KimiK3(m) => m.layers.len(),
         }
     }
 
-    /// Configured stop/eos token ids, as `usize` — both families' `Cfg::stop_ids` are `Vec<i32>`
-    /// read the same way (`eos_token_id`, single int or array) from `config.json`.
+    /// Configured stop/eos token ids, as `usize` — every family's `Cfg::stop_ids` is a `Vec<i32>`
+    /// read the same way (`eos_token_id`, single int or array) from `config.json` (K3's own
+    /// `Cfg` reads it via `cfg.base`, the embedded `kimi_linear::config::Cfg`).
     pub fn stop_ids(&self) -> Vec<usize> {
         match self {
             Model::Glm52(m) => m.cfg.stop_ids.iter().map(|&id| id as usize).collect(),
             Model::KimiLinear(m) => m.cfg.stop_ids.iter().map(|&id| id as usize).collect(),
+            Model::KimiK3(m) => m.cfg.base.stop_ids.iter().map(|&id| id as usize).collect(),
         }
     }
 
-    /// Sets the opt-in CACHE_ROUTE toggle (see `glm52::moe::RouteConfig`) — both families reuse
+    /// Sets the opt-in CACHE_ROUTE toggle (see `glm52::moe::RouteConfig`) — every family reuses
     /// the exact same `RouteConfig`/`moe()` routing code (Kimi's `Ffn::Moe` layers dispatch
     /// through `glm52::moe::moe()` too, see `kimi_linear::generate`'s doc), so this one setter
-    /// covers either family.
+    /// covers all three.
     pub fn set_cache_route(&mut self, on: bool) {
         match self {
             Model::Glm52(m) => m.route_cfg.cache_route = on,
             Model::KimiLinear(m) => m.route_cfg.cache_route = on,
+            Model::KimiK3(m) => m.route_cfg.cache_route = on,
         }
     }
 }
@@ -150,6 +166,7 @@ impl Model {
 pub enum KvSessionError {
     Glm52Load(crate::kv_session::LoadError),
     KimiLinearLoad(crate::kimi_linear::kv_session::LoadError),
+    KimiK3Load(crate::kimi_k3::kv_session::LoadError),
     Io(std::io::Error),
 }
 
@@ -158,6 +175,7 @@ impl fmt::Display for KvSessionError {
         match self {
             KvSessionError::Glm52Load(e) => write!(f, "{e}"),
             KvSessionError::KimiLinearLoad(e) => write!(f, "{e}"),
+            KvSessionError::KimiK3Load(e) => write!(f, "{e}"),
             KvSessionError::Io(e) => write!(f, "session file: {e}"),
         }
     }
@@ -170,20 +188,24 @@ impl KvState {
         match model {
             Model::Glm52(m) => KvState::Glm52(crate::generate::KvState::new(m)),
             Model::KimiLinear(m) => KvState::KimiLinear(crate::kimi_linear::generate::KvState::new(m)),
+            Model::KimiK3(m) => KvState::KimiK3(crate::kimi_k3::generate::KvState::new(m)),
         }
     }
 
     /// Appends one completed turn's new KV rows to `path` — see `kv_session.rs`'s doc for
-    /// GLM-5.2, `kimi_linear::kv_session.rs`'s doc for Kimi Linear.
+    /// GLM-5.2, `kimi_linear::kv_session.rs`'s doc for Kimi Linear, `kimi_k3::kv_session.rs`'s
+    /// doc for K3 (same two-file MLA-log + KDA-snapshot format, distinct magic bytes, no
+    /// Attention-Residuals state to persist since that's purely transient per forward call).
     pub fn save(&self, from_pos: usize, to_pos: usize, path: &Path) -> Result<(), KvSessionError> {
         match self {
             KvState::Glm52(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
             KvState::KimiLinear(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
+            KvState::KimiK3(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
         }
     }
 
     /// Loads a previously-saved session file — see `kv_session.rs`'s doc for GLM-5.2,
-    /// `kimi_linear::kv_session.rs`'s doc for Kimi Linear.
+    /// `kimi_linear::kv_session.rs`'s doc for Kimi Linear, `kimi_k3::kv_session.rs`'s doc for K3.
     pub fn load(path: &Path, model: &Model) -> Result<(KvState, usize), KvSessionError> {
         match model {
             Model::Glm52(m) => {
@@ -194,6 +216,10 @@ impl KvState {
                 let (kv, pos) = crate::kimi_linear::generate::KvState::load(path, m).map_err(KvSessionError::KimiLinearLoad)?;
                 Ok((KvState::KimiLinear(kv), pos))
             }
+            Model::KimiK3(m) => {
+                let (kv, pos) = crate::kimi_k3::generate::KvState::load(path, m).map_err(KvSessionError::KimiK3Load)?;
+                Ok((KvState::KimiK3(kv), pos))
+            }
         }
     }
 }
@@ -203,6 +229,7 @@ impl ExpertCaches {
         match model {
             Model::Glm52(m) => ExpertCaches::Glm52(crate::generate::ExpertCaches::new(m, capacity)),
             Model::KimiLinear(m) => ExpertCaches::KimiLinear(crate::kimi_linear::generate::ExpertCaches::new(m, capacity)),
+            Model::KimiK3(m) => ExpertCaches::KimiK3(crate::kimi_k3::generate::ExpertCaches::new(m, capacity)),
         }
     }
 
@@ -210,6 +237,7 @@ impl ExpertCaches {
         match self {
             ExpertCaches::Glm52(c) => c.hit_miss_totals(),
             ExpertCaches::KimiLinear(c) => c.hit_miss_totals(),
+            ExpertCaches::KimiK3(c) => c.hit_miss_totals(),
         }
     }
 
@@ -217,6 +245,7 @@ impl ExpertCaches {
         match self {
             ExpertCaches::Glm52(c) => c.io_wait_nanos_total(),
             ExpertCaches::KimiLinear(c) => c.io_wait_nanos_total(),
+            ExpertCaches::KimiK3(c) => c.io_wait_nanos_total(),
         }
     }
 
@@ -224,6 +253,7 @@ impl ExpertCaches {
         match self {
             ExpertCaches::Glm52(c) => c.warm_start(model_dir, cache_capacity),
             ExpertCaches::KimiLinear(c) => c.warm_start(model_dir, cache_capacity),
+            ExpertCaches::KimiK3(c) => c.warm_start(model_dir, cache_capacity),
         }
     }
 
@@ -231,6 +261,7 @@ impl ExpertCaches {
         match self {
             ExpertCaches::Glm52(c) => c.save_usage(model_dir),
             ExpertCaches::KimiLinear(c) => c.save_usage(model_dir),
+            ExpertCaches::KimiK3(c) => c.save_usage(model_dir),
         }
     }
 }
@@ -245,6 +276,7 @@ pub fn step(model: &Model, shards: &crate::safetensors::Shards, caches: &mut Exp
     match (model, caches, kv) {
         (Model::Glm52(m), ExpertCaches::Glm52(c), KvState::Glm52(k)) => Ok(crate::generate::step(m, shards, c, k, ids, pos_base)?),
         (Model::KimiLinear(m), ExpertCaches::KimiLinear(c), KvState::KimiLinear(k)) => Ok(crate::kimi_linear::generate::step(m, shards, c, k, ids, pos_base)?),
+        (Model::KimiK3(m), ExpertCaches::KimiK3(c), KvState::KimiK3(k)) => Ok(crate::kimi_k3::generate::step(m, shards, c, k, ids, pos_base)?),
         _ => unreachable!("Model/ExpertCaches/KvState family mismatch -- always construct KvState/ExpertCaches from the same Model"),
     }
 }
@@ -255,12 +287,13 @@ pub fn step_all(model: &Model, shards: &crate::safetensors::Shards, caches: &mut
     match (model, caches, kv) {
         (Model::Glm52(m), ExpertCaches::Glm52(c), KvState::Glm52(k)) => Ok(crate::generate::step_all(m, shards, c, k, ids, pos_base)?),
         (Model::KimiLinear(m), ExpertCaches::KimiLinear(c), KvState::KimiLinear(k)) => Ok(crate::kimi_linear::generate::step_all(m, shards, c, k, ids, pos_base)?),
+        (Model::KimiK3(m), ExpertCaches::KimiK3(c), KvState::KimiK3(k)) => Ok(crate::kimi_k3::generate::step_all(m, shards, c, k, ids, pos_base)?),
         _ => unreachable!("Model/ExpertCaches/KvState family mismatch -- always construct KvState/ExpertCaches from the same Model"),
     }
 }
 
 /// Like `step`, but also returns a [`crate::generate::StepProfile`] — same dispatch/panic
-/// contract as `step`. Both families' `step_profiled` share that one profile type (plain data,
+/// contract as `step`. Every family's `step_profiled` shares that one profile type (plain data,
 /// no family-specific coupling — see `kimi_linear::generate::step_profiled`'s doc).
 pub fn step_profiled(
     model: &Model,
@@ -273,6 +306,7 @@ pub fn step_profiled(
     match (model, caches, kv) {
         (Model::Glm52(m), ExpertCaches::Glm52(c), KvState::Glm52(k)) => Ok(crate::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
         (Model::KimiLinear(m), ExpertCaches::KimiLinear(c), KvState::KimiLinear(k)) => Ok(crate::kimi_linear::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
+        (Model::KimiK3(m), ExpertCaches::KimiK3(c), KvState::KimiK3(k)) => Ok(crate::kimi_k3::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
         _ => unreachable!("Model/ExpertCaches/KvState family mismatch -- always construct KvState/ExpertCaches from the same Model"),
     }
 }
@@ -280,12 +314,14 @@ pub fn step_profiled(
 pub enum Tokenizer {
     Glm52(Box<crate::tokenizer::Tokenizer>),
     KimiLinear(Box<crate::kimi_linear::tokenizer::Tokenizer>),
+    KimiK3(Box<crate::kimi_k3::tokenizer::Tokenizer>),
 }
 
 #[derive(Debug)]
 pub enum TokenizerError {
     Glm52(crate::tokenizer::TokenizerError),
     KimiLinear(crate::kimi_linear::tokenizer::TokenizerError),
+    KimiK3(crate::kimi_k3::tokenizer::TokenizerError),
 }
 
 impl fmt::Display for TokenizerError {
@@ -293,6 +329,7 @@ impl fmt::Display for TokenizerError {
         match self {
             TokenizerError::Glm52(e) => write!(f, "{e}"),
             TokenizerError::KimiLinear(e) => write!(f, "{e}"),
+            TokenizerError::KimiK3(e) => write!(f, "{e}"),
         }
     }
 }
@@ -301,10 +338,13 @@ impl std::error::Error for TokenizerError {}
 
 impl Tokenizer {
     /// Loads the tokenizer matching `model`'s family: GLM-5.2's `tokenizer.json` (a single
-    /// file inside `dir`) or Kimi Linear's `tiktoken.model` + `tokenizer_config.json` (both
-    /// read directly from `dir` — see `kimi_linear::tokenizer::Tokenizer::load`'s doc). Takes
-    /// `model` rather than re-peeking `config.json`'s `model_type` itself, since the caller
-    /// already resolved that via `Model::load` — no reason to read the file twice.
+    /// file inside `dir`), or either Kimi family's `tiktoken.model` + `tokenizer_config.json`
+    /// (both read directly from `dir` — see `kimi_linear::tokenizer::Tokenizer::load`'s/
+    /// `kimi_k3::tokenizer::Tokenizer::load`'s docs; K3's own file FORMAT is identical to Kimi
+    /// Linear 48B's, but the reserved-special-token COUNT differs — see `kimi_k3::tokenizer`'s
+    /// module doc). Takes `model` rather than re-peeking `config.json`'s `model_type` itself,
+    /// since the caller already resolved that via `Model::load` — no reason to read the file
+    /// twice.
     pub fn load(dir: &Path, model: &Model) -> Result<Tokenizer, TokenizerError> {
         match model {
             Model::Glm52(_) => Ok(Tokenizer::Glm52(Box::new(
@@ -313,6 +353,7 @@ impl Tokenizer {
             Model::KimiLinear(_) => {
                 Ok(Tokenizer::KimiLinear(Box::new(crate::kimi_linear::tokenizer::Tokenizer::load(dir).map_err(TokenizerError::KimiLinear)?)))
             }
+            Model::KimiK3(_) => Ok(Tokenizer::KimiK3(Box::new(crate::kimi_k3::tokenizer::Tokenizer::load(dir).map_err(TokenizerError::KimiK3)?))),
         }
     }
 
@@ -320,6 +361,7 @@ impl Tokenizer {
         match self {
             Tokenizer::Glm52(t) => t.encode(text),
             Tokenizer::KimiLinear(t) => t.encode(text),
+            Tokenizer::KimiK3(t) => t.encode(text),
         }
     }
 
@@ -327,6 +369,7 @@ impl Tokenizer {
         match self {
             Tokenizer::Glm52(t) => t.decode(ids),
             Tokenizer::KimiLinear(t) => t.decode(ids),
+            Tokenizer::KimiK3(t) => t.decode(ids),
         }
     }
 }
@@ -515,6 +558,74 @@ mod tests {
         dir
     }
 
+    /// A minimal single-layer Kimi K3 checkpoint (KDA + dense FFN, no attn-res/latent-MoE/output
+    /// gates -- those get their own dedicated coverage in `kimi_k3::model`/`generate`'s own test
+    /// modules; this one is only about proving the top-level `Model`/`KvState`/`ExpertCaches`
+    /// dispatch enum routes `model_type: "kimi_k3"` correctly end to end).
+    fn build_minimal_k3_fixture(name: &str) -> TempDir {
+        let dir = TempDir::new(name);
+        let mut seed = 17u32;
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), serde_json::json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut add = |header: &mut serde_json::Map<String, Value>, name: String, shape: Vec<usize>| {
+            let n: usize = shape.iter().product::<usize>().max(1);
+            let bytes = f32_bytes(&random_vec(n, &mut seed));
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, end]}));
+        };
+
+        let (d, dense_inter, vocab) = (6, 5, 10);
+        let (kda_head_dim, kda_n_heads, kernel) = (4, 2, 3);
+        let d_inner = kda_head_dim * kda_n_heads;
+
+        add(&mut header, "language_model.model.embed_tokens.weight".into(), vec![vocab, d]);
+        add(&mut header, "language_model.lm_head.weight".into(), vec![vocab, d]);
+        add(&mut header, "language_model.model.norm.weight".into(), vec![d]);
+        add(&mut header, "language_model.model.layers.0.input_layernorm.weight".into(), vec![d]);
+        add(&mut header, "language_model.model.layers.0.post_attention_layernorm.weight".into(), vec![d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.q_proj.weight".into(), vec![d_inner, d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.k_proj.weight".into(), vec![d_inner, d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.v_proj.weight".into(), vec![d_inner, d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.q_conv1d.weight".into(), vec![d_inner, 1, kernel]);
+        add(&mut header, "language_model.model.layers.0.self_attn.k_conv1d.weight".into(), vec![d_inner, 1, kernel]);
+        add(&mut header, "language_model.model.layers.0.self_attn.v_conv1d.weight".into(), vec![d_inner, 1, kernel]);
+        add(&mut header, "language_model.model.layers.0.self_attn.f_a_proj.weight".into(), vec![kda_head_dim, d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.f_b_proj.weight".into(), vec![d_inner, kda_head_dim]);
+        add(&mut header, "language_model.model.layers.0.self_attn.dt_bias".into(), vec![d_inner]);
+        add(&mut header, "language_model.model.layers.0.self_attn.A_log".into(), vec![1, 1, kda_n_heads, 1]);
+        add(&mut header, "language_model.model.layers.0.self_attn.b_proj.weight".into(), vec![kda_n_heads, d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.g_a_proj.weight".into(), vec![kda_head_dim, d]);
+        add(&mut header, "language_model.model.layers.0.self_attn.g_b_proj.weight".into(), vec![d_inner, kda_head_dim]);
+        add(&mut header, "language_model.model.layers.0.self_attn.o_norm.weight".into(), vec![kda_head_dim]);
+        add(&mut header, "language_model.model.layers.0.self_attn.o_proj.weight".into(), vec![d, d_inner]);
+        add(&mut header, "language_model.model.layers.0.mlp.gate_proj.weight".into(), vec![dense_inter, d]);
+        add(&mut header, "language_model.model.layers.0.mlp.up_proj.weight".into(), vec![dense_inter, d]);
+        add(&mut header, "language_model.model.layers.0.mlp.down_proj.weight".into(), vec![d, dense_inter]);
+
+        let text_config = serde_json::json!({
+            "model_type": "kimi_linear",
+            "hidden_size": d, "num_hidden_layers": 1, "num_attention_heads": 2,
+            "first_k_dense_replace": 1, "q_lora_rank": null, "kv_lora_rank": 4,
+            "qk_nope_head_dim": 2, "qk_rope_head_dim": 2, "v_head_dim": 3,
+            "num_experts": 2, "num_experts_per_token": 1, "num_shared_experts": 0,
+            "num_expert_group": 1, "topk_group": 1, "moe_intermediate_size": 2,
+            "intermediate_size": dense_inter, "vocab_size": vocab, "moe_renormalize": true,
+            "rms_norm_eps": 1e-5, "routed_scaling_factor": 1.0, "mla_use_nope": true,
+            "moe_router_activation_func": "sigmoid", "rope_theta": 10000.0,
+            "linear_attn_config": {
+                "head_dim": kda_head_dim, "num_heads": kda_n_heads, "short_conv_kernel_size": kernel,
+                "kda_layers": [1], "full_attn_layers": []
+            }
+        });
+        let cfg_json = serde_json::json!({ "model_type": "kimi_k3", "text_config": text_config });
+        fs::write(dir.0.join("config.json"), cfg_json.to_string()).unwrap();
+        write_safetensors(&dir.0, header, data);
+        dir
+    }
+
     #[test]
     fn load_and_step_dispatch_correctly_for_a_real_glm52_checkpoint() {
         let fixture = build_minimal_glm52_fixture("rabbit_test_model_dispatch_glm52_happy_path");
@@ -544,6 +655,58 @@ mod tests {
         // carry across dispatch calls the same way it does calling kimi_linear::generate directly.
         let logits2 = step(&model, &shards, &mut caches, &mut kv, &[2], 2).unwrap();
         assert_eq!(logits2.len(), 10);
+    }
+
+    #[test]
+    fn load_and_step_dispatch_correctly_for_a_real_kimi_k3_checkpoint() {
+        let fixture = build_minimal_k3_fixture("rabbit_test_model_dispatch_k3_happy_path");
+        let model = Model::load(&fixture.0, 32, 32).unwrap();
+        assert!(matches!(model, Model::KimiK3(_)));
+        assert_eq!(model.n_layers(), 1);
+
+        let shards = crate::safetensors::Shards::open(&fixture.0).unwrap();
+        let mut caches = ExpertCaches::new(&model, 4);
+        let mut kv = KvState::new(&model);
+        let logits = step(&model, &shards, &mut caches, &mut kv, &[0, 1], 0).unwrap();
+        assert_eq!(logits.len(), 10); // vocab
+
+        // a second, decode-style step must also work through the dispatch enum, same as the
+        // Kimi Linear test above.
+        let logits2 = step(&model, &shards, &mut caches, &mut kv, &[2], 2).unwrap();
+        assert_eq!(logits2.len(), 10);
+
+        // --session works through the dispatch enum too -- save the two steps taken above,
+        // reload into a fresh KvState, and confirm a follow-up step continues identically.
+        let session_path = fixture.0.join("session.bin");
+        kv.save(0, 3, &session_path).unwrap();
+        let (mut kv_loaded, loaded_pos) = KvState::load(&session_path, &model).unwrap();
+        assert_eq!(loaded_pos, 3);
+        let mut caches_loaded = ExpertCaches::new(&model, 4);
+        let logits3_original = step(&model, &shards, &mut caches, &mut kv, &[4], 3).unwrap();
+        let logits3_loaded = step(&model, &shards, &mut caches_loaded, &mut kv_loaded, &[4], 3).unwrap();
+        assert_eq!(logits3_original, logits3_loaded, "resumed K3 session must continue bit-for-bit identically");
+
+        // The tokenizer IS wired -- but this fixture's dir has no tiktoken.model/
+        // tokenizer_config.json (only the checkpoint's own tensors/config), so loading must fail
+        // with a real (KimiK3-wrapped) IO error, not silently succeed or panic.
+        assert!(matches!(Tokenizer::load(&fixture.0, &model), Err(TokenizerError::KimiK3(_))));
+
+        // With the REAL fixture files (tests/fixtures/k3/, if present -- same policy as
+        // k3_tokenizer_fixture.rs) copied alongside the checkpoint, the tokenizer must load and
+        // dispatch for real.
+        let real_fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/k3");
+        if real_fixtures.join("tiktoken.model").is_file() {
+            fs::copy(real_fixtures.join("tiktoken.model"), fixture.0.join("tiktoken.model")).unwrap();
+            fs::copy(real_fixtures.join("tokenizer_config.json"), fixture.0.join("tokenizer_config.json")).unwrap();
+            let tok = Tokenizer::load(&fixture.0, &model).expect("real K3 tokenizer fixture must load");
+            let ids = tok.encode("hello");
+            assert_eq!(tok.decode(&ids), b"hello");
+        } else {
+            eprintln!(
+                "SKIP the real-tokenizer part of load_and_step_dispatch_correctly_for_a_real_kimi_k3_checkpoint: \
+                 tests/fixtures/k3 not found — run tools/fetch_k3_tokenizer_fixture.py first."
+            );
+        }
     }
 
     #[test]
@@ -584,6 +747,11 @@ mod tests {
         let mut kimi_model = Model::load(&kimi_fixture.0, 32, 32).unwrap();
         assert_eq!(kimi_model.n_layers(), 1);
         kimi_model.set_cache_route(true);
+
+        let k3_fixture = build_minimal_k3_fixture("rabbit_test_model_dispatch_helpers_k3");
+        let mut k3_model = Model::load(&k3_fixture.0, 32, 32).unwrap();
+        assert_eq!(k3_model.n_layers(), 1);
+        k3_model.set_cache_route(true);
     }
 
     #[test]

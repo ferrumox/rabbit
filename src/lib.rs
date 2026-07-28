@@ -6,6 +6,7 @@ pub mod expert_cache;
 pub mod generate;
 pub mod glm52;
 pub mod kernels;
+pub mod kimi_k3;
 pub mod kimi_linear;
 pub mod kv_session;
 pub mod model;

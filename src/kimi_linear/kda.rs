@@ -29,8 +29,24 @@ fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// KDA's per-channel forget-gate parameterization for ONE head:
-/// `alpha[i] = exp(-exp(a_log) * softplus(g[i] + dt_bias[i]))`.
+/// `alpha[i] = exp(-exp(a_log) * softplus(g[i] + dt_bias[i]))`, or — when `lower_bound` is
+/// `Some` (Kimi K3's real checkpoint, `gate_lower_bound: -5.0`) — the DIFFERENT bounded formula
+/// `alpha[i] = exp(lower_bound * sigmoid(exp(a_log) * (g[i] + dt_bias[i])))`. **Confirmed by
+/// reading the actual installed `fla-core` (0.5.2) source this session, not guessed**:
+/// `fla.ops.kda.gate.naive_kda_lowerbound_gate` computes `lower_bound * sigmoid(exp(A_log) * (g +
+/// dt_bias))`, and `fla.ops.kda.naive.naive_recurrent_kda`'s own docstring explicitly documents
+/// its `g` parameter as "Per-dimension decay gates (**log-space**)" — i.e. BOTH formulas hand
+/// back log-alpha, and the final `.exp()` this function already applied for the plain formula
+/// must also apply to the bounded one, not just clip/replace it. This is genuinely a different
+/// formula from the plain one, not a floor bolted onto it — `naive_kda_gate` (plain) is unbounded
+/// below as its input grows (softplus is unbounded), `naive_kda_lowerbound_gate` uses `sigmoid`
+/// instead, which saturates, giving `alpha` a real floor at `exp(lower_bound)` (e.g. `-5.0` ->
+/// alpha never drops below `~0.0067`) instead of being able to approach `0`.
 ///
 /// **`a_log` is a single scalar for this whole head, not one value per channel** — confirmed
 /// against the real `fla.ops.kda.gate.naive_kda_gate` reference this session (not the paper's
@@ -41,17 +57,29 @@ fn softplus(x: f32) -> f32 {
 /// 32 values for 32 heads, not `32*128` — cross-checking this against actual weight shapes is
 /// what caught the earlier (wrong) all-slices-are-d_k-wide signature this function used to have.
 /// `g`/`dt_bias`/`alpha` are all `d_k`-wide (`g` a per-token low-rank projection of the hidden
-/// state, computed elsewhere). Since `softplus(x) > 0` always and `exp(a_log) > 0` always, the
-/// exponent is always `<= 0`, so `alpha[i]` always lands in `(0, 1]` — exactly the range
-/// `KdaState::step`'s `Diag(alpha)` term (a per-channel decay, never a growth) requires.
-pub fn decay_gate(a_log: f32, g: &[f32], dt_bias: &[f32], alpha: &mut [f32]) {
+/// state, computed elsewhere). Either formula always lands in `(0, 1]` (the plain one: since
+/// `softplus(x) > 0` and `exp(a_log) > 0` always, the pre-exp exponent is always `<= 0`; the
+/// bounded one: `sigmoid` is always in `(0,1)` and `lower_bound < 0`, so the pre-exp exponent is
+/// always in `(lower_bound, 0)`) — exactly the range `KdaState::step`'s `Diag(alpha)` term (a
+/// per-channel decay, never a growth) requires either way.
+pub fn decay_gate(a_log: f32, g: &[f32], dt_bias: &[f32], lower_bound: Option<f32>, alpha: &mut [f32]) {
     let d_k = g.len();
     assert_eq!(dt_bias.len(), d_k);
     assert_eq!(alpha.len(), d_k);
 
-    let neg_exp_a_log = -a_log.exp();
-    for i in 0..d_k {
-        alpha[i] = (neg_exp_a_log * softplus(g[i] + dt_bias[i])).exp();
+    match lower_bound {
+        None => {
+            let neg_exp_a_log = -a_log.exp();
+            for i in 0..d_k {
+                alpha[i] = (neg_exp_a_log * softplus(g[i] + dt_bias[i])).exp();
+            }
+        }
+        Some(lb) => {
+            let exp_a_log = a_log.exp();
+            for i in 0..d_k {
+                alpha[i] = (lb * sigmoid(exp_a_log * (g[i] + dt_bias[i]))).exp();
+            }
+        }
     }
 }
 
@@ -195,7 +223,7 @@ mod tests {
         let dt_bias = random_vec(d_k, &mut seed);
 
         let mut alpha = vec![0f32; d_k];
-        decay_gate(a_log, &g, &dt_bias, &mut alpha);
+        decay_gate(a_log, &g, &dt_bias, None, &mut alpha);
 
         for i in 0..d_k {
             let expected = (-a_log.exp() * naive_softplus(g[i] + dt_bias[i])).exp();
@@ -214,7 +242,7 @@ mod tests {
         let dt_bias: Vec<f32> = random_vec(d_k, &mut seed).iter().map(|x| x * 50.0).collect();
 
         let mut alpha = vec![0f32; d_k];
-        decay_gate(a_log, &g, &dt_bias, &mut alpha);
+        decay_gate(a_log, &g, &dt_bias, None, &mut alpha);
 
         for &a in &alpha {
             assert!(a.is_finite(), "alpha must stay finite even at extreme gate inputs");
@@ -235,12 +263,12 @@ mod tests {
         let ln2 = std::f32::consts::LN_2;
 
         let mut alpha_0 = [0f32; 2];
-        decay_gate(0.0, &g, &dt_bias, &mut alpha_0);
+        decay_gate(0.0, &g, &dt_bias, None, &mut alpha_0);
         assert!((alpha_0[0] - (-ln2).exp()).abs() < 1e-6); // exp(a_log=0)=1
         assert!((alpha_0[1] - (-ln2).exp()).abs() < 1e-6); // same a_log broadcasts to every channel
 
         let mut alpha_1 = [0f32; 2];
-        decay_gate(1.0, &g, &dt_bias, &mut alpha_1);
+        decay_gate(1.0, &g, &dt_bias, None, &mut alpha_1);
         assert!((alpha_1[0] - (-std::f32::consts::E * ln2).exp()).abs() < 1e-6); // exp(a_log=1)=e
         assert!((alpha_1[1] - (-std::f32::consts::E * ln2).exp()).abs() < 1e-6);
     }
@@ -251,8 +279,70 @@ mod tests {
         let g = [100.0f32];
         let dt_bias = [0.0f32];
         let mut alpha = [0f32];
-        decay_gate(0.0, &g, &dt_bias, &mut alpha);
+        decay_gate(0.0, &g, &dt_bias, None, &mut alpha);
         assert!(alpha[0] < 1e-40, "gate should saturate almost fully closed, got {}", alpha[0]);
+    }
+
+    #[test]
+    fn decay_gate_bounded_matches_naive_reference() {
+        // Independent re-derivation of the K3-only bounded formula (see decay_gate's doc):
+        // alpha[i] = exp(lower_bound * sigmoid(exp(a_log) * (g[i] + dt_bias[i]))).
+        fn naive_sigmoid(x: f32) -> f32 {
+            1.0 / (1.0 + (-x).exp())
+        }
+        let mut seed = 33u32;
+        let d_k = 6;
+        let a_log = xorshift(&mut seed);
+        let g = random_vec(d_k, &mut seed);
+        let dt_bias = random_vec(d_k, &mut seed);
+        let lower_bound = -5.0f32;
+
+        let mut alpha = vec![0f32; d_k];
+        decay_gate(a_log, &g, &dt_bias, Some(lower_bound), &mut alpha);
+
+        for i in 0..d_k {
+            let expected = (lower_bound * naive_sigmoid(a_log.exp() * (g[i] + dt_bias[i]))).exp();
+            assert!((alpha[i] - expected).abs() < 1e-5, "{} vs {}", alpha[i], expected);
+        }
+    }
+
+    #[test]
+    fn decay_gate_bounded_differs_from_the_plain_formula() {
+        // Not a redundant test of correctness -- proves the `Some(lower_bound)` branch is a
+        // genuinely DIFFERENT formula (sigmoid-based), not the plain softplus formula with a
+        // clip applied on top, which would coincide with the plain output whenever the plain
+        // value already happens to be above the bound.
+        let mut seed = 44u32;
+        let d_k = 5;
+        let a_log = xorshift(&mut seed);
+        let g = random_vec(d_k, &mut seed);
+        let dt_bias = random_vec(d_k, &mut seed);
+
+        let mut plain = vec![0f32; d_k];
+        decay_gate(a_log, &g, &dt_bias, None, &mut plain);
+        let mut bounded = vec![0f32; d_k];
+        decay_gate(a_log, &g, &dt_bias, Some(-5.0), &mut bounded);
+
+        assert_ne!(plain, bounded);
+    }
+
+    #[test]
+    fn decay_gate_bounded_alpha_never_drops_below_exp_of_the_lower_bound() {
+        // sigmoid saturates toward 1 as its input grows, so lower_bound*sigmoid(...) approaches
+        // lower_bound (never goes past it) -- alpha = exp(that) has a real floor at
+        // exp(lower_bound), unlike the plain formula which can approach 0 arbitrarily closely.
+        let d_k = 3;
+        let g = [1000.0f32, 1000.0, 1000.0]; // pushes sigmoid(...) essentially to 1
+        let dt_bias = [0.0f32, 0.0, 0.0];
+        let lower_bound = -5.0f32;
+        let mut alpha = vec![0f32; d_k];
+        decay_gate(2.0, &g, &dt_bias, Some(lower_bound), &mut alpha);
+
+        let floor = lower_bound.exp();
+        for &a in &alpha {
+            assert!(a > 0.0 && a.is_finite());
+            assert!((a - floor).abs() < 1e-3, "alpha={a} should approach the floor exp(lower_bound)={floor}");
+        }
     }
 
     #[test]
