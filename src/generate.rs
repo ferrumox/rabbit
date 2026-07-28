@@ -75,6 +75,14 @@ impl ExpertCaches {
         self.0.iter().flatten().fold((0, 0, 0), |(h, m, n), c| (h + c.hits, m + c.misses, n + c.load_nanos))
     }
 
+    /// Summed `io_wait_nanos` (pure `io_uring` disk wait, excluding decode/copy work) across
+    /// every MoE layer's cache — see `ExpertCache::io_wait_nanos`'s doc and `PERFORMANCE.md`
+    /// for why this exists separately from `hit_miss_totals`'s `load_nanos`, which conflates
+    /// the two.
+    pub fn io_wait_nanos_total(&self) -> u64 {
+        self.0.iter().flatten().map(|c| c.io_wait_nanos).sum()
+    }
+
     /// Reads `<model_dir>/.rabbit_usage` (if any), seeds every MoE layer's usage counters from
     /// it, and — if the persisted total selection count (`hist`, summed across ALL layers)
     /// reaches `usage_cache::HIST_THRESHOLD` — marks each layer's top

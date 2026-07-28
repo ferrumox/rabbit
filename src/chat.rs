@@ -154,10 +154,22 @@ pub fn render_messages(messages: &[(Role, String)], think: bool) -> String {
 /// progress (the CLI's stderr output) or build streaming output (the server's SSE chunks)
 /// without `generate_reply` itself needing to know which.
 pub enum GenEvent<'a> {
-    /// The prefill step (forwarding `turn_ids`) completed.
-    Prefill { tokens: usize, seconds: f32, hits: u64, misses: u64, io_seconds: f32 },
+    /// The prefill step (forwarding `turn_ids`) completed. `io_wait_seconds` is the portion of
+    /// `io_seconds` that was pure disk wait (`io_uring`'s `submit_and_wait`) rather than the
+    /// decode/copy work that follows it — see `ExpertCache::io_wait_nanos`'s doc.
+    Prefill { tokens: usize, seconds: f32, hits: u64, misses: u64, io_seconds: f32, io_wait_seconds: f32 },
     /// One new token was generated (decode step `index` of at most `max`).
-    Token { token_id: usize, bytes: &'a [u8], index: usize, max: usize, seconds: f32, hits: u64, misses: u64, io_seconds: f32 },
+    Token {
+        token_id: usize,
+        bytes: &'a [u8],
+        index: usize,
+        max: usize,
+        seconds: f32,
+        hits: u64,
+        misses: u64,
+        io_seconds: f32,
+        io_wait_seconds: f32,
+    },
 }
 
 /// Forwards `turn_ids` (prefill, continuing from `pos_base` positions already in `kv`) then
@@ -178,7 +190,15 @@ pub fn generate_reply(
     let mut step_t = std::time::Instant::now();
     let mut logits = generate::step(&sess.model, &sess.shards, &mut sess.caches, kv, turn_ids, pos_base)?;
     let (mut hits, mut misses, mut io_ns) = sess.caches.hit_miss_totals();
-    on_event(GenEvent::Prefill { tokens: turn_ids.len(), seconds: step_t.elapsed().as_secs_f32(), hits, misses, io_seconds: io_ns as f32 / 1e9 });
+    let mut io_wait_ns = sess.caches.io_wait_nanos_total();
+    on_event(GenEvent::Prefill {
+        tokens: turn_ids.len(),
+        seconds: step_t.elapsed().as_secs_f32(),
+        hits,
+        misses,
+        io_seconds: io_ns as f32 / 1e9,
+        io_wait_seconds: io_wait_ns as f32 / 1e9,
+    });
     let mut pos = pos_base + turn_ids.len();
 
     let mut out_ids = Vec::with_capacity(sess.max_tokens);
@@ -190,14 +210,26 @@ pub fn generate_reply(
         out_ids.push(next);
         if out_ids.len() >= sess.max_tokens {
             let decoded = sess.tokenizer.decode(&[next as i32]);
-            on_event(GenEvent::Token { token_id: next, bytes: &decoded, index: out_ids.len(), max: sess.max_tokens, seconds: 0.0, hits, misses, io_seconds: 0.0 });
+            on_event(GenEvent::Token {
+                token_id: next,
+                bytes: &decoded,
+                index: out_ids.len(),
+                max: sess.max_tokens,
+                seconds: 0.0,
+                hits,
+                misses,
+                io_seconds: 0.0,
+                io_wait_seconds: 0.0,
+            });
             break;
         }
         let io_ns_before = io_ns;
+        let io_wait_ns_before = io_wait_ns;
         step_t = std::time::Instant::now();
         logits = generate::step(&sess.model, &sess.shards, &mut sess.caches, kv, &[next], pos)?;
         let step_seconds = step_t.elapsed().as_secs_f32();
         (hits, misses, io_ns) = sess.caches.hit_miss_totals();
+        io_wait_ns = sess.caches.io_wait_nanos_total();
         let decoded = sess.tokenizer.decode(&[next as i32]);
         on_event(GenEvent::Token {
             token_id: next,
@@ -208,6 +240,7 @@ pub fn generate_reply(
             hits,
             misses,
             io_seconds: (io_ns - io_ns_before) as f32 / 1e9,
+            io_wait_seconds: (io_wait_ns - io_wait_ns_before) as f32 / 1e9,
         });
         pos += 1;
     }

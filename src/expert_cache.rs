@@ -67,19 +67,26 @@ mod uring_load {
         rows: usize,
         cols: usize,
         loc: TensorLocation,
-        /// `Some(scale)` when a `{name}.qs` sibling exists: `loc` then points at already-
-        /// packed int8/int4/int2 bytes (the reference's pre-quantized container format, see `model.rs`'s
-        /// `qt_load`) to wrap as-is via `QT::from_packed`, not raw f32/bf16/FP8 to decode and
-        /// requantize. The scale itself is tiny (`rows` floats) — fetched with a plain
-        /// `read_f32` up front rather than folded into the batched `io_uring` reads, which
-        /// exist to amortize the *big* per-expert tensors, not a few-KB sidecar.
-        packed_scale: Option<Vec<f32>>,
-        /// `Some(scale)` when `loc.dtype == F8E4M3` (mutually exclusive with `packed_scale` —
-        /// a tensor is never both `.qs`-packed and raw FP8): the `{name}_scale_inv` 128x128
-        /// block-scale sidecar, fetched up front the same way `packed_scale` is, so the raw
-        /// bytes `io_uring` reads back can be dequantized correctly instead of falling through
-        /// to `Shards::decode_f32`'s *unscaled* per-element FP8 decode.
-        fp8_scale: Option<Vec<f32>>,
+        /// `Some(index into Pending::scale_bufs)` when a `{name}.qs` sibling exists: `loc` then
+        /// points at already-packed int8/int4/int2 bytes (the reference's pre-quantized
+        /// container format, see `model.rs`'s `qt_load`) to wrap as-is via `QT::from_packed`,
+        /// not raw f32/bf16/FP8 to decode and requantize. The scale itself is tiny (`rows`
+        /// floats) but is submitted in the SAME `io_uring` batch as `loc`'s own read (not a
+        /// synchronous pre-read loop before the batch even starts) — measured on the real
+        /// checkpoint that the old "it's only a few KB, not worth batching" reasoning was
+        /// wrong: with up to `cache_capacity` misses per round each paying one blocking
+        /// syscall's worth of latency SEQUENTIALLY before the big reads even began, that prefix
+        /// alone accounted for close to the whole gap between a raw-disk throughput probe
+        /// (~4.8 GB/s on this box) and what a real generation run actually achieved (~1.15
+        /// GB/s) — see `PERFORMANCE.md`.
+        packed_scale: Option<usize>,
+        /// `Some(index into Pending::scale_bufs)` when `loc.dtype == F8E4M3` (mutually
+        /// exclusive with `packed_scale` — a tensor is never both `.qs`-packed and raw FP8):
+        /// the `{name}_scale_inv` 128x128 block-scale sidecar, batched the same way
+        /// `packed_scale` is, so the raw bytes `io_uring` reads back can be dequantized
+        /// correctly instead of falling through to `Shards::decode_f32`'s *unscaled*
+        /// per-element FP8 decode.
+        fp8_scale: Option<usize>,
     }
 
     /// A persistent `io_uring` instance, reused across every `submit_batch` call for as long as
@@ -103,13 +110,16 @@ mod uring_load {
         }
     }
 
-    /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity (3
-    /// tensors/expert). Returns `None` if `io_uring` isn't usable on this host (the
+    /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity: 3
+    /// tensors/expert, plus up to one scale-sidecar read per tensor (`.qs` packed scale or FP8
+    /// `_scale_inv` — mutually exclusive per tensor, so this is a worst-case upper bound, not a
+    /// typical one) submitted in the SAME batch instead of a synchronous pre-read — see
+    /// `submit_batch`'s doc for why. Returns `None` if `io_uring` isn't usable on this host (the
     /// `io_uring_disabled` sysctl, a seccomp profile blocking the syscalls, ...) — every
     /// `submit_batch` call then falls back to a synchronous load, same as a hard per-call
     /// failure would.
     pub(super) fn new_ring(cache_capacity: usize) -> Option<Ring> {
-        Ring::new(cache_capacity * 3).ok()
+        Ring::new(cache_capacity * 3 * 2).ok()
     }
 
     /// A batch of expert reads submitted to `ring` but not yet awaited — `complete_batch` must
@@ -119,6 +129,10 @@ mod uring_load {
     pub(super) struct Pending {
         reqs: Vec<Req>,
         bufs: Vec<Vec<u8>>,
+        /// Scale-sidecar buffers (`.qs`/`_scale_inv`), indexed by `Req::packed_scale`/
+        /// `Req::fp8_scale` — submitted in the same `io_uring` round as `bufs`, at `user_data`
+        /// tags `reqs.len()..reqs.len()+scale_bufs.len()`.
+        scale_bufs: Vec<Vec<u8>>,
         eids: Vec<usize>,
     }
 
@@ -132,7 +146,10 @@ mod uring_load {
         }
     }
 
-    /// Submits reads for every tensor in `misses` (3/expert) WITHOUT waiting for completion.
+    /// Submits reads for every tensor in `misses` (3/expert) — plus, in the SAME `io_uring`
+    /// round, any `.qs`/FP8 scale sidecar those tensors need — WITHOUT waiting for completion.
+    /// Locating a sidecar (`shards.tensor_location`) is a plain in-memory header lookup, not
+    /// I/O, so nothing here blocks; only the actual byte reads are deferred to the ring.
     /// Returns `Ok(None)` — not an error — when the ring is unavailable, the batch doesn't fit
     /// in one submission round, or the submission itself fails; every one of these just means
     /// "the caller should fall back to a synchronous load for this batch," same as a hard
@@ -144,28 +161,34 @@ mod uring_load {
         let d = cfg.hidden as usize;
 
         let mut reqs = Vec::with_capacity(misses.len() * 3);
+        let mut scale_locs: Vec<TensorLocation> = Vec::new();
         for &eid in misses {
             let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}.weight");
             for (suf, rows, cols) in [("gate_proj", i, d), ("up_proj", i, d), ("down_proj", d, i)] {
                 let name = p(suf);
-                let qs_name = format!("{name}.qs");
-                let packed_scale = if shards.has(&qs_name) { Some(shards.read_f32(&qs_name, false)?) } else { None };
                 let loc = shards.tensor_location(&name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name.clone())))?;
-                let fp8_scale = if packed_scale.is_none() && loc.dtype == DType::F8E4M3 {
+
+                let mut packed_scale = None;
+                let mut fp8_scale = None;
+                if let Some(sloc) = shards.tensor_location(&format!("{name}.qs")) {
+                    packed_scale = Some(scale_locs.len());
+                    scale_locs.push(sloc);
+                } else if loc.dtype == DType::F8E4M3 {
                     let scale_name = format!("{name}_scale_inv");
-                    Some(shards.read_f32(&scale_name, false)?)
-                } else {
-                    None
-                };
+                    let sloc = shards.tensor_location(&scale_name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(scale_name)))?;
+                    fp8_scale = Some(scale_locs.len());
+                    scale_locs.push(sloc);
+                }
                 reqs.push(Req { rows, cols, loc, packed_scale, fp8_scale });
             }
         }
 
-        if reqs.len() > r.capacity {
+        if reqs.len() + scale_locs.len() > r.capacity {
             return Ok(None);
         }
 
         let mut bufs: Vec<Vec<u8>> = reqs.iter().map(|req| vec![0u8; req.loc.nbytes as usize]).collect();
+        let mut scale_bufs: Vec<Vec<u8>> = scale_locs.iter().map(|loc| vec![0u8; loc.nbytes as usize]).collect();
 
         {
             let mut sq = r.io.submission();
@@ -180,24 +203,41 @@ mod uring_load {
                     sq.push(&read_e).expect("checked batch fits ring capacity above");
                 }
             }
+            for (local, loc) in scale_locs.iter().enumerate() {
+                let buf = &mut scale_bufs[local];
+                let user_data = (reqs.len() + local) as u64;
+                let read_e = opcode::Read::new(types::Fd(loc.fd), buf.as_mut_ptr(), buf.len() as u32).offset(loc.offset).build().user_data(user_data);
+                // Safety: same as the main-tensor push above.
+                unsafe {
+                    sq.push(&read_e).expect("checked batch fits ring capacity above");
+                }
+            }
         }
         if r.io.submit().is_err() {
             return Ok(None);
         }
 
-        Ok(Some(Pending { reqs, bufs, eids: misses.to_vec() }))
+        Ok(Some(Pending { reqs, bufs, scale_bufs, eids: misses.to_vec() }))
     }
 
     /// Waits for every read `submit_batch` started, validates each one's byte count, and
     /// decodes the results into `ExpertSlot`s — the other half of `submit_batch`'s split,
     /// called on the same `ring` (`submit_batch` only returns `Some` when the ring exists, so
     /// this never needs its own "ring unavailable" fallback).
-    pub(super) fn complete_batch(ring: &mut Ring, pending: Pending, bits: u8, used: u64) -> Result<Vec<ExpertSlot>, std::io::Error> {
-        let Pending { reqs, bufs, eids } = pending;
+    /// Returns the loaded slots plus, separately, how many of those nanoseconds were spent
+    /// purely in `submit_and_wait` (waiting on the kernel/disk) — split out from `load_nanos`
+    /// (which times this whole function, wait AND decode/copy together) specifically so a
+    /// diagnostic run can tell apart "still disk-bound" from "decode/copy is now the bigger
+    /// cost," the question that found the `qt_from_raw` buffer-copy fix — see `PERFORMANCE.md`.
+    pub(super) fn complete_batch(ring: &mut Ring, pending: Pending, bits: u8, used: u64) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
+        let Pending { reqs, bufs, scale_bufs, eids } = pending;
+        let total = reqs.len() + scale_bufs.len();
 
-        ring.io.submit_and_wait(reqs.len())?;
+        let wait_t = std::time::Instant::now();
+        ring.io.submit_and_wait(total)?;
+        let io_wait_nanos = wait_t.elapsed().as_nanos() as u64;
 
-        let mut results = vec![None; reqs.len()];
+        let mut results = vec![None; total];
         for cqe in ring.io.completion() {
             results[cqe.user_data() as usize] = Some(cqe.result());
         }
@@ -212,6 +252,22 @@ mod uring_load {
                 None => return Err(std::io::Error::other("expert read: no completion queue entry")),
             }
         }
+        for (local, buf) in scale_bufs.iter().enumerate() {
+            let idx = reqs.len() + local;
+            match results[idx] {
+                Some(n) if n as u64 == buf.len() as u64 => {}
+                Some(n) if n >= 0 => {
+                    let msg = format!("expert scale read: short read ({n}/{} bytes)", buf.len());
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, msg));
+                }
+                Some(n) => return Err(std::io::Error::from_raw_os_error(-n)),
+                None => return Err(std::io::Error::other("expert scale read: no completion queue entry")),
+            }
+        }
+
+        // decode every scale sidecar once up front (plain byte->f32 reinterpretation, no I/O
+        // left to do) so `qt_from_raw` below just indexes into `scales` instead of re-decoding.
+        let scales: Vec<Vec<f32>> = scale_bufs.iter().map(|b| Shards::decode_f32(b, DType::F32)).collect();
 
         // group the 3 reads per expert back into one ExpertSlot each, in `eids` order. A
         // decode error here (bad `.qs`/FP8 format) is a real data problem, not a transient I/O
@@ -220,28 +276,36 @@ mod uring_load {
         // into the same I/O-error path here is simpler than threading a second error type
         // through, and `finish_loading`'s fallback fails the same way through `qt_load`
         // instead: same end result either way.
+        // `bufs` is consumed in the SAME order it was built (3 entries/expert, `misses` order)
+        // — `.into_iter()` here instead of indexing lets `qt_from_raw` take each buffer BY
+        // VALUE (straight into `QT::from_packed`, which already wants an owned `Vec<u8>`)
+        // instead of `raw.to_vec()`-cloning a borrowed slice. Measured on the real checkpoint:
+        // this decode/copy loop (not the actual disk wait — see `io_wait_nanos`) was ~25s of a
+        // ~62s "disk I/O" figure, almost entirely these redundant per-tensor clones.
+        let mut bufs = bufs.into_iter();
         let mut out = Vec::with_capacity(eids.len());
         for (chunk, &eid) in eids.iter().enumerate() {
             let base = chunk * 3;
-            let decode = |buf: &[u8], req: &Req| qt_from_raw(buf, req, bits).map_err(|e| std::io::Error::other(e.to_string()));
-            let gate = decode(&bufs[base], &reqs[base])?;
-            let up = decode(&bufs[base + 1], &reqs[base + 1])?;
-            let down = decode(&bufs[base + 2], &reqs[base + 2])?;
+            let mut next_buf = || bufs.next().expect("bufs has exactly 3 entries per expert, in the same order as reqs");
+            let decode = |buf: Vec<u8>, req: &Req| qt_from_raw(buf, req, bits, &scales).map_err(|e| std::io::Error::other(e.to_string()));
+            let gate = decode(next_buf(), &reqs[base])?;
+            let up = decode(next_buf(), &reqs[base + 1])?;
+            let down = decode(next_buf(), &reqs[base + 2])?;
             out.push(ExpertSlot { eid, gate, up, down, used });
         }
-        Ok(out)
+        Ok((out, io_wait_nanos))
     }
 
-    fn qt_from_raw(raw: &[u8], req: &Req, bits: u8) -> Result<QT, ModelError> {
-        if let Some(scale) = &req.packed_scale {
-            return QT::from_packed(req.rows, req.cols, bits, raw.to_vec(), scale.clone())
+    fn qt_from_raw(raw: Vec<u8>, req: &Req, bits: u8, scales: &[Vec<f32>]) -> Result<QT, ModelError> {
+        if let Some(idx) = req.packed_scale {
+            return QT::from_packed(req.rows, req.cols, bits, raw, scales[idx].clone())
                 .map_err(|source| ModelError::PackedFormat { name: "expert tensor (.qs)".to_string(), source });
         }
-        let w = if let Some(scale) = &req.fp8_scale {
-            dequant_fp8_blockscale(raw, req.rows as u64, req.cols as u64, scale, "expert tensor (fp8 scale_inv)")
+        let w = if let Some(idx) = req.fp8_scale {
+            dequant_fp8_blockscale(&raw, req.rows as u64, req.cols as u64, &scales[idx], "expert tensor (fp8 scale_inv)")
                 .map_err(ModelError::Safetensors)?
         } else {
-            Shards::decode_f32(raw, req.loc.dtype)
+            Shards::decode_f32(&raw, req.loc.dtype)
         };
         let mut t = QT::alloc(req.rows, req.cols, bits, false);
         t.fill(&w);
@@ -317,6 +381,14 @@ pub struct ExpertCache {
     /// I/O-bound" from "already compute-bound" before investing in either kind of further
     /// optimization.
     pub load_nanos: u64,
+    /// The portion of `load_nanos` (Linux `io_uring` path only) spent purely in
+    /// `submit_and_wait` — actually waiting on the kernel/disk, not decoding or copying the
+    /// results afterward. `load_nanos - io_wait_nanos` is everything else `finish_loading`'s
+    /// async branch does (validation, scale decode, the `qt_from_raw` loop's buffer copies) —
+    /// distinguishing the two is what found the buffer-copy fix documented in
+    /// `PERFORMANCE.md`: about 40% of a real run's reported "disk I/O" time turned out to be
+    /// this CPU-side work, not the drive.
+    pub io_wait_nanos: u64,
     #[cfg(target_os = "linux")]
     ring: Option<uring_load::Ring>,
 }
@@ -342,6 +414,7 @@ impl ExpertCache {
             hits: 0,
             misses: 0,
             load_nanos: 0,
+            io_wait_nanos: 0,
             #[cfg(target_os = "linux")]
             ring: uring_load::new_ring(capacity),
         }
@@ -466,7 +539,10 @@ impl ExpertCache {
                 let result = uring_load::complete_batch(ring, p, bits, self.clock);
                 self.load_nanos += load_t.elapsed().as_nanos() as u64;
                 match result {
-                    Ok(v) => v,
+                    Ok((v, io_wait_nanos)) => {
+                        self.io_wait_nanos += io_wait_nanos;
+                        v
+                    }
                     Err(_) => sequential_fallback(shards, cfg, layer, &eids_for_fallback, bits, self.clock)?,
                 }
             }

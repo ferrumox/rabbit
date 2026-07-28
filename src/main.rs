@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
-[--session <path>] [--no-usage-cache] [--cache-route] [--host H] [--port N] [--api-key K]";
+[--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K]";
 
 struct Args {
     model_dir: PathBuf,
@@ -30,6 +30,9 @@ struct Args {
     session: Option<PathBuf>,
     no_usage_cache: bool,
     cache_route: bool,
+    /// `None` = use the default (physical core count — see `main`'s call to
+    /// `rayon::ThreadPoolBuilder`). `--threads` overrides it explicitly.
+    threads: Option<usize>,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -51,6 +54,7 @@ fn parse_args() -> Result<Args, String> {
     let mut session = None;
     let mut no_usage_cache = false;
     let mut cache_route = false;
+    let mut threads = None;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut api_key = None;
@@ -74,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
             "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--no-usage-cache" => no_usage_cache = true,
             "--cache-route" => cache_route = true,
+            "--threads" => threads = Some(next("--threads")?.parse().map_err(|e| format!("--threads: {e}"))?),
             "--host" => host = next("--host")?,
             "--port" => port = next("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--api-key" => api_key = Some(next("--api-key")?),
@@ -105,6 +110,7 @@ fn parse_args() -> Result<Args, String> {
         session,
         no_usage_cache,
         cache_route,
+        threads,
         host,
         port,
         api_key,
@@ -131,12 +137,16 @@ fn load_args(args: &Args) -> LoadArgs {
 /// a hang.
 fn print_progress(ev: GenEvent) {
     match ev {
-        GenEvent::Prefill { tokens, seconds, hits, misses, io_seconds } => {
+        GenEvent::Prefill { tokens, seconds, hits, misses, io_seconds, io_wait_seconds } => {
             eprintln!("prefill ({tokens} tokens)...");
-            eprintln!("  prefill done in {seconds:.1}s (expert cache: {hits} hits, {misses} misses, {io_seconds:.1}s in disk I/O)");
+            eprintln!(
+                "  prefill done in {seconds:.1}s (expert cache: {hits} hits, {misses} misses, {io_seconds:.1}s in disk I/O [{io_wait_seconds:.1}s actual disk wait])"
+            );
         }
-        GenEvent::Token { index, max, seconds, hits, misses, io_seconds, .. } => {
-            eprintln!("  token {index}/{max} in {seconds:.1}s ({io_seconds:.1}s in disk I/O this step; expert cache totals: {hits} hits, {misses} misses)");
+        GenEvent::Token { index, max, seconds, hits, misses, io_seconds, io_wait_seconds, .. } => {
+            eprintln!(
+                "  token {index}/{max} in {seconds:.1}s ({io_seconds:.1}s in disk I/O [{io_wait_seconds:.1}s actual disk wait] this step; expert cache totals: {hits} hits, {misses} misses)"
+            );
         }
     }
 }
@@ -256,6 +266,24 @@ fn run_serve(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     server::serve(sess, cfg)
 }
 
+/// Sizes the global `rayon` pool to physical cores by default, not `std::thread::available_
+/// parallelism()`'s logical count (which includes SMT/hyperthread siblings) — measured on this
+/// project's own dev box (12 physical / 24 logical): running the default 24 threads vs 12
+/// physical-only gave the SAME wall-clock decode speed but roughly HALF the total CPU-seconds
+/// (`user` time), confirming this workload's bottleneck is memory/disk bandwidth, not compute
+/// throughput SMT could help with — see `PERFORMANCE.md`. `--threads` overrides explicitly for
+/// anyone who wants to test otherwise on different hardware. Only ever called once, before any
+/// generation work starts, so a `build_global` failure (already-initialized pool) can't happen
+/// in practice; logged rather than panicking just in case.
+fn configure_thread_pool(threads: Option<usize>) {
+    let n = threads.unwrap_or_else(|| num_cpus::get_physical().max(1));
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(n).build_global() {
+        eprintln!("warning: failed to configure {n}-thread rayon pool ({e}), using the default");
+    } else {
+        eprintln!("using {n} threads ({} physical cores detected)", num_cpus::get_physical());
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -264,6 +292,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    configure_thread_pool(args.threads);
     let result = if args.serve {
         run_serve(&args)
     } else if args.chat {
