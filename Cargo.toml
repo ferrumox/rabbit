@@ -1,6 +1,6 @@
 [package]
 name = "rabbit"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 description = "A Rust inference engine for GLM-5.2 (744B-parameter MoE), streaming routed experts from disk on demand"
 
@@ -18,6 +18,7 @@ num_cpus = "1"
 fancy-regex = "0.13"
 # tiktoken.model's on-disk format is `<base64-encoded-bytes> <rank>` per line.
 base64 = "0.22"
+ureq = { version = "3.3.0", features = ["json"] }
 
 # io_uring is Linux-only; the expert-loading fallback path (sequential pread via
 # safetensors.rs) covers every other target, so this dependency is never required elsewhere.

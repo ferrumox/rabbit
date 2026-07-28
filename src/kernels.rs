@@ -229,6 +229,35 @@ pub fn matmul_mxfp4(y: &mut [f32], x: &[f32], data: &[u8], block_scale: &[u8], s
     });
 }
 
+/// y[S,O] = x[S,I] @ W^T, W int4-packed[O,ceil(I/2)] (2 values/byte) with a GROUPED scale
+/// (`QTKind::I4Grouped` — one `f32` per `group_size`-element run along each row, not one per
+/// whole row). Scalar only for now, same "correctness first" precedent as `matmul_mxfp4` (no
+/// real grouped-int4 checkpoint existed to benchmark against until this session's Kimi Linear
+/// conversion) — the scale must be applied INSIDE the accumulation loop here (it varies within
+/// a row), unlike `matmul_i4_scalar`'s single `sc` factored out after the whole dot product.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_i4_grouped(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], group_size: usize, s: usize, i: usize, o: usize) {
+    let rb = i.div_ceil(2);
+    let ngroups = i.div_ceil(group_size);
+    with_yt_scratch(o * s, |yt| {
+        yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+            let w = &q4[oi * rb..(oi + 1) * rb];
+            let sc = &scale[oi * ngroups..(oi + 1) * ngroups];
+            for (si, slot) in row.iter_mut().enumerate() {
+                let xs = &x[si * i..(si + 1) * i];
+                let mut a = 0f32;
+                for k in 0..i {
+                    let byte = w[k >> 1];
+                    let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                    a += xs[k] * (nibble as i32 - 8) as f32 * sc[k / group_size];
+                }
+                *slot = a;
+            }
+        });
+        transpose_so(y, yt, s, o);
+    });
+}
+
 /// Quantizes one activation row to int8 (absmax/127, Q8_0-style) for the IDOT kernels.
 /// Returns the row's scale; `q.len() == x.len()` required. Scalar only — the C never
 /// vectorized this either (it's a single absmax-then-round pass, not the hot inner loop).
@@ -775,6 +804,7 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QT, s: usize) {
             }
         }
         QTKind::I2 { data, scale } => matmul_i2(y, x, data, scale, s, w.cols, w.rows),
+        QTKind::I4Grouped { data, scale, group_size } => matmul_i4_grouped(y, x, data, scale, *group_size, s, w.cols, w.rows),
         QTKind::MxFp4 { data, block_scale } => matmul_mxfp4(y, x, data, block_scale, s, w.cols, w.rows),
     }
 }
@@ -827,6 +857,17 @@ pub fn qt_addrow(w: &QT, row: usize, coef: f32, acc: &mut [f32]) {
                 let byte = wr[k >> 2];
                 let bits = (byte >> ((k & 3) * 2)) & 3;
                 acc[k] += c * (bits as i32 - 2) as f32;
+            }
+        }
+        QTKind::I4Grouped { data, scale, group_size } => {
+            let ngroups = i.div_ceil(*group_size);
+            let sr = &scale[row * ngroups..(row + 1) * ngroups];
+            let rb = i.div_ceil(2);
+            let wr = &data[row * rb..(row + 1) * rb];
+            for k in 0..i {
+                let byte = wr[k >> 1];
+                let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                acc[k] += coef * (nibble as i32 - 8) as f32 * sr[k / group_size];
             }
         }
         QTKind::MxFp4 { data, block_scale } => {
@@ -885,6 +926,19 @@ pub fn qt_matvec_rows(w: &QT, r0: usize, n: usize, x: &[f32], y: &mut [f32]) {
                     acc += (bits as i32 - 2) as f32 * x[k];
                 }
                 acc as f64 * scale[row] as f64
+            }
+            QTKind::I4Grouped { data, scale, group_size } => {
+                let ngroups = i.div_ceil(*group_size);
+                let sr = &scale[row * ngroups..(row + 1) * ngroups];
+                let rb = i.div_ceil(2);
+                let wr = &data[row * rb..(row + 1) * rb];
+                let mut acc = 0f64;
+                for k in 0..i {
+                    let byte = wr[k >> 1];
+                    let nibble = if k & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                    acc += ((nibble as i32 - 8) as f32 * sr[k / group_size]) as f64 * x[k] as f64;
+                }
+                acc
             }
             QTKind::MxFp4 { data, block_scale } => {
                 let rb = i.div_ceil(2);
@@ -1003,6 +1057,85 @@ mod tests {
         matmul_mxfp4(&mut y, &x, &data, &block_scale, 1, cols, 1);
         // block 0: 32 * (2.0 * 1.0) = 64.0; block 1: 8 * (-6.0 * 8.0) = -384.0
         assert_eq!(y[0], 32.0 * 2.0 + 8.0 * -48.0);
+    }
+
+    #[test]
+    fn matmul_i4_grouped_matches_manual_nibble_unpack_across_two_groups() {
+        // 6 columns, group_size=3 -> group 0 = cols[0..3] (scale 2.0), group 1 = cols[3..6]
+        // (scale 5.0). Values chosen so each group's contribution is easy to hand-verify.
+        let vals = [1i32, -1, 2, 3, -2, 0]; // group0: 1,-1,2 ; group1: 3,-2,0
+        let mut bytes = vec![0u8; vals.len().div_ceil(2)];
+        for (idx, &v) in vals.iter().enumerate() {
+            let nibble = (v + 8) as u8;
+            if idx % 2 == 0 {
+                bytes[idx / 2] |= nibble;
+            } else {
+                bytes[idx / 2] |= nibble << 4;
+            }
+        }
+        let scale = [2.0f32, 5.0f32];
+        let x = [1.0f32; 6];
+        let mut y = [0.0f32; 1];
+        matmul_i4_grouped(&mut y, &x, &bytes, &scale, 3, 1, 6, 1);
+        // group0: (1-1+2)*2.0 = 4.0 ; group1: (3-2+0)*5.0 = 5.0
+        assert_eq!(y[0], 4.0 + 5.0);
+    }
+
+    #[test]
+    fn matmul_qt_i4_grouped_matches_manual_dequant_dot_product() {
+        let rows = 5;
+        let cols = 70; // group_size=16 -> 4 groups/row (16,16,16,22... wait 70/16=4.375 -> 5 groups), a deliberately non-multiple case
+        let gs = 16;
+        let s = 2;
+        let w = random_vec(rows * cols, 41);
+        let x = random_vec(s * cols, 42);
+        let mut t = QT::alloc_grouped(rows, cols, 4, gs);
+        t.fill(&w);
+
+        let mut expected = vec![0.0f32; s * rows];
+        for si in 0..s {
+            for oi in 0..rows {
+                let wr = t.row_f32(oi);
+                let xr = &x[si * cols..(si + 1) * cols];
+                expected[si * rows + oi] = wr.iter().zip(xr).map(|(&a, &b)| a * b).sum();
+            }
+        }
+        let mut y = vec![0.0f32; s * rows];
+        matmul_qt(&mut y, &x, &t, s);
+        for (a, b) in y.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn qt_addrow_i4_grouped_matches_row_f32() {
+        let (rows, cols, gs) = (3, 40, 8);
+        let w = random_vec(rows * cols, 43);
+        let mut t = QT::alloc_grouped(rows, cols, 4, gs);
+        t.fill(&w);
+
+        let mut acc = vec![0.0f32; cols];
+        qt_addrow(&t, 1, 3.0, &mut acc);
+        let expected: Vec<f32> = t.row_f32(1).iter().map(|&v| v * 3.0).collect();
+        for (a, b) in acc.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn qt_matvec_rows_i4_grouped_matches_row_f32_dot_product() {
+        let (rows, cols, gs) = (4, 24, 8);
+        let w = random_vec(rows * cols, 44);
+        let mut t = QT::alloc_grouped(rows, cols, 4, gs);
+        t.fill(&w);
+        let x = random_vec(cols, 45);
+
+        let mut y = vec![0.0f32; 2];
+        qt_matvec_rows(&t, 1, 2, &x, &mut y);
+        for (j, &yj) in y.iter().enumerate() {
+            let expected: f32 = t.row_f32(1 + j).iter().zip(&x).map(|(&a, &b)| a * b).sum();
+            assert!((yj - expected).abs() < 1e-2, "{yj} vs {expected}");
+        }
     }
 
     #[test]

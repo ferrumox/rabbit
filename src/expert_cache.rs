@@ -272,7 +272,7 @@ mod uring_load {
     /// id, like `finish_loading`, don't care) plus, separately, how many nanoseconds were spent
     /// purely waiting on completions — split out from `load_nanos` the same way the previous
     /// non-streaming version was, for the same reason (see `PERFORMANCE.md`).
-    pub(super) fn complete_batch_streaming(ring: &mut Ring, pending: Pending, bits: u8, used: u64, mut on_slot: impl FnMut(&ExpertSlot)) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
+    pub(super) fn complete_batch_streaming(ring: &mut Ring, pending: Pending, bits: u8, group_size: usize, used: u64, mut on_slot: impl FnMut(&ExpertSlot)) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
         let Pending { reqs, mut bufs, scale_bufs, eids } = pending;
         let total = reqs.len() + scale_bufs.len();
         let n_experts = eids.len();
@@ -343,9 +343,9 @@ mod uring_load {
                     // `Vec<u8>`) instead of `raw.to_vec()`-cloning it — same reasoning as the
                     // buffer-copy fix this replaced (see `PERFORMANCE.md`).
                     let base = owner * 3;
-                    let gate = qt_from_raw(std::mem::take(&mut bufs[base]), &reqs[base], bits, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let up = qt_from_raw(std::mem::take(&mut bufs[base + 1]), &reqs[base + 1], bits, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let down = qt_from_raw(std::mem::take(&mut bufs[base + 2]), &reqs[base + 2], bits, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let gate = qt_from_raw(std::mem::take(&mut bufs[base]), &reqs[base], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let up = qt_from_raw(std::mem::take(&mut bufs[base + 1]), &reqs[base + 1], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let down = qt_from_raw(std::mem::take(&mut bufs[base + 2]), &reqs[base + 2], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))?;
                     let slot = ExpertSlot { eid: eids[owner], gate, up, down, used };
                     on_slot(&slot);
                     out.push(slot);
@@ -356,9 +356,9 @@ mod uring_load {
         Ok((out, io_wait_nanos))
     }
 
-    fn qt_from_raw(raw: Vec<u8>, req: &Req, bits: u8, scales: &[Vec<f32>]) -> Result<QT, ModelError> {
+    fn qt_from_raw(raw: Vec<u8>, req: &Req, bits: u8, group_size: usize, scales: &[Vec<f32>]) -> Result<QT, ModelError> {
         if let Some(idx) = req.packed_scale {
-            return QT::from_packed(req.rows, req.cols, bits, raw, scales[idx].clone())
+            return QT::from_packed_grouped(req.rows, req.cols, bits, raw, scales[idx].clone(), group_size)
                 .map_err(|source| ModelError::PackedFormat { name: "expert tensor (.qs)".to_string(), source });
         }
         let w = if let Some(idx) = req.fp8_scale {
@@ -621,7 +621,7 @@ impl ExpertCache {
                 let eids_for_fallback = p.eids_for_fallback();
                 let load_t = std::time::Instant::now();
                 let ring = self.ring.as_mut().expect("Async pending implies the ring existed when begin_loading submitted it");
-                let result = uring_load::complete_batch_streaming(ring, p, bits, self.clock, &mut on_slot);
+                let result = uring_load::complete_batch_streaming(ring, p, bits, cfg.group_size as usize, self.clock, &mut on_slot);
                 self.load_nanos += load_t.elapsed().as_nanos() as u64;
                 match result {
                     Ok((v, io_wait_nanos)) => {
@@ -732,10 +732,11 @@ fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize
 fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, used: u64, naming: ExpertNaming) -> Result<ExpertSlot, ModelError> {
     let i = cfg.moe_inter as usize;
     let d = cfg.hidden as usize;
+    let gs = cfg.group_size as usize;
     let names = naming.tensor_names(layer, eid);
-    let gate = qt_load(shards, &names[0], i, d, bits)?;
-    let up = qt_load(shards, &names[1], i, d, bits)?;
-    let down = qt_load(shards, &names[2], d, i, bits)?;
+    let gate = qt_load(shards, gs, &names[0], i, d, bits)?;
+    let up = qt_load(shards, gs, &names[1], i, d, bits)?;
+    let down = qt_load(shards, gs, &names[2], d, i, bits)?;
     Ok(ExpertSlot { eid, gate, up, down, used })
 }
 
@@ -752,7 +753,7 @@ fn mlock_best_effort(slot: &ExpertSlot) {
             QTKind::I8 { data, scale } => {
                 vec![(data.as_ptr() as *const u8, std::mem::size_of_val(data.as_slice())), (scale.as_ptr() as *const u8, std::mem::size_of_val(scale.as_slice()))]
             }
-            QTKind::I4 { data, scale } | QTKind::I2 { data, scale } => {
+            QTKind::I4 { data, scale } | QTKind::I2 { data, scale } | QTKind::I4Grouped { data, scale, .. } => {
                 vec![(data.as_ptr(), data.len()), (scale.as_ptr() as *const u8, std::mem::size_of_val(scale.as_slice()))]
             }
             QTKind::MxFp4 { data, block_scale } => {
@@ -892,6 +893,7 @@ mod tests {
             theta: 10000.0,
             attn_scale: 1.0,
             routed_scale: 1.0,
+            group_size: 0,
         }
     }
 

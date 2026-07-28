@@ -118,6 +118,7 @@ fn tiny_cfg(n_experts: i32, moe_inter: i32, hidden: i32) -> Cfg {
         theta: 10000.0,
         attn_scale: 1.0,
         routed_scale: 1.0,
+        group_size: 0,
     }
 }
 

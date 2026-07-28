@@ -585,6 +585,7 @@ mod tests {
             theta: 10000.0,
             attn_scale: 1.0 / ((qk_nope + qk_rope) as f32).sqrt(),
             routed_scale: 1.0,
+            group_size: 0,
         }
     }
 

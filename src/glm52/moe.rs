@@ -543,6 +543,7 @@ mod tests {
             theta: 10000.0,
             attn_scale: 1.0,
             routed_scale: 1.0,
+            group_size: 0,
         }
     }
 

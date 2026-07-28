@@ -1,6 +1,7 @@
 //! rabbit — Rust port of colibrì's GLM-5.2 inference engine. Work in progress.
 
 pub mod chat;
+pub mod convert;
 pub mod expert_cache;
 pub mod generate;
 pub mod glm52;

@@ -127,13 +127,15 @@ fn ld(shards: &Shards, name: &str) -> Result<Vec<f32>, ModelError> {
 }
 
 /// `pub(crate)`: `expert_cache.rs` reuses this to load a routed expert's gate/up/down tensors
-/// the same way every other dense-resident tensor is loaded.
-pub(crate) fn qt_load(shards: &Shards, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
+/// the same way every other dense-resident tensor is loaded. `group_size` (from
+/// `Cfg::group_size`, `0` = ungrouped) is threaded through rather than guessed from the `.qs`
+/// sidecar's own length — see `Cfg::group_size`'s doc for why.
+pub(crate) fn qt_load(shards: &Shards, group_size: usize, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
     let qs_name = format!("{name}.qs");
     if shards.has(&qs_name) {
         let data = shards.read_raw(name, false)?;
         let scale = shards.read_f32(&qs_name, false)?;
-        return QT::from_packed(rows, cols, bits, data, scale)
+        return QT::from_packed_grouped(rows, cols, bits, data, scale, group_size)
             .map_err(|source| ModelError::PackedFormat { name: name.to_string(), source });
     }
 
@@ -181,8 +183,8 @@ impl Model {
         // quant does) unless dbits is already aggressive, in which case there's no point
         // keeping them wider than the rest of the resident weights.
         let io_bits = if dbits >= 8 { 16 } else { dbits };
-        let embed = qt_load(&shards, "model.embed_tokens.weight", cfg.vocab as usize, d, io_bits)?;
-        let lm_head = qt_load(&shards, "lm_head.weight", cfg.vocab as usize, d, io_bits)?;
+        let embed = qt_load(&shards, cfg.group_size as usize, "model.embed_tokens.weight", cfg.vocab as usize, d, io_bits)?;
+        let lm_head = qt_load(&shards, cfg.group_size as usize, "lm_head.weight", cfg.vocab as usize, d, io_bits)?;
         let final_norm = ld(&shards, "model.norm.weight")?;
 
         let has_dsa = detect_has_dsa(&cfg, &shards);
@@ -195,39 +197,39 @@ impl Model {
             let post_ln = ld(&shards, &p("post_attention_layernorm.weight"))?;
 
             let attn = AttnWeights {
-                q_a: qt_load(&shards, &p("self_attn.q_a_proj.weight"), q_lora, d, dbits)?,
+                q_a: qt_load(&shards, cfg.group_size as usize, &p("self_attn.q_a_proj.weight"), q_lora, d, dbits)?,
                 q_a_ln: ld(&shards, &p("self_attn.q_a_layernorm.weight"))?,
-                q_b: qt_load(&shards, &p("self_attn.q_b_proj.weight"), h * qh, q_lora, dbits)?,
-                kv_a: qt_load(&shards, &p("self_attn.kv_a_proj_with_mqa.weight"), kv_lora + qk_rope, d, dbits)?,
+                q_b: qt_load(&shards, cfg.group_size as usize, &p("self_attn.q_b_proj.weight"), h * qh, q_lora, dbits)?,
+                kv_a: qt_load(&shards, cfg.group_size as usize, &p("self_attn.kv_a_proj_with_mqa.weight"), kv_lora + qk_rope, d, dbits)?,
                 kv_a_ln: ld(&shards, &p("self_attn.kv_a_layernorm.weight"))?,
-                kv_b: qt_load(&shards, &p("self_attn.kv_b_proj.weight"), h * (qk_nope + v_head), kv_lora, dbits)?,
-                o: qt_load(&shards, &p("self_attn.o_proj.weight"), d, h * v_head, dbits)?,
+                kv_b: qt_load(&shards, cfg.group_size as usize, &p("self_attn.kv_b_proj.weight"), h * (qk_nope + v_head), kv_lora, dbits)?,
+                o: qt_load(&shards, cfg.group_size as usize, &p("self_attn.o_proj.weight"), d, h * v_head, dbits)?,
             };
 
             let sparse = i >= cfg.first_dense as usize;
             let ffn = if !sparse {
                 Ffn::Dense(DenseMlpWeights {
-                    gate_proj: qt_load(&shards, &p("mlp.gate_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
-                    up_proj: qt_load(&shards, &p("mlp.up_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
-                    down_proj: qt_load(&shards, &p("mlp.down_proj.weight"), d, cfg.dense_inter as usize, dbits)?,
+                    gate_proj: qt_load(&shards, cfg.group_size as usize, &p("mlp.gate_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
+                    up_proj: qt_load(&shards, cfg.group_size as usize, &p("mlp.up_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
+                    down_proj: qt_load(&shards, cfg.group_size as usize, &p("mlp.down_proj.weight"), d, cfg.dense_inter as usize, dbits)?,
                 })
             } else {
                 let s_i = (cfg.moe_inter * cfg.n_shared) as usize;
                 Ffn::Moe(MoeWeights {
                     router: ld(&shards, &p("mlp.gate.weight"))?,
                     router_bias: ld(&shards, &p("mlp.gate.e_score_correction_bias"))?,
-                    sh_gate: qt_load(&shards, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?,
-                    sh_up: qt_load(&shards, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?,
-                    sh_down: qt_load(&shards, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?,
+                    sh_gate: qt_load(&shards, cfg.group_size as usize, &p("mlp.shared_experts.gate_proj.weight"), s_i, d, dbits)?,
+                    sh_up: qt_load(&shards, cfg.group_size as usize, &p("mlp.shared_experts.up_proj.weight"), s_i, d, dbits)?,
+                    sh_down: qt_load(&shards, cfg.group_size as usize, &p("mlp.shared_experts.down_proj.weight"), d, s_i, dbits)?,
                 })
             };
 
             let dsa = if has_dsa && cfg.idx_type[i] {
                 let ip = |s: &str| format!("model.layers.{i}.self_attn.indexer.{s}");
                 Some(DsaWeights {
-                    wq_b: qt_load(&shards, &ip("wq_b.weight"), (cfg.index_nh * cfg.index_hd) as usize, q_lora, dbits)?,
-                    wk: qt_load(&shards, &ip("wk.weight"), cfg.index_hd as usize, d, dbits)?,
-                    weights_proj: qt_load(&shards, &ip("weights_proj.weight"), cfg.index_nh as usize, d, dbits)?,
+                    wq_b: qt_load(&shards, cfg.group_size as usize, &ip("wq_b.weight"), (cfg.index_nh * cfg.index_hd) as usize, q_lora, dbits)?,
+                    wk: qt_load(&shards, cfg.group_size as usize, &ip("wk.weight"), cfg.index_hd as usize, d, dbits)?,
+                    weights_proj: qt_load(&shards, cfg.group_size as usize, &ip("weights_proj.weight"), cfg.index_nh as usize, d, dbits)?,
                     k_norm_w: ld(&shards, &ip("k_norm.weight"))?,
                     k_norm_b: ld(&shards, &ip("k_norm.bias"))?,
                 })
@@ -510,7 +512,7 @@ mod tests {
         );
         let shards = Shards::open(&dir.0).unwrap();
 
-        let t = qt_load(&shards, "w.weight", rows, cols, 8).unwrap();
+        let t = qt_load(&shards, 0, "w.weight", rows, cols, 8).unwrap();
         match &t.kind {
             crate::quant::QTKind::I8 { data, scale: got_scale } => {
                 let raw_i8: Vec<i8> = packed.iter().map(|&b| b as i8).collect();
@@ -530,7 +532,7 @@ mod tests {
         write_minimal_safetensors(&dir.0, &[("w.weight", "F32", vec![rows, cols], f32_bytes(&w))]);
         let shards = Shards::open(&dir.0).unwrap();
 
-        let t = qt_load(&shards, "w.weight", rows, cols, 32).unwrap(); // bits=32 -> exact F32 passthrough
+        let t = qt_load(&shards, 0, "w.weight", rows, cols, 32).unwrap(); // bits=32 -> exact F32 passthrough
         match &t.kind {
             crate::quant::QTKind::F32(data) => assert_eq!(data, &w),
             _ => panic!("expected F32"),
@@ -560,7 +562,7 @@ mod tests {
         );
         let shards = Shards::open(&dir.0).unwrap();
 
-        let t = qt_load(&shards, "w.weight", rows, cols, 32).unwrap(); // bits=32 -> F32, exact
+        let t = qt_load(&shards, 0, "w.weight", rows, cols, 32).unwrap(); // bits=32 -> F32, exact
         let expected = [1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0].map(|v| v * scale);
         match &t.kind {
             crate::quant::QTKind::F32(data) => assert_eq!(data, &expected),

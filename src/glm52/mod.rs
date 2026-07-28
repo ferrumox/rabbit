@@ -6,5 +6,6 @@
 
 pub mod attention;
 pub mod config;
+pub mod convert;
 pub mod model;
 pub mod moe;

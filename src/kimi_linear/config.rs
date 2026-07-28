@@ -62,6 +62,10 @@ pub struct Cfg {
     /// Per layer (0-indexed): `true` = KDA (recurrent), `false` = MLA (global attention).
     /// Derived from `linear_attn_config`'s 1-indexed `kda_layers`/`full_attn_layers`.
     pub is_kda: Vec<bool>,
+    /// `0` = every resident `.qs` sidecar (if any) is per-row-scaled. `>0` = the converter that
+    /// produced this checkpoint used grouped int4 — see `glm52::config::Cfg::group_size`'s doc
+    /// for the full reasoning (identical here, just mirrored for Kimi's own `Cfg`).
+    pub group_size: i32,
 }
 
 const SUPPORTED_MODEL_TYPE: &str = "kimi_linear";
@@ -284,6 +288,7 @@ impl Cfg {
             kda_n_heads,
             short_conv_kernel,
             is_kda,
+            group_size: r.get("rabbit_group_size").and_then(Value::as_i64).unwrap_or(0) as i32,
         };
 
         check_range!("hidden_size", c.hidden, 1, 1 << 20);
@@ -306,6 +311,7 @@ impl Cfg {
         check_range!("linear_attn_config.head_dim", c.kda_head_dim, 1, 1 << 16);
         check_range!("linear_attn_config.num_heads", c.kda_n_heads, 1, 1024);
         check_range!("linear_attn_config.short_conv_kernel_size", c.short_conv_kernel, 1, 64);
+        check_range!("rabbit_group_size", c.group_size, 0, 1 << 16);
 
         Ok(c)
     }

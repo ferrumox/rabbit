@@ -52,7 +52,7 @@ impl DType {
 /// (`exp==0`): `mantissa/8 * 2^-6`. Normals: `(1+mantissa/8) * 2^(exp-7)`, max finite `448.0`
 /// at `exp=15,mantissa=6` (mantissa=7 there is reserved for NaN, the "fn" — finite, no
 /// infinity — variant's one deviation from a "denser" plain e4m3 that would go up to 480).
-fn f8e4m3_to_f32(b: u8) -> f32 {
+pub(crate) fn f8e4m3_to_f32(b: u8) -> f32 {
     let sign = (b >> 7) & 1;
     let exp = (b >> 3) & 0xF;
     let mant = (b & 0x7) as f32;
@@ -301,6 +301,15 @@ impl Shards {
         }
 
         Ok(Shards { files, tensors, index })
+    }
+
+    /// Every indexed tensor across every shard in this `Shards` — the converter's
+    /// (`glm52::convert`) equivalent of Python's `safe_open(path).keys()`/`.values()`, used to
+    /// iterate a whole checkpoint (or, when `open` is pointed at a directory holding exactly one
+    /// downloaded shard, that one file's own tensor set — the disk-safe conversion workflow's
+    /// natural unit).
+    pub fn tensors(&self) -> &[Tensor] {
+        &self.tensors
     }
 
     pub fn find(&self, name: &str) -> Option<&Tensor> {

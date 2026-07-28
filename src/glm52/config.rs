@@ -37,6 +37,13 @@ pub struct Cfg {
     pub theta: f32,
     pub attn_scale: f32,
     pub routed_scale: f32,
+    /// `0` = every resident/expert `.qs` sidecar (if any) is per-row-scaled, the original
+    /// format. `>0` = the converter that produced this checkpoint used grouped int4
+    /// (`quant_int4_grouped`/`--group-size`), one scale per this many columns instead of one
+    /// per row — read once here and threaded to every `qt_load` call rather than guessed from
+    /// a `.qs` sidecar's own length, which isn't always exactly invertible back to a group size
+    /// (see `QTKind::I4Grouped`'s doc in `quant.rs`).
+    pub group_size: i32,
 }
 
 /// The only `model_type` this loader recognizes today — rabbit's single supported
@@ -228,6 +235,7 @@ impl Cfg {
             theta,
             attn_scale,
             routed_scale,
+            group_size: r.get("rabbit_group_size").and_then(Value::as_i64).unwrap_or(0) as i32,
         };
 
         // config.json comes from untrusted mirrors — hostile dimensions must not get past
@@ -252,6 +260,7 @@ impl Cfg {
         check_range!("index_topk", c.index_topk, 0, 1 << 20);
         check_range!("index_n_heads", c.index_nh, 0, 1024);
         check_range!("index_head_dim", c.index_hd, 0, 1 << 16);
+        check_range!("rabbit_group_size", c.group_size, 0, 1 << 16);
 
         Ok(c)
     }

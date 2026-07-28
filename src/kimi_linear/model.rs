@@ -135,12 +135,12 @@ fn ld(shards: &Shards, name: &str) -> Result<Vec<f32>, ModelError> {
     Ok(shards.read_f32(name, false)?)
 }
 
-fn qt_load(shards: &Shards, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
+fn qt_load(shards: &Shards, group_size: usize, name: &str, rows: usize, cols: usize, bits: u8) -> Result<QT, ModelError> {
     let qs_name = format!("{name}.qs");
     if shards.has(&qs_name) {
         let data = shards.read_raw(name, false)?;
         let scale = shards.read_f32(&qs_name, false)?;
-        return QT::from_packed(rows, cols, bits, data, scale)
+        return QT::from_packed_grouped(rows, cols, bits, data, scale, group_size)
             .map_err(|source| ModelError::PackedFormat { name: name.to_string(), source });
     }
 
@@ -195,6 +195,7 @@ pub fn to_glm_cfg(kcfg: &Cfg) -> GlmCfg {
         theta: kcfg.theta,
         attn_scale: kcfg.attn_scale,
         routed_scale: kcfg.routed_scale,
+        group_size: kcfg.group_size,
     }
 }
 
@@ -214,8 +215,8 @@ impl Model {
         let kda_n_heads = cfg.kda_n_heads as usize;
 
         let io_bits = if dbits >= 8 { 16 } else { dbits };
-        let embed = qt_load(&shards, "model.embed_tokens.weight", cfg.vocab as usize, d, io_bits)?;
-        let lm_head = qt_load(&shards, "lm_head.weight", cfg.vocab as usize, d, io_bits)?;
+        let embed = qt_load(&shards, cfg.group_size as usize, "model.embed_tokens.weight", cfg.vocab as usize, d, io_bits)?;
+        let lm_head = qt_load(&shards, cfg.group_size as usize, "lm_head.weight", cfg.vocab as usize, d, io_bits)?;
         let final_norm = ld(&shards, "model.norm.weight")?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
@@ -228,41 +229,41 @@ impl Model {
             let attn = if cfg.is_kda[i] {
                 let ap = |s: &str| format!("model.layers.{i}.self_attn.{s}");
                 Attn::Kda(Box::new(KdaWeights {
-                    q_proj: qt_load(&shards, &ap("q_proj.weight"), d_inner, d, dbits)?,
-                    k_proj: qt_load(&shards, &ap("k_proj.weight"), d_inner, d, dbits)?,
-                    v_proj: qt_load(&shards, &ap("v_proj.weight"), d_inner, d, dbits)?,
+                    q_proj: qt_load(&shards, cfg.group_size as usize, &ap("q_proj.weight"), d_inner, d, dbits)?,
+                    k_proj: qt_load(&shards, cfg.group_size as usize, &ap("k_proj.weight"), d_inner, d, dbits)?,
+                    v_proj: qt_load(&shards, cfg.group_size as usize, &ap("v_proj.weight"), d_inner, d, dbits)?,
                     q_conv: ld(&shards, &ap("q_conv1d.weight"))?,
                     k_conv: ld(&shards, &ap("k_conv1d.weight"))?,
                     v_conv: ld(&shards, &ap("v_conv1d.weight"))?,
-                    f_a_proj: qt_load(&shards, &ap("f_a_proj.weight"), kda_head_dim, d, dbits)?,
-                    f_b_proj: qt_load(&shards, &ap("f_b_proj.weight"), d_inner, kda_head_dim, dbits)?,
+                    f_a_proj: qt_load(&shards, cfg.group_size as usize, &ap("f_a_proj.weight"), kda_head_dim, d, dbits)?,
+                    f_b_proj: qt_load(&shards, cfg.group_size as usize, &ap("f_b_proj.weight"), d_inner, kda_head_dim, dbits)?,
                     dt_bias: ld(&shards, &ap("dt_bias"))?,
                     a_log: ld(&shards, &ap("A_log"))?,
-                    b_proj: qt_load(&shards, &ap("b_proj.weight"), kda_n_heads, d, dbits)?,
-                    g_a_proj: qt_load(&shards, &ap("g_a_proj.weight"), kda_head_dim, d, dbits)?,
-                    g_b_proj: qt_load(&shards, &ap("g_b_proj.weight"), d_inner, kda_head_dim, dbits)?,
+                    b_proj: qt_load(&shards, cfg.group_size as usize, &ap("b_proj.weight"), kda_n_heads, d, dbits)?,
+                    g_a_proj: qt_load(&shards, cfg.group_size as usize, &ap("g_a_proj.weight"), kda_head_dim, d, dbits)?,
+                    g_b_proj: qt_load(&shards, cfg.group_size as usize, &ap("g_b_proj.weight"), d_inner, kda_head_dim, dbits)?,
                     o_norm: ld(&shards, &ap("o_norm.weight"))?,
-                    o_proj: qt_load(&shards, &ap("o_proj.weight"), d, d_inner, dbits)?,
+                    o_proj: qt_load(&shards, cfg.group_size as usize, &ap("o_proj.weight"), d, d_inner, dbits)?,
                 }))
             } else {
                 let ap = |s: &str| format!("model.layers.{i}.self_attn.{s}");
                 Attn::Mla(Box::new(AttnWeights {
-                    q_a: qt_load(&shards, &ap("q_proj.weight"), h * qh, d, dbits)?,
+                    q_a: qt_load(&shards, cfg.group_size as usize, &ap("q_proj.weight"), h * qh, d, dbits)?,
                     q_a_ln: vec![],
                     q_b: QT::alloc(1, 1, 32, false),
-                    kv_a: qt_load(&shards, &ap("kv_a_proj_with_mqa.weight"), kv_lora + qk_rope, d, dbits)?,
+                    kv_a: qt_load(&shards, cfg.group_size as usize, &ap("kv_a_proj_with_mqa.weight"), kv_lora + qk_rope, d, dbits)?,
                     kv_a_ln: ld(&shards, &ap("kv_a_layernorm.weight"))?,
-                    kv_b: qt_load(&shards, &ap("kv_b_proj.weight"), h * (qk_nope + v_head), kv_lora, dbits)?,
-                    o: qt_load(&shards, &ap("o_proj.weight"), d, h * v_head, dbits)?,
+                    kv_b: qt_load(&shards, cfg.group_size as usize, &ap("kv_b_proj.weight"), h * (qk_nope + v_head), kv_lora, dbits)?,
+                    o: qt_load(&shards, cfg.group_size as usize, &ap("o_proj.weight"), d, h * v_head, dbits)?,
                 }))
             };
 
             let sparse = i >= cfg.first_dense as usize;
             let ffn = if !sparse {
                 Ffn::Dense(DenseMlpWeights {
-                    gate_proj: qt_load(&shards, &p("mlp.gate_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
-                    up_proj: qt_load(&shards, &p("mlp.up_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
-                    down_proj: qt_load(&shards, &p("mlp.down_proj.weight"), d, cfg.dense_inter as usize, dbits)?,
+                    gate_proj: qt_load(&shards, cfg.group_size as usize, &p("mlp.gate_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
+                    up_proj: qt_load(&shards, cfg.group_size as usize, &p("mlp.up_proj.weight"), cfg.dense_inter as usize, d, dbits)?,
+                    down_proj: qt_load(&shards, cfg.group_size as usize, &p("mlp.down_proj.weight"), d, cfg.dense_inter as usize, dbits)?,
                 })
             } else {
                 let mp = |s: &str| format!("model.layers.{i}.block_sparse_moe.{s}");
@@ -270,9 +271,9 @@ impl Model {
                 Ffn::Moe(MoeWeights {
                     router: ld(&shards, &mp("gate.weight"))?,
                     router_bias: ld(&shards, &mp("gate.e_score_correction_bias"))?,
-                    sh_gate: qt_load(&shards, &mp("shared_experts.gate_proj.weight"), s_i, d, dbits)?,
-                    sh_up: qt_load(&shards, &mp("shared_experts.up_proj.weight"), s_i, d, dbits)?,
-                    sh_down: qt_load(&shards, &mp("shared_experts.down_proj.weight"), d, s_i, dbits)?,
+                    sh_gate: qt_load(&shards, cfg.group_size as usize, &mp("shared_experts.gate_proj.weight"), s_i, d, dbits)?,
+                    sh_up: qt_load(&shards, cfg.group_size as usize, &mp("shared_experts.up_proj.weight"), s_i, d, dbits)?,
+                    sh_down: qt_load(&shards, cfg.group_size as usize, &mp("shared_experts.down_proj.weight"), d, s_i, dbits)?,
                 })
             };
 
