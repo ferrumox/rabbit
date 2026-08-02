@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
-[--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K] \
+[--session <path>] [--no-usage-cache] [--cache-route] [--preload-experts] [--threads N] [--numa] [--numa-threads N] [--host H] [--port N] [--api-key K] \
 [--shard-dirs <dir1,dir2,...>]";
 
 struct Args {
@@ -34,9 +34,22 @@ struct Args {
     session: Option<PathBuf>,
     no_usage_cache: bool,
     cache_route: bool,
+    /// `--preload-experts`: after warm-start, load every MoE layer's experts up front (Phase 4b)
+    /// so token 1 runs at steady state. Applies to `--prompt`/`--chat`/`--serve` alike.
+    preload_experts: bool,
     /// `None` = use the default (physical core count — see `main`'s call to
     /// `rayon::ThreadPoolBuilder`). `--threads` overrides it explicitly.
     threads: Option<usize>,
+    /// `--numa`: NUMA-affine execution (`NUMA_AMX_BRIEF.md`) — pinned per-node worker pools,
+    /// expert weights placed on per-expert home nodes, expert compute dispatched to where its
+    /// weights live. Default off; a no-op on single-node machines and non-Linux (the flag parses
+    /// everywhere so command lines stay portable, and degrades to current behavior).
+    numa: bool,
+    /// `--numa-threads`: total pinned threads across the node pools (default: the effective
+    /// `--threads`). Decoupled because the two pools want DIFFERENT widths (measured, synth):
+    /// attention/dense on the global pool degrades past ~96 threads, while the expert phase
+    /// keeps scaling on pinned pools — e.g. `--threads 48 --numa --numa-threads 384`.
+    numa_threads: Option<usize>,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -59,7 +72,10 @@ fn parse_args() -> Result<Args, String> {
     let mut session = None;
     let mut no_usage_cache = false;
     let mut cache_route = false;
+    let mut preload_experts = false;
     let mut threads = None;
+    let mut numa = false;
+    let mut numa_threads = None;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut api_key = None;
@@ -84,7 +100,10 @@ fn parse_args() -> Result<Args, String> {
             "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--no-usage-cache" => no_usage_cache = true,
             "--cache-route" => cache_route = true,
+            "--preload-experts" => preload_experts = true,
             "--threads" => threads = Some(next("--threads")?.parse().map_err(|e| format!("--threads: {e}"))?),
+            "--numa" => numa = true,
+            "--numa-threads" => numa_threads = Some(next("--numa-threads")?.parse().map_err(|e| format!("--numa-threads: {e}"))?),
             "--host" => host = next("--host")?,
             "--port" => port = next("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--api-key" => api_key = Some(next("--api-key")?),
@@ -117,7 +136,10 @@ fn parse_args() -> Result<Args, String> {
         session,
         no_usage_cache,
         cache_route,
+        preload_experts,
         threads,
+        numa,
+        numa_threads,
         host,
         port,
         api_key,
@@ -137,23 +159,38 @@ fn load_args(args: &Args) -> LoadArgs {
         cache_capacity: args.cache_capacity,
         no_usage_cache: args.no_usage_cache,
         cache_route: args.cache_route,
+        preload_experts: args.preload_experts,
     }
 }
 
 /// Prints a `GenEvent` to stderr exactly as `main.rs` always has — a real-model forward can
 /// take seconds to tens of seconds per step, so silent output would be indistinguishable from
 /// a hang.
-fn print_progress(ev: GenEvent) {
+/// `show_disk_wait` is `caches.any_has_ring()`: without a ring (MXFP4/K3) `io_wait_seconds` is
+/// structurally always 0.0 and means nothing, so the `[... actual disk wait]` bracket is replaced
+/// with `[disk wait n/a]` rather than printed as if the disk were instant (Phase 4c — the 0.0
+/// readout misled the owner in the first minutes of the first real K3 run). `io_seconds`
+/// (`load_nanos`, the real sequential/parallel load time) stays shown either way.
+fn print_progress(ev: GenEvent, show_disk_wait: bool) {
+    let wait = |io_wait_seconds: f32| {
+        if show_disk_wait {
+            format!("[{io_wait_seconds:.1}s actual disk wait]")
+        } else {
+            "[disk wait n/a]".to_string()
+        }
+    };
     match ev {
         GenEvent::Prefill { tokens, seconds, hits, misses, io_seconds, io_wait_seconds } => {
             eprintln!("prefill ({tokens} tokens)...");
             eprintln!(
-                "  prefill done in {seconds:.1}s (expert cache: {hits} hits, {misses} misses, {io_seconds:.1}s in disk I/O [{io_wait_seconds:.1}s actual disk wait])"
+                "  prefill done in {seconds:.1}s (expert cache: {hits} hits, {misses} misses, {io_seconds:.1}s in disk I/O {})",
+                wait(io_wait_seconds)
             );
         }
         GenEvent::Token { index, max, seconds, hits, misses, io_seconds, io_wait_seconds, .. } => {
             eprintln!(
-                "  token {index}/{max} in {seconds:.1}s ({io_seconds:.1}s in disk I/O [{io_wait_seconds:.1}s actual disk wait] this step; expert cache totals: {hits} hits, {misses} misses)"
+                "  token {index}/{max} in {seconds:.1}s ({io_seconds:.1}s in disk I/O {} this step; expert cache totals: {hits} hits, {misses} misses)",
+                wait(io_wait_seconds)
             );
         }
     }
@@ -166,7 +203,11 @@ fn run_single_shot(args: &Args, prompt: &str) -> Result<(), Box<dyn std::error::
 
     let mut kv = KvState::new(&sess.model);
     let t1 = std::time::Instant::now();
-    let (text, _pos, n, _profile) = chat::generate_reply(&mut sess, &mut kv, &prompt_ids, 0, print_progress)?;
+    let show_disk_wait = sess.caches.any_has_ring();
+    // Passthrough, not `output_filter`: `prompt` was encoded raw above (no `render_turn`), so
+    // there is no chat envelope open for the model to close and nothing to strip.
+    let (text, _pos, n, _profile) =
+        chat::generate_reply(&mut sess, &mut kv, &prompt_ids, 0, chat::OutputFilter::Passthrough, |ev| print_progress(ev, show_disk_wait))?;
     let elapsed = t1.elapsed().as_secs_f32();
     println!("{text}");
     eprintln!("\n{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
@@ -238,7 +279,9 @@ fn run_chat(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let from_pos = pos;
         let t1 = std::time::Instant::now();
-        let (reply, new_pos, n, _profile) = chat::generate_reply(&mut sess, &mut kv, &turn_ids, pos, print_progress)?;
+        let show_disk_wait = sess.caches.any_has_ring();
+        let filter = chat::output_filter(&sess.model, args.think);
+        let (reply, new_pos, n, _profile) = chat::generate_reply(&mut sess, &mut kv, &turn_ids, pos, filter, |ev| print_progress(ev, show_disk_wait))?;
         let elapsed = t1.elapsed().as_secs_f32();
         eprintln!("{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
         pos = new_pos;
@@ -283,12 +326,23 @@ fn run_serve(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 /// anyone who wants to test otherwise on different hardware. Only ever called once, before any
 /// generation work starts, so a `build_global` failure (already-initialized pool) can't happen
 /// in practice; logged rather than panicking just in case.
-fn configure_thread_pool(threads: Option<usize>) {
+fn configure_thread_pool(threads: Option<usize>, numa: bool, numa_threads: Option<usize>) {
     let n = threads.unwrap_or_else(|| num_cpus::get_physical().max(1));
     if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(n).build_global() {
         eprintln!("warning: failed to configure {n}-thread rayon pool ({e}), using the default");
     } else {
         eprintln!("using {n} threads ({} physical cores detected)", num_cpus::get_physical());
+    }
+    // Phase N2 (`NUMA_AMX_BRIEF.md`): pinned per-node pools, sized from the SAME effective
+    // `--threads` total as the global pool above (total/n_nodes each) so the thread sweep stays
+    // meaningful with --numa on. The global pool remains for everything that isn't
+    // NUMA-dispatched (other architectures, attention, dense matmuls) — the two never run
+    // concurrently, so this is not oversubscription.
+    if numa {
+        match rabbit::numa::NodePools::init(numa_threads.unwrap_or(n)) {
+            Ok(p) => eprintln!("--numa: {} pinned node pools x {} threads", p.n(), p.threads_per_pool()),
+            Err(why) => eprintln!("--numa: {why}"),
+        }
     }
 }
 
@@ -300,7 +354,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    configure_thread_pool(args.threads);
+    configure_thread_pool(args.threads, args.numa, args.numa_threads);
     let result = if args.serve {
         run_serve(&args)
     } else if args.chat {

@@ -10,6 +10,7 @@ pub mod kimi_k3;
 pub mod kimi_linear;
 pub mod kv_session;
 pub mod model;
+pub mod numa;
 pub mod quant;
 pub mod safetensors;
 pub mod server;

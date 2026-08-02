@@ -220,6 +220,8 @@ impl Model {
         let fused_gate_up = detect_fused_gate_up(&cfg, &shards);
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
+        let t_layers = std::time::Instant::now();
+        let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
         for i in 0..cfg.n_layers as usize {
             let p = |s: &str| format!("model.layers.{i}.{s}");
 
@@ -268,6 +270,17 @@ impl Model {
             };
 
             layers.push(Layer { in_ln, post_ln, attn, dsa, ffn });
+            // Per-layer progress (see kimi_k3::model's version): rewriting line in a TTY,
+            // newline-delimited when redirected so a log/monitor sees each layer.
+            if stderr_tty {
+                eprint!("\r  loaded layer {}/{} ({:.0}s)", i + 1, cfg.n_layers, t_layers.elapsed().as_secs_f32());
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            } else {
+                eprintln!("  loaded layer {}/{} ({:.0}s)", i + 1, cfg.n_layers, t_layers.elapsed().as_secs_f32());
+            }
+        }
+        if stderr_tty {
+            eprintln!();
         }
 
         Ok(Model { cfg, embed, lm_head, final_norm, layers, has_dsa, ebits, route_cfg: RouteConfig::default(), fused_gate_up })

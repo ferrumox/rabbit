@@ -12,11 +12,11 @@
 //! benchmark toward an unrealistically huge single dot product).
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar};
+use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar, matmul_mxfp4_scalar};
 #[cfg(target_arch = "x86_64")]
 use rabbit::kernels::{
     axpy_f32_avx2, axpy_i4_f32_avx512, dot_f32_avx2, dot_i4_f32_avx512, dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2,
-    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512,
+    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512, matmul_mxfp4_avx512,
 };
 use std::hint::black_box;
 
@@ -118,6 +118,33 @@ fn bench_matmul_i4(c: &mut Criterion) {
     group.finish();
 }
 
+/// K3 routed-expert MXFP4 matmul (`matmul_mxfp4`) at the real per-expert dims: gate/up projections
+/// are `[moe_inter=3072, moe_hidden=3584]` (i=3584, o=3072), down is `[3584, 3072]` (i=3072,
+/// o=3584). Benched at s=1 (decode) and s=8 (a small batch), the before/after instrument for
+/// Phase 2's scalar block restructure and Phase 3's AVX-512 tier. In Phase 2 this measures the
+/// single scalar tier (`matmul_mxfp4` is scalar); Phase 3 splits it into scalar/avx512 entries.
+fn bench_matmul_mxfp4(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matmul_mxfp4");
+    for &(name, i, o) in &[("gate_up_i3584_o3072", 3584usize, 3072usize), ("down_i3072_o3584", 3072usize, 3584usize)] {
+        let data = random_bytes(o * i.div_ceil(2), 21);
+        let scale = random_bytes(o * i.div_ceil(32), 22);
+        for &s in &[1usize, 8] {
+            let x: Vec<f32> = random_i8(s * i, 23).iter().map(|&v| v as f32).collect();
+            let mut y = vec![0f32; s * o];
+            group.bench_function(format!("scalar/{name}/s{s}"), |b| {
+                b.iter(|| matmul_mxfp4_scalar(black_box(&mut y), black_box(&x), black_box(&data), black_box(&scale), s, i, o))
+            });
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+                group.bench_function(format!("avx512/{name}/s{s}"), |b| {
+                    b.iter(|| unsafe { matmul_mxfp4_avx512(black_box(&mut y), black_box(&x), black_box(&data), black_box(&scale), s, i, o) })
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 /// `qt_addrow`'s int4 branch (MLA-absorb `q_nope` absorption) at the real `kv_lora=512` this
 /// runs at in `attention.rs`'s absorbed decode path — see that module's doc for why this and
 /// `qt_matvec_rows` are fixed O(kv_lora) per call, independent of context length.
@@ -204,6 +231,7 @@ criterion_group!(
     bench_dot_i8i8,
     bench_dot_i4i8,
     bench_matmul_i4,
+    bench_matmul_mxfp4,
     bench_qt_addrow_i4,
     bench_qt_matvec_rows_i4,
     bench_mla_score_and_vmix

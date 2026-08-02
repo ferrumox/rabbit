@@ -37,3 +37,15 @@ harness = false
 [[bench]]
 name = "expert_load"
 harness = false
+
+# Added 2026-07-31 for the Kimi K3 target-box performance work (see PERFORMANCE.md's Phase 0
+# section). thin LTO + a single codegen unit let the optimizer inline across the hand-written
+# `is_x86_feature_detected!` kernel dispatchers and their `#[target_feature]` inner fns, which
+# 16 codegen units + no LTO (the compiler defaults this crate shipped with) leave on the table.
+# Deliberately NOT set: `panic = "abort"` (the `--serve` accept loop relies on unwinding a
+# panicked request thread without killing the process) and `target-cpu=native` (open decision D1:
+# kept out of the committed build so binaries stay portable across the owner's machines; measured
+# separately via RUSTFLAGS, see PERFORMANCE.md).
+[profile.release]
+lto = "thin"
+codegen-units = 1

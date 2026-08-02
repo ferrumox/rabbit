@@ -37,7 +37,7 @@
 //! checkpoint's `config.json`'s `eos_token_id` — matches; `kimi_k3::config::Cfg` already reads
 //! this generically via `cfg.base.stop_ids`, no change needed there).
 
-use crate::chat::Role;
+use crate::chat::{Emit, Role};
 
 const OPEN: &str = "<|open|>";
 const CLOSE: &str = "<|close|>";
@@ -155,9 +155,129 @@ pub fn render_messages(messages: &[(Role, String)], think: bool) -> String {
     out
 }
 
+/// The output-side inverse of [`generation_prompt`]: strips the structural XTML envelope the
+/// model emits to close the turn that `generation_prompt` deliberately left open.
+///
+/// `generation_prompt` hands the model an UN-closed `<|open|>response<|sep|>` (or
+/// `<|open|>think<|sep|>` under `think`), so a well-behaved K3 completion ends by closing what
+/// was opened: `...<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>`. Only
+/// `<|end_of_msg|>` (163586) is in `cfg.base.stop_ids`, and `generate` stops on it without
+/// emitting it — but `<|close|>` (163588) and `<|sep|>` (163589) are `"special": false` in the
+/// checkpoint's `added_tokens_decoder`, so the tokenizer decodes them to their literal text and
+/// they leak into the reply unless something strips them. That something is this.
+///
+/// Under `think` the model additionally switches channels mid-generation
+/// (`<|close|>think<|sep|><|open|>response<|sep|>`), which is exactly why the simpler "stop at
+/// the first `<|close|>`" rule is correct only for `!think`. Reasoning-channel text is passed
+/// through — rabbit's existing convention, GLM-5.2 likewise shows `<think>` content inline —
+/// the six control tokens of the transition are swallowed, and the reply continues with the
+/// response channel's body.
+pub struct ResponseFilter {
+    state: State,
+}
+
+enum State {
+    /// Emitting the think channel's body; its `<|close|>` begins the transition.
+    Think,
+    /// Swallowing `<|close|>think<|sep|><|open|>response<|sep|>` — two `<|sep|>`s wide. Counting
+    /// separators rather than matching the tag names keeps this independent of how `think` and
+    /// `response` happen to tokenize.
+    Transition { seps: u8 },
+    /// Emitting the response channel's body; its `<|close|>` ends the reply.
+    Response,
+}
+
+impl ResponseFilter {
+    /// `think` must be the same flag the turn's prompt was rendered with — it decides which
+    /// channel [`generation_prompt`] left open, and so which `<|close|>` terminates the reply.
+    pub fn new(think: bool) -> Self {
+        Self { state: if think { State::Think } else { State::Response } }
+    }
+
+    /// Classifies one freshly generated token by its decoded text.
+    pub fn step(&mut self, token: &str) -> Emit {
+        match &mut self.state {
+            State::Think => {
+                if token == CLOSE {
+                    self.state = State::Transition { seps: 0 };
+                    Emit::Skip
+                } else {
+                    Emit::Text
+                }
+            }
+            State::Transition { seps } => {
+                if token == SEP {
+                    *seps += 1;
+                    if *seps >= 2 {
+                        self.state = State::Response;
+                    }
+                }
+                Emit::Skip
+            }
+            State::Response => {
+                if token == CLOSE {
+                    Emit::Stop
+                } else {
+                    Emit::Text
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds `tokens` through the filter, returning the text that survives and whether the
+    /// filter asked to stop (mirroring `generate_reply`'s loop).
+    fn run(think: bool, tokens: &[&str]) -> (String, bool) {
+        let mut f = ResponseFilter::new(think);
+        let mut out = String::new();
+        for t in tokens {
+            match f.step(t) {
+                Emit::Text => out.push_str(t),
+                Emit::Skip => {}
+                Emit::Stop => return (out, true),
+            }
+        }
+        (out, false)
+    }
+
+    /// The exact token sequence the real checkpoint produced for "Can you tell me who you are
+    /// please?" (captured from a `--serve` SSE stream, 2026-08-01) — the bug this filter fixes.
+    #[test]
+    fn strips_the_closing_envelope_the_real_checkpoint_emits_without_thinking() {
+        let (text, stopped) = run(false, &["I", "’m", " Kim", "i", ".", CLOSE, "response", SEP, CLOSE, "message", SEP]);
+        assert_eq!(text, "I’m Kimi.");
+        assert!(stopped, "the response channel's <|close|> must end the turn, not be emitted");
+    }
+
+    #[test]
+    fn passes_through_a_reply_that_never_closes_its_channel() {
+        let (text, stopped) = run(false, &["still", " going"]);
+        assert_eq!(text, "still going");
+        assert!(!stopped, "max_tokens truncation must not look like a channel close");
+    }
+
+    /// Under `think` the first `<|close|>` is the think channel's, not the reply's — stopping
+    /// there would swallow the entire response.
+    #[test]
+    fn thinking_mode_keeps_generating_across_the_think_to_response_transition() {
+        let (text, stopped) = run(
+            true,
+            &["reason", "ing", CLOSE, "think", SEP, OPEN, "response", SEP, "the", " answer", CLOSE, "response", SEP],
+        );
+        assert_eq!(text, "reasoningthe answer", "transition markup is swallowed, both channels' bodies survive");
+        assert!(stopped);
+    }
+
+    #[test]
+    fn thinking_mode_does_not_stop_on_a_close_that_only_ends_the_think_channel() {
+        let (text, stopped) = run(true, &["hmm", CLOSE, "think", SEP, OPEN, "response", SEP, "hi"]);
+        assert_eq!(text, "hmmhi");
+        assert!(!stopped);
+    }
 
     #[test]
     fn first_turn_with_thinking_and_system_prompt_emits_preamble_then_system_then_user_then_open_think() {

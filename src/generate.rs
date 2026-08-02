@@ -63,7 +63,7 @@ impl ExpertCaches {
         let v = model
             .layers
             .iter()
-            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, naming)) } else { None })
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, model.cfg.n_experts as usize, naming)) } else { None })
             .collect();
         ExpertCaches(v)
     }
@@ -82,6 +82,21 @@ impl ExpertCaches {
     /// the two.
     pub fn io_wait_nanos_total(&self) -> u64 {
         self.0.iter().flatten().map(|c| c.io_wait_nanos).sum()
+    }
+
+    /// Whether any layer's cache loads through an `io_uring` ring. `false` (every MXFP4/K3 run,
+    /// whose naming never gets a ring) means `io_wait_nanos_total` is structurally zero, so the
+    /// CLI must not present it as "actual disk wait" (Phase 4c) — see `ExpertCache::has_ring`.
+    pub fn any_has_ring(&self) -> bool {
+        self.0.iter().flatten().any(|c| c.has_ring())
+    }
+
+    /// Phase 4b: preload every MoE layer's routed experts up front (see
+    /// `expert_cache::preload_layers`). GLM-5.2 experts are at the model hidden width, so the
+    /// model's own cfg supplies the shapes.
+    pub fn preload(&mut self, model: &Model, shards: &Shards) -> Result<(), ModelError> {
+        let n_experts = model.cfg.n_experts as usize;
+        Ok(crate::expert_cache::preload_layers(&mut self.0, shards, &model.cfg, model.ebits, n_experts)?)
     }
 
     /// Reads `<model_dir>/.rabbit_usage` (if any), seeds every MoE layer's usage counters from
@@ -170,6 +185,16 @@ pub struct Phases {
     pub attention_s: f32,
     pub expert_wait_s: f32,
     pub expert_matmul_s: f32,
+    /// Phase N5a (`NUMA_AMX_BRIEF.md`) sub-buckets of `attention_s`, filled by architectures
+    /// that split their attention cost (Kimi K3's `layer_forward`/`kda_step` today; GLM-5.2 and
+    /// Kimi Linear leave them 0). `attn_mla_s` is the MLA layers' whole attention time;
+    /// `attn_kda_proj_s` is the KDA layers' eight per-token projection matmuls;
+    /// `attn_kda_recur_s` is their conv/normalize/96-head-recurrence remainder — so
+    /// `attention_s ≈ attn_mla_s + attn_kda_proj_s + attn_kda_recur_s` (small glue excepted).
+    /// Instrumentation only: the math is untouched, per the brief's scope guard.
+    pub attn_kda_proj_s: f32,
+    pub attn_kda_recur_s: f32,
+    pub attn_mla_s: f32,
 }
 
 /// A profiled `step_profiled` call's full timing breakdown: [`Phases`] plus the final lm_head
@@ -1074,26 +1099,30 @@ mod tests {
         // layer 2 (MoE + DSA-shared) gets none, so it must end up with zero candidates.
         crate::usage_cache::save(&usage_path, vec![(1usize, 0usize, 150_000u64), (1, 1, 50_000)].into_iter()).unwrap();
 
-        let cache_capacity = 8;
+        // capacity 2 < n_experts (3): pinning is only meaningful when the cache CAN'T hold every
+        // expert. At full residency (capacity >= n_experts) the cache never evicts, so pinning is
+        // correctly skipped -- covered by
+        // `expert_cache::tests::full_residency_cache_never_pins_even_with_marked_candidates`.
+        let cache_capacity = 2;
         let mut caches = ExpertCaches::new(&model, cache_capacity);
         let stats = caches.warm_start(&dir.0, cache_capacity);
 
         assert_eq!(stats.hist, 200_000);
         assert!((stats.confidence - 1.0).abs() < 1e-6);
-        // budget = floor(8 * 0.5 * 1.0) = 4, but only 2 nonzero entries exist for layer 1 -> 2 candidates.
-        assert_eq!(stats.pin_candidates, 2);
+        // budget = floor(2 * 0.5 * 1.0) = 1 -> only the highest-usage expert (eid 0, 150k) is a candidate.
+        assert_eq!(stats.pin_candidates, 1);
 
         // lazy: marking candidates must not load anything.
         assert!(!caches.0[1].as_ref().unwrap().is_pinned(0));
         assert_eq!(caches.0[1].as_ref().unwrap().pinned_len(), 0);
 
-        // the first real load of each marked candidate promotes it.
+        // the first real load of the marked candidate promotes it; the non-candidate does not.
         caches.0[1].as_mut().unwrap().get_or_load(&shards, &model.cfg, 1, 0, model.ebits).unwrap();
         caches.0[1].as_mut().unwrap().get_or_load(&shards, &model.cfg, 1, 1, model.ebits).unwrap();
         let layer1 = caches.0[1].as_ref().unwrap();
         assert!(layer1.is_pinned(0));
-        assert!(layer1.is_pinned(1));
-        assert_eq!(layer1.pinned_len(), 2);
+        assert!(!layer1.is_pinned(1), "eid 1 was below the pin budget, so it stays in ordinary LRU slots");
+        assert_eq!(layer1.pinned_len(), 1);
 
         let layer2 = caches.0[2].as_ref().unwrap();
         assert_eq!(layer2.pinned_len(), 0, "a layer with no usage history must not get anything pinned");

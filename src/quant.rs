@@ -126,6 +126,39 @@ impl QT {
         }
     }
 
+    /// A fresh `QT` holding rows `[r0, r0+nr)` of this one, byte-for-byte — every variant's
+    /// buffers are row-major, so a contiguous row range is a contiguous byte range in each.
+    /// Exists for NUMA row-sharding (`kernels::QTSharded`): the FRESH allocations are the point
+    /// — called on a pinned thread, first touch places the copy's pages on that thread's node,
+    /// which a borrow of the original obviously couldn't do.
+    pub fn copy_rows(&self, r0: usize, nr: usize) -> QT {
+        assert!(r0 + nr <= self.rows, "copy_rows: row range past the end of the weight");
+        let cols = self.cols;
+        let kind = match &self.kind {
+            QTKind::F32(data) => QTKind::F32(data[r0 * cols..(r0 + nr) * cols].to_vec()),
+            QTKind::I8 { data, scale } => QTKind::I8 { data: data[r0 * cols..(r0 + nr) * cols].to_vec(), scale: scale[r0..r0 + nr].to_vec() },
+            QTKind::I4 { data, scale } => {
+                let rb = cols.div_ceil(2);
+                QTKind::I4 { data: data[r0 * rb..(r0 + nr) * rb].to_vec(), scale: scale[r0..r0 + nr].to_vec() }
+            }
+            QTKind::I2 { data, scale } => {
+                let rb = cols.div_ceil(4);
+                QTKind::I2 { data: data[r0 * rb..(r0 + nr) * rb].to_vec(), scale: scale[r0..r0 + nr].to_vec() }
+            }
+            QTKind::I4Grouped { data, scale, group_size } => {
+                let rb = cols.div_ceil(2);
+                let ngroups = cols.div_ceil(*group_size);
+                QTKind::I4Grouped { data: data[r0 * rb..(r0 + nr) * rb].to_vec(), scale: scale[r0 * ngroups..(r0 + nr) * ngroups].to_vec(), group_size: *group_size }
+            }
+            QTKind::MxFp4 { data, block_scale } => {
+                let rb = cols.div_ceil(2);
+                let bpr = cols.div_ceil(32);
+                QTKind::MxFp4 { data: data[r0 * rb..(r0 + nr) * rb].to_vec(), block_scale: block_scale[r0 * bpr..(r0 + nr) * bpr].to_vec() }
+            }
+        };
+        QT { rows: nr, cols, bits: self.bits, kind }
+    }
+
     /// Fills from row-major f32 weights `w[rows*cols]`, quantizing per the chosen format.
     pub fn fill(&mut self, w: &[f32]) {
         assert_eq!(w.len(), self.rows * self.cols);

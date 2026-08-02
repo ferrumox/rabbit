@@ -22,7 +22,12 @@
 //! Usage:
 //!   cargo run --release --example teacher_forced_decode_bench -- --model <dir> \
 //!       [--prompt <text>] [--steps N] [--dbits N] [--ebits N] [--expert-cache N] \
-//!       [--shard-dirs <dir1,dir2,...>]
+//!       [--shard-dirs <dir1,dir2,...>] [--numa]
+//!
+//! The final line includes a **logits fingerprint**: an FNV-1a hash folded over every decode
+//! step's full logits vector (raw f32 bits). Two runs that print the same fingerprint computed
+//! bit-identical logits at every step — this is the acceptance instrument for scheduling-only
+//! changes (`NUMA_AMX_BRIEF.md` invariant 1: same fingerprint with `--numa` on and off, warm).
 
 use rabbit::model::{self, ExpertCaches, KvState, Model, Tokenizer};
 use rabbit::safetensors::Shards;
@@ -43,6 +48,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_capacity: usize = arg_value(&args, "--expert-cache").and_then(|s| s.parse().ok()).unwrap_or(64);
     let mut shard_dirs = vec![model_dir.clone()];
     shard_dirs.extend(arg_value(&args, "--shard-dirs").into_iter().flat_map(|s| s.split(',').map(PathBuf::from).collect::<Vec<_>>()));
+    if args.iter().any(|a| a == "--numa") {
+        // Node pools sized from the global pool's total (which honors RAYON_NUM_THREADS) unless
+        // `--numa-threads N` decouples them — the diagnostic that separates "how many unpinned
+        // threads should attention get" from "how many pinned threads should the experts get",
+        // which the N3 sweep showed are different questions.
+        let total = arg_value(&args, "--numa-threads").and_then(|s| s.parse().ok()).unwrap_or_else(rayon::current_num_threads);
+        match rabbit::numa::NodePools::init(total) {
+            Ok(p) => eprintln!("--numa: {} pinned node pools x {} threads", p.n(), p.threads_per_pool()),
+            Err(why) => eprintln!("--numa: {why}"),
+        }
+    }
 
     eprintln!("loading model (dbits={dbits}, ebits={ebits})...");
     let t0 = Instant::now();
@@ -66,9 +82,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // construction -- no argmax/sample call anywhere in this loop -- so the exact same sequence
     // of `step` calls (same ids, same positions) happens on every run, on every binary.
     let t_decode = Instant::now();
+    let mut fingerprint: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    let mut phases = rabbit::generate::Phases::default();
+    let mut lm_head_s = 0f32;
     for (i, pos) in (0..steps).zip(prompt_ids.len()..) {
         let id = prompt_ids[i % prompt_ids.len()];
-        model::step(&model, &shards, &mut caches, &mut kv, &[id], pos)?;
+        let (logits, prof) = model::step_profiled(&model, &shards, &mut caches, &mut kv, &[id], pos)?;
+        phases.attention_s += prof.phases.attention_s;
+        phases.attn_kda_proj_s += prof.phases.attn_kda_proj_s;
+        phases.attn_kda_recur_s += prof.phases.attn_kda_recur_s;
+        phases.attn_mla_s += prof.phases.attn_mla_s;
+        phases.expert_wait_s += prof.phases.expert_wait_s;
+        phases.expert_matmul_s += prof.phases.expert_matmul_s;
+        lm_head_s += prof.lm_head_s;
+        for v in logits {
+            for b in v.to_bits().to_le_bytes() {
+                fingerprint = (fingerprint ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
         let (hits, misses, _) = caches.hit_miss_totals();
         eprintln!(
             "  step {}/{} at {:.1}s elapsed (expert cache totals: {hits} hits, {misses} misses)",
@@ -78,6 +109,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let decode_elapsed = t_decode.elapsed().as_secs_f32();
-    println!("{steps} teacher-forced decode steps in {decode_elapsed:.2}s ({:.4} tok/s)", steps as f32 / decode_elapsed);
+    println!("{steps} teacher-forced decode steps in {decode_elapsed:.2}s ({:.4} tok/s), logits fingerprint {fingerprint:016x}", steps as f32 / decode_elapsed);
+    // Per-token phase buckets over the decode steps (N5a instrumentation — the same numbers
+    // `/profile` serves in --serve, without needing a server boot to read them).
+    let per = |v: f32| v / steps as f32;
+    println!(
+        "per-token buckets: expert {:.3}s (wait {:.3}s), attention {:.3}s (kda_proj {:.3}s, kda_recur {:.3}s, mla {:.3}s), lm_head {:.3}s",
+        per(phases.expert_matmul_s),
+        per(phases.expert_wait_s),
+        per(phases.attention_s),
+        per(phases.attn_kda_proj_s),
+        per(phases.attn_kda_recur_s),
+        per(phases.attn_mla_s),
+        per(lm_head_s)
+    );
     Ok(())
 }

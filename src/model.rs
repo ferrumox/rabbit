@@ -249,6 +249,29 @@ impl ExpertCaches {
         }
     }
 
+    /// Whether any layer loads through an `io_uring` ring — see `ExpertCache::has_ring`. When
+    /// `false` (MXFP4/K3), `io_wait_nanos_total` is structurally zero and the CLI suppresses its
+    /// "actual disk wait" readout (Phase 4c).
+    pub fn any_has_ring(&self) -> bool {
+        match self {
+            ExpertCaches::Glm52(c) => c.any_has_ring(),
+            ExpertCaches::KimiLinear(c) => c.any_has_ring(),
+            ExpertCaches::KimiK3(c) => c.any_has_ring(),
+        }
+    }
+
+    /// Phase 4b: preload every MoE layer's experts up front (see `expert_cache::preload_layers`).
+    /// Same dispatch/panic contract as `step` — `caches` and `model` always come from the same
+    /// `Model::load` in any correctly-threaded session.
+    pub fn preload(&mut self, model: &Model, shards: &crate::safetensors::Shards) -> Result<(), ModelError> {
+        match (self, model) {
+            (ExpertCaches::Glm52(c), Model::Glm52(m)) => Ok(c.preload(m, shards)?),
+            (ExpertCaches::KimiLinear(c), Model::KimiLinear(m)) => Ok(c.preload(m, shards)?),
+            (ExpertCaches::KimiK3(c), Model::KimiK3(m)) => Ok(c.preload(m, shards)?),
+            _ => unreachable!("ExpertCaches/Model family mismatch -- always construct ExpertCaches from the same Model"),
+        }
+    }
+
     pub fn warm_start(&mut self, model_dir: &Path, cache_capacity: usize) -> crate::generate::WarmStartStats {
         match self {
             ExpertCaches::Glm52(c) => c.warm_start(model_dir, cache_capacity),
