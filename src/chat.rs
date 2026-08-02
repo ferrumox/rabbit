@@ -26,6 +26,9 @@ pub struct LoadArgs {
     /// opt-in CACHE_ROUTE (see `moe::RouteConfig`) — off by default, matching colibrì's own
     /// stance, since it's still unmeasured on rabbit's own architecture.
     pub cache_route: bool,
+    /// `--preload-experts` (Phase 4b): after warm-start, load every MoE layer's experts up front
+    /// so token 1 runs at steady-state speed instead of paying a long streaming warmup.
+    pub preload_experts: bool,
     /// Extra directories to scan for `.safetensors` shards, alongside `model_dir` — lets a
     /// checkpoint's shards be split across separate drives (e.g. a second NVMe added for
     /// capacity/bandwidth, without an OS-level RAID array — see `Shards::open_multi`'s doc).
@@ -80,6 +83,13 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
         } else if stats.hist > 0 {
             eprintln!("usage cache: {} historical selections (below auto-pin threshold)", stats.hist);
         }
+    }
+    if args.preload_experts {
+        eprintln!("preloading experts (--preload-experts)...");
+        let tp = std::time::Instant::now();
+        caches.preload(&model, &shards)?;
+        let (_, loaded, _) = caches.hit_miss_totals();
+        eprintln!("preload done in {:.1}s ({loaded} experts resident)", tp.elapsed().as_secs_f32());
     }
     let sampling = SamplingConfig { temperature: args.temperature, nucleus: args.nucleus };
     let rng = Rng::new(args.seed);
@@ -178,6 +188,51 @@ fn glm52_render_messages(messages: &[(Role, String)], think: bool) -> String {
     out
 }
 
+/// What the active family's [`OutputFilter`] decided about one freshly generated token.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Emit {
+    /// Part of the visible reply — show it.
+    Text,
+    /// Structural markup the model emitted to close its own turn — swallow it, but still count
+    /// it as generated.
+    Skip,
+    /// The reply's channel closed: the turn is complete, stop generating.
+    Stop,
+}
+
+/// The output-side counterpart to [`render_turn`]/[`render_messages`]. Those open a turn in the
+/// family's prompt grammar; this closes it, deciding per generated token whether the model is
+/// still producing reply text or has begun emitting the markup that ends the turn.
+///
+/// Only Kimi K3 needs a real one. GLM-5.2 and Kimi Linear 48B end a turn with a single stop id,
+/// which `generate_reply`'s `stop_ids` check already handles without emitting it. K3 is the only
+/// family whose turn ends with a multi-token close sequence (`<|close|>response<|sep|>
+/// <|close|>message<|sep|>`) made of tokens that are not themselves stop ids — see
+/// [`crate::kimi_k3::chat_template::ResponseFilter`].
+pub enum OutputFilter {
+    Passthrough,
+    KimiK3(crate::kimi_k3::chat_template::ResponseFilter),
+}
+
+impl OutputFilter {
+    pub fn step(&mut self, token: &str) -> Emit {
+        match self {
+            OutputFilter::Passthrough => Emit::Text,
+            OutputFilter::KimiK3(f) => f.step(token),
+        }
+    }
+}
+
+/// Builds the [`OutputFilter`] matching how this turn's prompt was rendered — `think` must be the
+/// same flag handed to [`render_turn`]/[`render_messages`], since it decides which channel the
+/// generation prompt left open for the model to close.
+pub fn output_filter(model: &Model, think: bool) -> OutputFilter {
+    match model {
+        Model::KimiK3(_) => OutputFilter::KimiK3(crate::kimi_k3::chat_template::ResponseFilter::new(think)),
+        Model::Glm52(_) | Model::KimiLinear(_) => OutputFilter::Passthrough,
+    }
+}
+
 pub fn render_messages(model: &Model, messages: &[(Role, String)], think: bool) -> String {
     match model {
         Model::Glm52(_) => glm52_render_messages(messages, think),
@@ -202,6 +257,11 @@ pub struct TurnProfile {
     pub hits: u64,
     pub misses: u64,
     pub attention_s: f32,
+    /// N5a sub-buckets of `attention_s` (KDA projections / KDA recurrence / MLA) — zero for
+    /// families that don't split it; see `generate::Phases`.
+    pub attn_kda_proj_s: f32,
+    pub attn_kda_recur_s: f32,
+    pub attn_mla_s: f32,
     pub expert_wait_s: f32,
     pub expert_matmul_s: f32,
     pub lm_head_s: f32,
@@ -211,6 +271,9 @@ pub struct TurnProfile {
 impl TurnProfile {
     fn accumulate(&mut self, step: &StepProfile) {
         self.attention_s += step.phases.attention_s;
+        self.attn_kda_proj_s += step.phases.attn_kda_proj_s;
+        self.attn_kda_recur_s += step.phases.attn_kda_recur_s;
+        self.attn_mla_s += step.phases.attn_mla_s;
         self.expert_wait_s += step.phases.expert_wait_s;
         self.expert_matmul_s += step.phases.expert_matmul_s;
         self.lm_head_s += step.lm_head_s;
@@ -250,11 +313,18 @@ pub enum GenEvent<'a> {
 /// turn's `pos_base`), the count of tokens generated, and this whole turn's [`TurnProfile`]
 /// (every caller gets one — the timing overhead is a handful of `Instant::now()` calls per
 /// layer, negligible next to a real forward pass; only `server.rs` does anything with it).
+///
+/// `filter` must match how `turn_ids` was built: [`output_filter`] with the same `think` flag
+/// when the prompt came from [`render_turn`]/[`render_messages`], or [`OutputFilter::Passthrough`]
+/// for a raw prompt with no chat envelope to close (`--prompt`'s single-shot completion). Note
+/// the returned token count is what the model *generated*, which can exceed the reply text's
+/// token count when the filter swallowed closing markup.
 pub fn generate_reply(
     sess: &mut Session,
     kv: &mut KvState,
     turn_ids: &[usize],
     pos_base: usize,
+    mut filter: OutputFilter,
     mut on_event: impl FnMut(GenEvent),
 ) -> Result<(String, usize, usize, TurnProfile), Box<dyn std::error::Error>> {
     let turn_t = std::time::Instant::now();
@@ -276,17 +346,37 @@ pub fn generate_reply(
     let mut pos = pos_base + turn_ids.len();
 
     let mut out_ids = Vec::with_capacity(sess.max_tokens);
+    // The subset of `out_ids` that survived the filter — what the reply text is built from.
+    // Separate from `out_ids` so `max_tokens`, step indices and `completion_tokens` keep counting
+    // what the model actually generated, not what was shown.
+    let mut kept_ids: Vec<usize> = Vec::with_capacity(sess.max_tokens);
     while out_ids.len() < sess.max_tokens {
         let next = generate::pick_token(&logits, &sess.sampling, &mut sess.rng, None);
         if sess.stop_ids.contains(&next) {
             break;
         }
+        // Decoded here rather than after the forward step below (where it used to live) because
+        // the filter's verdict is needed first: `Stop` ends the turn on a token the family's
+        // grammar says closes the reply, and breaking now skips a forward pass — seconds to tens
+        // of seconds on a real model — whose logits would be thrown away.
+        let decoded = sess.tokenizer.decode(&[next as i32]);
+        let action = filter.step(&String::from_utf8_lossy(&decoded));
+        if action == Emit::Stop {
+            break;
+        }
+        // A `Skip`ped token still generated, so it still counts against `max_tokens` and still
+        // reports a `Token` event (callers' step/timing accounting stays exact) — it just carries
+        // no bytes, which every consumer already treats as nothing to show: `server.rs`'s SSE
+        // writer guards on `!s.is_empty()`, and the CLI prints an empty slice as nothing.
+        let shown: &[u8] = if action == Emit::Text { &decoded } else { &[] };
         out_ids.push(next);
+        if action == Emit::Text {
+            kept_ids.push(next);
+        }
         if out_ids.len() >= sess.max_tokens {
-            let decoded = sess.tokenizer.decode(&[next as i32]);
             on_event(GenEvent::Token {
                 token_id: next,
-                bytes: &decoded,
+                bytes: shown,
                 index: out_ids.len(),
                 max: sess.max_tokens,
                 seconds: 0.0,
@@ -306,10 +396,9 @@ pub fn generate_reply(
         let step_seconds = step_t.elapsed().as_secs_f32();
         (hits, misses, io_ns) = sess.caches.hit_miss_totals();
         io_wait_ns = sess.caches.io_wait_nanos_total();
-        let decoded = sess.tokenizer.decode(&[next as i32]);
         on_event(GenEvent::Token {
             token_id: next,
-            bytes: &decoded,
+            bytes: shown,
             index: out_ids.len(),
             max: sess.max_tokens,
             seconds: step_seconds,
@@ -321,8 +410,8 @@ pub fn generate_reply(
         pos += 1;
     }
 
-    let out_i32: Vec<i32> = out_ids.iter().map(|&id| id as i32).collect();
-    let text = String::from_utf8_lossy(&sess.tokenizer.decode(&out_i32)).into_owned();
+    let kept_i32: Vec<i32> = kept_ids.iter().map(|&id| id as i32).collect();
+    let text = String::from_utf8_lossy(&sess.tokenizer.decode(&kept_i32)).into_owned();
 
     profile.wall_s = turn_t.elapsed().as_secs_f32();
     profile.completion_tokens = out_ids.len();

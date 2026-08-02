@@ -140,7 +140,13 @@ fn push_profile(session: &mut Session, profile: chat::TurnProfile) {
 }
 
 fn handle_profile(request: Request, session: &Session) {
-    let body = json!({"seq": session.profile_seq, "turns": session.profile});
+    let mut body = json!({"seq": session.profile_seq, "turns": session.profile});
+    // Phase N3d (`NUMA_AMX_BRIEF.md`): per-node MoE dispatch totals since process start —
+    // present only when --numa dispatch has actually run. Monotonic; clients diff polls. The
+    // busy-time spread across nodes is the measured routing skew D1 is judged on.
+    if let Some(stats) = crate::kimi_k3::moe::numa_moe_stats() {
+        body["numa_moe"] = json!(stats.iter().enumerate().map(|(node, (busy_s, experts))| json!({"node": node, "busy_s": busy_s, "experts": experts})).collect::<Vec<_>>());
+    }
     respond_json(request, 200, body.to_string());
 }
 
@@ -258,7 +264,8 @@ fn handle_chat_completions(mut request: Request, session: &mut Session, cfg: &Se
     }
 
     let mut hit_stop = true;
-    let result = chat::generate_reply(session, &mut kv, &prompt_ids, 0, |ev| {
+    let filter = chat::output_filter(&session.model, cfg.think);
+    let result = chat::generate_reply(session, &mut kv, &prompt_ids, 0, filter, |ev| {
         if let GenEvent::Token { index, max, .. } = ev
             && index >= max
         {
@@ -330,7 +337,8 @@ fn stream_chat_completion(request: Request, session: &mut Session, kv: &mut KvSt
     let mut hit_stop = true;
     let mut io_failed = false;
 
-    let gen_result = chat::generate_reply(session, kv, prompt_ids, 0, |ev| {
+    let filter = chat::output_filter(&session.model, cfg.think);
+    let gen_result = chat::generate_reply(session, kv, prompt_ids, 0, filter, |ev| {
         if io_failed {
             return;
         }

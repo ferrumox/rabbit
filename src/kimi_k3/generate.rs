@@ -24,7 +24,7 @@ use crate::expert_cache::{ExpertCache, ExpertNaming};
 use crate::generate::{Phases, StepProfile};
 use crate::glm52::attention::{self, rmsnorm, OutputGate};
 use crate::glm52::moe::{self, Activation};
-use crate::kernels::matmul_qt;
+use crate::kernels::{matmul_qt, matvec_sharded_batch, DenseQT};
 use crate::kimi_k3::attn_res::{self, AttnResState};
 use crate::kimi_k3::config::Cfg;
 use crate::kimi_k3::model::{self, Attn, Ffn, KdaOutputGate, KdaWeights, Model, ModelError};
@@ -127,7 +127,7 @@ impl ExpertCaches {
         // `.weight_packed`/`.weight_scale` naming; every synthetic test fixture in this crate
         // uses plain `.weight` float tensors and needs the original `KimiK3` naming.
         let naming = if model.cfg.mxfp4_experts { ExpertNaming::KimiK3Mxfp4 } else { ExpertNaming::KimiK3 };
-        let v = model.layers.iter().map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, naming)) } else { None }).collect();
+        let v = model.layers.iter().map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, model.cfg.base.n_experts as usize, naming)) } else { None }).collect();
         ExpertCaches(v)
     }
 
@@ -137,6 +137,22 @@ impl ExpertCaches {
 
     pub fn io_wait_nanos_total(&self) -> u64 {
         self.0.iter().flatten().map(|c| c.io_wait_nanos).sum()
+    }
+
+    /// Whether any layer's cache loads through an `io_uring` ring. `false` (every MXFP4/K3 run,
+    /// whose naming never gets a ring) means `io_wait_nanos_total` is structurally zero, so the
+    /// CLI must not present it as "actual disk wait" (Phase 4c) — see `ExpertCache::has_ring`.
+    pub fn any_has_ring(&self) -> bool {
+        self.0.iter().flatten().any(|c| c.has_ring())
+    }
+
+    /// Phase 4b: preload every MoE layer's routed experts up front. K3's experts live at the
+    /// LATENT width, so `to_glm_cfg_expert` (not `to_glm_cfg`) supplies the shapes — the same
+    /// config `latent_moe`'s own `ensure_loaded` uses. See `expert_cache::preload_layers`.
+    pub fn preload(&mut self, model: &Model, shards: &Shards) -> Result<(), ModelError> {
+        let cfg = crate::kimi_k3::model::to_glm_cfg_expert(&model.cfg);
+        let n_experts = cfg.n_experts as usize;
+        Ok(crate::expert_cache::preload_layers(&mut self.0, shards, &cfg, model.ebits, n_experts)?)
     }
 
     pub fn warm_start(&mut self, model_dir: &std::path::Path, cache_capacity: usize) -> crate::generate::WarmStartStats {
@@ -195,18 +211,38 @@ fn embed_tokens(model: &Model, ids: &[usize]) -> Vec<f32> {
 /// checkpoints that don't set it — see `kda.rs::decay_gate`'s doc), and the output gate's `g2`
 /// input comes from EITHER `w.output_gate`'s low-rank or full-rank projection (the math
 /// consuming `g2`, `head_output_gate`, is unchanged either way).
-fn kda_step(cfg: &Cfg, w: &KdaWeights, state: &mut KdaLayerState, x: &[f32], out: &mut [f32]) {
+fn kda_step(cfg: &Cfg, w: &KdaWeights, state: &mut KdaLayerState, x: &[f32], out: &mut [f32], mut phases: Option<&mut Phases>) {
     let head_dim = cfg.base.kda_head_dim as usize;
     let n_heads = cfg.base.kda_n_heads as usize;
     let d_inner = head_dim * n_heads;
     let eps = cfg.base.eps;
 
+    // Phase N5a instrumentation (timing only — every operation below is byte-for-byte what it
+    // was): the step's cost is bucketed into its projection matmuls vs everything recurrent
+    // (convs, activations/norms, the 96-head state update). A handful of `Instant::now()` calls
+    // against a multi-ms step; noise. See `Phases::attn_kda_proj_s`'s doc.
+    let mut proj_ns = 0u128;
+    let mut recur_ns = 0u128;
+    let mut t = std::time::Instant::now();
+
     let mut q_pre = vec![0f32; d_inner];
-    matmul_qt(&mut q_pre, x, &w.q_proj, 1);
     let mut k_pre = vec![0f32; d_inner];
-    matmul_qt(&mut k_pre, x, &w.k_proj, 1);
     let mut v_pre = vec![0f32; d_inner];
-    matmul_qt(&mut v_pre, x, &w.v_proj, 1);
+    // N4: sharded q/k/v run as ONE cross-domain fan-out (three weights amortizing one fan-out's
+    // wake cost — at 69 KDA layers/token the fan-out count is the price that matters). Plain
+    // weights (no --numa) take exactly the pre-N4 three matmuls.
+    match (&w.q_proj, &w.k_proj, &w.v_proj, crate::numa::NodePools::get()) {
+        (DenseQT::Sharded(q), DenseQT::Sharded(k), DenseQT::Sharded(v), Some(pools)) => {
+            matvec_sharded_batch(pools, x, &mut [(&mut q_pre, q), (&mut k_pre, k), (&mut v_pre, v)]);
+        }
+        _ => {
+            w.q_proj.matvec(&mut q_pre, x);
+            w.k_proj.matvec(&mut k_pre, x);
+            w.v_proj.matvec(&mut v_pre, x);
+        }
+    }
+    proj_ns += t.elapsed().as_nanos();
+    t = std::time::Instant::now();
 
     let mut q = vec![0f32; d_inner];
     state.q_conv.step(&q_pre, &w.q_conv, &mut q);
@@ -233,6 +269,8 @@ fn kda_step(cfg: &Cfg, w: &KdaWeights, state: &mut KdaLayerState, x: &[f32], out
             *c *= q_scale;
         }
     }
+    recur_ns += t.elapsed().as_nanos();
+    t = std::time::Instant::now();
 
     let mut f_a = vec![0f32; head_dim];
     matmul_qt(&mut f_a, x, &w.f_a_proj, 1);
@@ -253,6 +291,8 @@ fn kda_step(cfg: &Cfg, w: &KdaWeights, state: &mut KdaLayerState, x: &[f32], out
             matmul_qt(&mut g2, &g_a, g_b_proj, 1);
         }
     }
+    proj_ns += t.elapsed().as_nanos();
+    t = std::time::Instant::now();
 
     let mut o = vec![0f32; d_inner];
     state.heads.par_iter_mut().zip(o.par_chunks_mut(head_dim)).enumerate().for_each(|(h, (head_state, o_slot))| {
@@ -263,8 +303,16 @@ fn kda_step(cfg: &Cfg, w: &KdaWeights, state: &mut KdaLayerState, x: &[f32], out
         head_state.step(&q[sl.clone()], &k[sl.clone()], &v[sl.clone()], &alpha, beta, o_slot);
         head_output_gate(o_slot, &w.o_norm, &g2[sl], eps);
     });
+    recur_ns += t.elapsed().as_nanos();
+    t = std::time::Instant::now();
 
-    matmul_qt(out, &o, &w.o_proj, 1);
+    w.o_proj.matvec(out, &o);
+    proj_ns += t.elapsed().as_nanos();
+
+    if let Some(p) = phases.as_deref_mut() {
+        p.attn_kda_proj_s += proj_ns as f32 / 1e9;
+        p.attn_kda_recur_s += recur_ns as f32 / 1e9;
+    }
 }
 
 /// One transformer layer, Attention-Residuals-aware: when `cfg.attn_res_block > 0` (and
@@ -309,7 +357,7 @@ fn layer_forward(
     match (&layer.attn, layer_state) {
         (Attn::Kda(w), LayerState::Kda(state)) => {
             for si in 0..s {
-                kda_step(cfg, w, state, &nrm[si * d..(si + 1) * d], &mut attn_delta[si * d..(si + 1) * d]);
+                kda_step(cfg, w, state, &nrm[si * d..(si + 1) * d], &mut attn_delta[si * d..(si + 1) * d], phases.as_deref_mut());
             }
         }
         (Attn::Mla(w), LayerState::Mla(kv)) => {
@@ -319,6 +367,9 @@ fn layer_forward(
                 None => OutputGate::Off,
             };
             attention::attention(&glm_cfg, &w.attn, kv, &nrm, s, pos_base, dsa, absorb, rope, qproj, output_gate, &mut attn_delta);
+            if let Some(p) = phases.as_deref_mut() {
+                p.attn_mla_s += attn_t.elapsed().as_secs_f32();
+            }
         }
         _ => unreachable!("Attn/LayerState variant mismatch -- KvState::new always pairs them per layer"),
     }
@@ -459,7 +510,7 @@ pub fn step(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &mut 
     let mut last = x[(s - 1) * d..s * d].to_vec();
     rmsnorm(&mut last, &model.final_norm, model.cfg.base.eps);
     let mut logit = vec![0f32; model.cfg.base.vocab as usize];
-    matmul_qt(&mut logit, &last, &model.lm_head, 1);
+    model.lm_head.matvec(&mut logit, &last);
     Ok(logit)
 }
 
@@ -474,7 +525,7 @@ pub fn step_profiled(model: &Model, shards: &Shards, caches: &mut ExpertCaches, 
     rmsnorm(&mut last, &model.final_norm, model.cfg.base.eps);
     let mut logit = vec![0f32; model.cfg.base.vocab as usize];
     let t = std::time::Instant::now();
-    matmul_qt(&mut logit, &last, &model.lm_head, 1);
+    model.lm_head.matvec(&mut logit, &last);
     let lm_head_s = t.elapsed().as_secs_f32();
     Ok((logit, StepProfile { phases, lm_head_s }))
 }
@@ -490,7 +541,7 @@ pub fn step_all(model: &Model, shards: &Shards, caches: &mut ExpertCaches, kv: &
     for si in 0..s {
         let mut row = x[si * d..(si + 1) * d].to_vec();
         rmsnorm(&mut row, &model.final_norm, model.cfg.base.eps);
-        matmul_qt(&mut lo[si * v..(si + 1) * v], &row, &model.lm_head, 1);
+        model.lm_head.matvec(&mut lo[si * v..(si + 1) * v], &row);
     }
     Ok(lo)
 }

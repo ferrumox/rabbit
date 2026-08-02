@@ -55,6 +55,7 @@ use crate::glm52::config::Cfg;
 use crate::glm52::model::{ModelError, qt_load};
 use crate::quant::{QT, QTKind};
 use crate::safetensors::Shards;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Which on-disk tensor-name convention a checkpoint's routed experts use — the one piece of
@@ -525,6 +526,11 @@ enum LoadKind {
 /// every `ensure_loaded` call over that lifetime; see `uring_load::Ring`'s doc for why.
 pub struct ExpertCache {
     capacity: usize,
+    /// Total routed experts for this layer. When `capacity >= n_experts` the cache holds every
+    /// expert (full residency) and never evicts, so pinning — which only protects against
+    /// eviction — is pointless and is skipped entirely (see `insert_or_pin`). `usize::MAX` (the
+    /// `new` default) means "unbounded / unknown", i.e. treat pinning as potentially useful.
+    n_experts: usize,
     slots: Vec<ExpertSlot>,
     /// Checked before `slots` on every lookup, never touched by `insert`'s LRU eviction —
     /// colibrì's `m->pin[layer]`. Structurally separate from `slots` rather than a "never
@@ -587,17 +593,22 @@ impl ExpertCache {
         self.capacity
     }
 
+    /// Test/simple constructor: `n_experts` unknown, so pinning is treated as potentially useful
+    /// (`usize::MAX`). Production builds go through `for_family` with the real expert count so
+    /// full-residency caches can skip pointless pinning.
     pub fn new(capacity: usize) -> ExpertCache {
-        Self::for_family(capacity, ExpertNaming::Glm52)
+        Self::for_family(capacity, usize::MAX, ExpertNaming::Glm52)
     }
 
     /// Like `new`, but for a checkpoint whose routed experts use a different on-disk
     /// tensor-name convention (see `ExpertNaming`) — e.g. Kimi Linear's
     /// `block_sparse_moe.experts.{eid}.{w1,w2,w3}` instead of GLM-5.2's
-    /// `mlp.experts.{eid}.{gate_proj,up_proj,down_proj}`.
-    pub fn for_family(capacity: usize, naming: ExpertNaming) -> ExpertCache {
+    /// `mlp.experts.{eid}.{gate_proj,up_proj,down_proj}`. `n_experts` is the layer's total routed
+    /// expert count, so `capacity >= n_experts` (full residency) can skip pinning entirely.
+    pub fn for_family(capacity: usize, n_experts: usize, naming: ExpertNaming) -> ExpertCache {
         ExpertCache {
             capacity,
+            n_experts,
             slots: Vec::new(),
             pinned: Vec::new(),
             pin_candidates: std::collections::HashSet::new(),
@@ -623,6 +634,22 @@ impl ExpertCache {
 
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// Whether this cache loads through an `io_uring` ring. `false` means every load is the
+    /// synchronous `sequential_fallback` path, whose `io_wait_nanos` counter is **structurally
+    /// always zero** — so a `[0.0s actual disk wait]` readout means "no ring here", NOT "the disk
+    /// was instant" (Phase 4c: the CLI must not print that misleading bracket for MXFP4, whose
+    /// naming never gets a ring — see `ExpertCache::new`).
+    pub fn has_ring(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.ring.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     /// Drops every cached slot (next lookup for any id is a miss) without tearing down the
@@ -824,8 +851,14 @@ impl ExpertCache {
     /// straight into `pinned` (mlocked, never evicted) instead of the ordinary LRU `slots` —
     /// the one and only place lazy/sticky promotion actually happens. `used` is irrelevant for
     /// a pinned slot, stamped 0.
+    ///
+    /// Skipped entirely at full residency (`capacity >= n_experts`): the cache then never evicts,
+    /// so pinning-to-prevent-eviction protects against nothing — and would just fail `mlock` for
+    /// every expert under a low `RLIMIT_MEMLOCK` (`--expert-cache 896` on the K3 target box hit
+    /// exactly this). The `&&` short-circuits before `remove`, so a candidate marked earlier is
+    /// simply left unused rather than promoted.
     fn insert_or_pin(&mut self, mut slot: ExpertSlot) {
-        if self.pin_candidates.remove(&slot.eid) {
+        if self.capacity < self.n_experts && self.pin_candidates.remove(&slot.eid) {
             slot.used = 0;
             mlock_best_effort(&slot);
             self.pinned.push(slot);
@@ -851,9 +884,122 @@ impl ExpertCache {
 }
 
 /// Used as `begin_loading`'s non-Linux (or ring-unavailable) synchronous path, and as
-/// `finish_loading`'s fallback when `uring_load::complete_batch` reports an I/O error.
+/// `finish_loading`'s fallback when `uring_load::complete_batch` reports an I/O error. This is the
+/// ONLY load path K3's MXFP4 experts ever take (their naming never gets an io_uring ring — see
+/// `ExpertCache::new`), so it is the whole warmup cost on the target box.
+///
+/// Parallelised over misses with rayon (Phase 4a, `K3_OPTIMIZE_BRIEF.md`): `Shards` reads are
+/// `&self` `pread` (thread-safe, never mmap — `safetensors.rs`), and an MXFP4 `load_expert` from
+/// warm page cache is nearly pure memcpy, so a single-threaded loop left the machine's 384 cores
+/// idle while streaming 16.73 MiB/expert one at a time. rayon's *ordered* `collect` into
+/// `Result<Vec<_>>` preserves input (miss) order, so cache insertion order and pin promotion are
+/// byte-for-byte unchanged and results stay deterministic; a load error short-circuits the collect
+/// exactly as `iter().collect()` did. Side benefit: distributes NUMA first-touch of the expert
+/// buffers across the loading threads instead of concentrating it on one.
 fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64, naming: ExpertNaming) -> Result<Vec<ExpertSlot>, ModelError> {
-    misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used, naming)).collect()
+    if let Some(pools) = crate::numa::NodePools::get() {
+        return numa_homed_load(pools, shards, cfg, layer, misses, bits, used, naming);
+    }
+    misses.par_iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used, naming)).collect()
+}
+
+/// Phase N3b (`NUMA_AMX_BRIEF.md`): with `--numa` active, each missing expert is loaded INSIDE
+/// its home node's pinned pool, so the buffer allocation and the `pread` fill — the first touch
+/// of every page — happen on a CPU of the node the expert will later be computed on
+/// (`numa::home_node` is also what `kimi_k3::moe`'s dispatch consults; placement and compute
+/// agree by construction). Zero `mbind` calls: first touch IS the placement mechanism.
+///
+/// The returned Vec is in the exact input (miss) order, same as the `par_iter` collect above, so
+/// cache insertion order, pin promotion, and determinism are unchanged — only WHERE each load
+/// ran differs. Runs during preload and for any mid-decode miss alike. Applies to every family
+/// that takes this path (for GLM/Kimi-Linear the io_uring ring normally bypasses it; K3's MXFP4
+/// always lands here).
+#[allow(clippy::too_many_arguments)]
+fn numa_homed_load(
+    pools: &crate::numa::NodePools,
+    shards: &Shards,
+    cfg: &Cfg,
+    layer: usize,
+    misses: &[usize],
+    bits: u8,
+    used: u64,
+    naming: ExpertNaming,
+) -> Result<Vec<ExpertSlot>, ModelError> {
+    let n_experts = cfg.n_experts as usize;
+    let mut by_node: Vec<Vec<usize>> = vec![Vec::new(); pools.n()];
+    for (k, &eid) in misses.iter().enumerate() {
+        by_node[crate::numa::home_node(layer, n_experts, eid, pools.n())].push(k);
+    }
+    let mut results: Vec<Option<Result<ExpertSlot, ModelError>>> = (0..misses.len()).map(|_| None).collect();
+    {
+        // Each miss index is owned by exactly one node's group, so the mutexes are uncontended —
+        // they exist to hand `&mut` result slots across the `run_all` closure's `Fn` boundary in
+        // safe Rust, not to serialize anything.
+        let slots: Vec<std::sync::Mutex<&mut Option<Result<ExpertSlot, ModelError>>>> = results.iter_mut().map(std::sync::Mutex::new).collect();
+        pools.run_all(|i| {
+            // Parallel WITHIN the node's pinned pool: warm-page-cache MXFP4 loads are memcpy-bound,
+            // and the copying threads are exactly where the pages should land.
+            by_node[i].par_iter().for_each(|&k| {
+                let loaded = load_expert(shards, cfg, layer, misses[k], bits, used, naming);
+                **slots[k].lock().unwrap() = Some(loaded);
+            });
+        });
+    }
+    results.into_iter().map(|r| r.expect("every miss index was assigned to exactly one node group")).collect()
+}
+
+/// Phase 4b preload (`K3_OPTIMIZE_BRIEF.md`): fills every MoE layer's cache up front so token 1
+/// runs at steady-state speed instead of paying hundreds of slow-warmup tokens. Loads are chunked
+/// per layer and parallel within a chunk (4a's `sequential_fallback`). `caches` is the per-layer
+/// `Vec<Option<ExpertCache>>` (None = a dense layer); `cfg` is the *expert-width* config (K3's
+/// latent width), same one the family's dispatch passes to `ensure_loaded`. Generic across all
+/// three families — the caller supplies the right `cfg`/`ebits`/`n_experts`.
+///
+/// Semantics at `capacity < n_experts` (D2): fill exactly to capacity — in usage-histogram order
+/// when a `.rabbit_usage` history was seeded (`warm_start`), else expert-id order — and say which
+/// in the log. At `capacity >= n_experts` every expert is loaded (full residency; the 1.32 TiB
+/// target-box case) and order is irrelevant.
+pub(crate) fn preload_layers(caches: &mut [Option<ExpertCache>], shards: &Shards, cfg: &Cfg, ebits: u8, n_experts: usize) -> Result<(), ModelError> {
+    let total_moe = caches.iter().filter(|c| c.is_some()).count();
+    let mut done = 0;
+    for (layer, cache_opt) in caches.iter_mut().enumerate() {
+        let Some(cache) = cache_opt else { continue };
+        let cap = cache.capacity().max(1);
+        let (eids, order) = preload_order(cache, n_experts, cap);
+        for chunk in eids.chunks(cap) {
+            cache.ensure_loaded(shards, cfg, layer, chunk, ebits)?;
+        }
+        done += 1;
+        eprintln!("  preload: MoE layer {layer} — {} experts resident ({order}) [{done}/{total_moe} layers]", eids.len());
+    }
+    Ok(())
+}
+
+/// The id list `preload_layers` loads for one layer, plus a human label for the log. See
+/// `preload_layers`' doc for the D2 order policy.
+fn preload_order(cache: &ExpertCache, n_experts: usize, cap: usize) -> (Vec<usize>, &'static str) {
+    if cap >= n_experts {
+        return ((0..n_experts).collect(), "full residency");
+    }
+    let mut usage: Vec<(usize, u64)> = cache.usage_counts().filter(|&(_, c)| c > 0).collect();
+    if usage.is_empty() {
+        return ((0..cap).collect(), "expert-id order — no usage history");
+    }
+    usage.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut eids: Vec<usize> = usage.into_iter().map(|(e, _)| e).take(cap).collect();
+    if eids.len() < cap {
+        // Usage history covered fewer than `cap` experts — top up in id order so the cache fills.
+        let have: std::collections::HashSet<usize> = eids.iter().copied().collect();
+        for e in 0..n_experts {
+            if eids.len() >= cap {
+                break;
+            }
+            if !have.contains(&e) {
+                eids.push(e);
+            }
+        }
+    }
+    (eids, "usage-histogram order")
 }
 
 fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, used: u64, naming: ExpertNaming) -> Result<ExpertSlot, ModelError> {
@@ -899,12 +1045,18 @@ fn qt_load_mxfp4(shards: &Shards, base_name: &str, rows: usize, cols: usize) -> 
     Ok(QT { rows, cols, bits: 4, kind: QTKind::MxFp4 { data, block_scale } })
 }
 
+/// Set the first time an `mlock` fails this process, so the best-effort warning prints exactly once
+/// instead of once per pinned expert buffer (which, with a low `RLIMIT_MEMLOCK`, is hundreds of
+/// identical lines). See `mlock_best_effort`.
+static MLOCK_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Best-effort `mlock` on a pinned expert's backing buffers, so the OS can't swap out memory
 /// pinning exists specifically to keep resident — same "unsafe libc call, best-effort, never a
 /// hard error" precedent already established for `posix_fadvise` in `safetensors.rs`. A failure
-/// (commonly `RLIMIT_MEMLOCK` too low for an unprivileged process) is logged once and otherwise
-/// ignored: losing the OS-level guarantee just means a pinned expert *could* get swapped under
-/// real memory pressure, same risk profile as not pinning it at all — not a correctness issue.
+/// (commonly `RLIMIT_MEMLOCK` too low for an unprivileged process) is logged ONCE (see
+/// `MLOCK_WARNED`) and otherwise ignored: losing the OS-level guarantee just means a pinned expert
+/// *could* get swapped under real memory pressure, same risk profile as not pinning it at all —
+/// not a correctness issue.
 fn mlock_best_effort(slot: &ExpertSlot) {
     let gate_up_qts: Vec<&QT> = match &slot.gate_up {
         GateUp::Separate { gate, up } => vec![gate, up],
@@ -925,7 +1077,21 @@ fn mlock_best_effort(slot: &ExpertSlot) {
         };
         for (ptr, len) in bufs {
             if len > 0 && unsafe { libc::mlock(ptr as *const libc::c_void, len) } != 0 {
-                eprintln!("usage cache: mlock failed for a pinned expert (best-effort, continuing): {}", std::io::Error::last_os_error());
+                // Log only the FIRST failure this process. With RLIMIT_MEMLOCK too low every pinned
+                // expert's every buffer fails identically, so the old per-buffer `eprintln!` flooded
+                // stderr with hundreds of copies of the same line (the doc always said "logged
+                // once" -- this makes the code match it). Still best-effort: pinning is silently
+                // skipped, not a hard error.
+                if !MLOCK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "usage cache: mlock failed for a pinned expert ({}) -- expert pinning is \
+                         disabled for this run (best-effort, harmless: it only guards against the OS \
+                         swapping a pinned expert out). Raise RLIMIT_MEMLOCK (`ulimit -l unlimited`) \
+                         or pass `--no-usage-cache` to skip pinning entirely. Further mlock failures \
+                         this run are suppressed.",
+                        std::io::Error::last_os_error()
+                    );
+                }
             }
         }
     }
@@ -1202,7 +1368,7 @@ mod tests {
         let fixture = build_kimi_experts_fixture("rabbit_test_ecache_kimi_naming", 2, 4, 6);
         let shards = Shards::open(&fixture.0).unwrap();
         let cfg = tiny_cfg(2, 4, 6);
-        let mut cache = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
+        let mut cache = ExpertCache::for_family(8, usize::MAX, ExpertNaming::KimiLinear);
 
         let slot = cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
         assert_eq!(slot.gate().rows, 4);
@@ -1224,13 +1390,13 @@ mod tests {
         let shards = Shards::open(&fixture.0).unwrap();
         let cfg = tiny_cfg(3, 4, 6);
 
-        let mut cache_seq = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
+        let mut cache_seq = ExpertCache::for_family(8, usize::MAX, ExpertNaming::KimiLinear);
         let eids = [0usize, 1, 2];
         for &eid in &eids {
             cache_seq.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
         }
 
-        let mut cache_batch = ExpertCache::for_family(8, ExpertNaming::KimiLinear);
+        let mut cache_batch = ExpertCache::for_family(8, usize::MAX, ExpertNaming::KimiLinear);
         cache_batch.ensure_loaded(&shards, &cfg, 0, &eids, 32).unwrap();
 
         for &eid in &eids {
@@ -1254,7 +1420,7 @@ mod tests {
         let fixture = build_k3_mxfp4_experts_fixture("rabbit_test_ecache_k3_mxfp4", moe_inter, hidden);
         let shards = Shards::open(&fixture.0).unwrap();
         let cfg = tiny_cfg(1, moe_inter as i32, hidden as i32);
-        let mut cache = ExpertCache::for_family(8, ExpertNaming::KimiK3Mxfp4);
+        let mut cache = ExpertCache::for_family(8, usize::MAX, ExpertNaming::KimiK3Mxfp4);
 
         let slot = cache.get_or_load(&shards, &cfg, 0, 0, 4).unwrap();
         assert_eq!(slot.gate().rows, moe_inter);
@@ -1326,7 +1492,7 @@ mod tests {
             sep_cache.get_or_load(&sep_shards, &cfg, 0, eid, 32).unwrap();
         }
 
-        let mut fused_cache = ExpertCache::for_family(8, ExpertNaming::Glm52FusedGateUp);
+        let mut fused_cache = ExpertCache::for_family(8, usize::MAX, ExpertNaming::Glm52FusedGateUp);
         fused_cache.ensure_loaded(&fused_shards, &cfg, 0, &eids, 32).unwrap();
 
         for &eid in &eids {
@@ -1359,7 +1525,7 @@ mod tests {
         let cfg = tiny_cfg(n_experts as i32, moe_inter as i32, hidden as i32);
 
         let mut sep_cache = ExpertCache::new(8);
-        let mut fused_cache = ExpertCache::for_family(8, ExpertNaming::Glm52FusedGateUp);
+        let mut fused_cache = ExpertCache::for_family(8, usize::MAX, ExpertNaming::Glm52FusedGateUp);
 
         for eid in 0..n_experts {
             let sep_slot = sep_cache.get_or_load(&sep_shards, &cfg, 0, eid, 32).unwrap();
@@ -1675,6 +1841,27 @@ mod tests {
         cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
         assert_eq!(cache.hits, 2);
         assert_eq!(cache.misses, 1);
+    }
+
+    #[test]
+    fn full_residency_cache_never_pins_even_with_marked_candidates() {
+        // capacity == n_experts: the cache holds every expert and can never evict, so pinning is
+        // pointless. A marked candidate must load into the ordinary LRU `slots`, NOT the pinned
+        // tier -- so no `mlock` is ever attempted (the `--expert-cache 896` / low-RLIMIT_MEMLOCK
+        // mlock-spam fix). `for_family` with the real `n_experts` is what production uses; the
+        // `new`-based pin tests above stay unaffected because `new` leaves `n_experts` unbounded.
+        let n_experts = 3;
+        let fixture = build_experts_fixture("rabbit_test_ecache_full_residency_no_pin", n_experts, 4, 6);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(n_experts as i32, 4, 6);
+        let mut cache = ExpertCache::for_family(n_experts, n_experts, ExpertNaming::Glm52);
+
+        cache.mark_pin_candidates(std::iter::once(1usize));
+        cache.get_or_load(&shards, &cfg, 0, 1, 32).unwrap();
+        assert!(!cache.is_pinned(1), "at full residency a candidate must not be pinned");
+        assert_eq!(cache.pinned_len(), 0, "nothing should ever land in the pinned/mlocked tier");
+        assert_eq!(cache.len(), 1, "the expert lives in the ordinary LRU slots instead");
+        assert!(cache.get(1).is_some());
     }
 
     #[test]

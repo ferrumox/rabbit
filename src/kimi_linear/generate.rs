@@ -136,7 +136,7 @@ impl ExpertCaches {
         let v = model
             .layers
             .iter()
-            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, ExpertNaming::KimiLinear)) } else { None })
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, model.cfg.n_experts as usize, ExpertNaming::KimiLinear)) } else { None })
             .collect();
         ExpertCaches(v)
     }
@@ -151,6 +151,22 @@ impl ExpertCaches {
     /// `crate::generate::ExpertCaches::io_wait_nanos_total`'s doc.
     pub fn io_wait_nanos_total(&self) -> u64 {
         self.0.iter().flatten().map(|c| c.io_wait_nanos).sum()
+    }
+
+    /// Whether any layer's cache loads through an `io_uring` ring. `false` (every MXFP4/K3 run,
+    /// whose naming never gets a ring) means `io_wait_nanos_total` is structurally zero, so the
+    /// CLI must not present it as "actual disk wait" (Phase 4c) — see `ExpertCache::has_ring`.
+    pub fn any_has_ring(&self) -> bool {
+        self.0.iter().flatten().any(|c| c.has_ring())
+    }
+
+    /// Phase 4b: preload every MoE layer's routed experts up front (see
+    /// `expert_cache::preload_layers`). `to_glm_cfg` supplies the expert shapes, same as the
+    /// dispatch path's `moe::moe` call.
+    pub fn preload(&mut self, model: &Model, shards: &Shards) -> Result<(), ModelError> {
+        let cfg = crate::kimi_linear::model::to_glm_cfg(&model.cfg);
+        let n_experts = cfg.n_experts as usize;
+        Ok(crate::expert_cache::preload_layers(&mut self.0, shards, &cfg, model.ebits, n_experts)?)
     }
 
     /// Seeds usage counters from `<model_dir>/.rabbit_usage` and marks pin candidates once

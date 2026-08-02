@@ -55,7 +55,11 @@ impl Activation {
     /// The single-element gating formula — `apply_single_expert`'s `Fused` gate_up branch reads
     /// gate/up from two positions within the SAME contiguous row buffer (not two separate
     /// slices), so it calls this directly per-element rather than through `apply` below.
-    fn combine(self, g: f32, u: f32) -> f32 {
+    ///
+    /// `pub(crate)` for the same reason as `unique_experts`/`apply_single_expert`/`expert_rows`
+    /// below: `kimi_k3::moe`'s row-blocked dispatch (Phase 5 v2) applies the activation to its own
+    /// transposed row blocks, and must do it with THIS formula rather than a second copy of it.
+    pub(crate) fn combine(self, g: f32, u: f32) -> f32 {
         match self {
             Activation::Silu => siluf(g) * u,
             Activation::Situ { beta, linear_beta } => {
@@ -71,8 +75,9 @@ impl Activation {
 
     /// `gate[i] = combine(gate[i], up[i])`, applied in place across two separate contiguous
     /// buffers — matches every existing call site's `g[k] = siluf(g[k]) * u[k]` convention
-    /// (result written into the gate buffer).
-    fn apply(self, gate: &mut [f32], up: &[f32]) {
+    /// (result written into the gate buffer). Element-wise with no cross-element dependency,
+    /// which is what lets `kimi_k3::moe` apply it to an arbitrary row block (see `combine`).
+    pub(crate) fn apply(self, gate: &mut [f32], up: &[f32]) {
         for (g, &u) in gate.iter_mut().zip(up) {
             *g = self.combine(*g, u);
         }
@@ -456,15 +461,25 @@ pub fn moe(
 /// calls this directly against its own down-projected `x`/narrower `d`/latent-width `out` buffer,
 /// getting the exact same tested `Separate`-vs-`Fused` gate_up matmul logic for free instead of
 /// duplicating it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize, i: usize, activation: Activation, out: &mut [f32]) {
-    let eid = slot.eid;
-    let rows: Vec<(usize, f32)> = routing
+/// Every `(sequence position, routing weight)` pair routed to `eid`, in ascending position order
+/// — the row list `apply_single_expert` gathers its activations by and scatters its results back
+/// through. At most one entry per position (a token picks any expert at most once).
+///
+/// `pub(crate)` for the same reason as `apply_single_expert` itself: `kimi_k3::moe`'s row-blocked
+/// dispatch (Phase 5 v2) needs the identical row list to reproduce that function's scatter order
+/// bit-for-bit, and re-deriving it there would be a second copy free to drift.
+pub(crate) fn expert_rows(routing: &Routing, eid: usize) -> Vec<(usize, f32)> {
+    routing
         .choices
         .iter()
         .enumerate()
         .filter_map(|(si, picks)| picks.iter().find(|&&(e, _)| e == eid).map(|&(_, wt)| (si, wt)))
-        .collect();
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_single_expert(slot: &ExpertSlot, routing: &Routing, x: &[f32], d: usize, i: usize, activation: Activation, out: &mut [f32]) {
+    let rows = expert_rows(routing, slot.eid);
     if rows.is_empty() {
         return;
     }

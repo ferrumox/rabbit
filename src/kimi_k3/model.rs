@@ -35,6 +35,7 @@ use crate::glm52::moe::{Activation, RouteConfig};
 use crate::kimi_k3::attn_res::AttnResWeights;
 use crate::kimi_k3::config::{Cfg, ConfigError};
 use crate::kimi_k3::moe::LatentMoeWeights;
+use crate::kernels::DenseQT;
 use crate::quant::{PackedFormatError, QT};
 use crate::safetensors::{SafetensorsError, Shards};
 use std::fmt;
@@ -51,9 +52,14 @@ pub enum KdaOutputGate {
 /// `output_gate` (see `KdaOutputGate`) replacing that struct's always-low-rank
 /// `g_a_proj`/`g_b_proj` pair.
 pub struct KdaWeights {
-    pub q_proj: QT,
-    pub k_proj: QT,
-    pub v_proj: QT,
+    /// q/k/v/o are `DenseQT` — the ready mechanism for Phase N4's KDA-projection row-sharding,
+    /// currently always `Plain`: sharding them was built, gated, and reverted on measurement
+    /// (the per-layer cross-domain fan-out cost exceeded the locality win; see
+    /// `Model::distribute_dense` and `PERFORMANCE.md`, N4). The small projections (f/b/gates)
+    /// stay plain `QT` outright: their per-token cost could never repay a fan-out.
+    pub q_proj: DenseQT,
+    pub k_proj: DenseQT,
+    pub v_proj: DenseQT,
     /// `[d_inner, kernel]` row-major — see `kimi_linear::model::KdaWeights::q_conv`'s doc.
     pub q_conv: Vec<f32>,
     pub k_conv: Vec<f32>,
@@ -66,7 +72,7 @@ pub struct KdaWeights {
     pub b_proj: QT,
     pub output_gate: KdaOutputGate,
     pub o_norm: Vec<f32>,
-    pub o_proj: QT,
+    pub o_proj: DenseQT,
 }
 
 /// One MLA layer's weights: `glm52::model::AttnWeights`, reused unchanged (K3's MLA tensor
@@ -119,7 +125,9 @@ pub struct Layer {
 pub struct Model {
     pub cfg: Cfg,
     pub embed: QT,
-    pub lm_head: QT,
+    /// `DenseQT` for the same N4 reason as `KdaWeights`' q/k/v/o — the [163840, 7168] decode
+    /// matvec is the brief's row-sharding poster child.
+    pub lm_head: DenseQT,
     pub final_norm: Vec<f32>,
     pub layers: Vec<Layer>,
     /// The model-level final Attention-Residuals pooling (`KimiLinearModel._apply_output_attn_res`)
@@ -303,7 +311,7 @@ impl Model {
         // that's a genuinely different real top-level module, not a bug in the oracle.
         let io_bits = if dbits >= 8 { 16 } else { dbits };
         let embed = qt_load(&shards, b.group_size as usize, "language_model.model.embed_tokens.weight", b.vocab as usize, d, io_bits)?;
-        let lm_head = qt_load(&shards, b.group_size as usize, "language_model.lm_head.weight", b.vocab as usize, d, io_bits)?;
+        let lm_head = DenseQT::Plain(qt_load(&shards, b.group_size as usize, "language_model.lm_head.weight", b.vocab as usize, d, io_bits)?);
         let final_norm = ld(&shards, "language_model.model.norm.weight")?;
 
         let output_attn_res = if cfg.attn_res_block > 0 {
@@ -316,6 +324,11 @@ impl Model {
         };
 
         let mut layers = Vec::with_capacity(b.n_layers as usize);
+        let t_layers = std::time::Instant::now();
+        // A rewriting `\r` line is nice in a real terminal but writes NO newlines, so a redirected
+        // log / background monitor sees nothing until the load finishes. Emit newline-delimited
+        // progress when stderr isn't a TTY so any log consumer sees each layer land.
+        let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
         for i in 0..b.n_layers as usize {
             let p = |s: &str| format!("language_model.model.layers.{i}.{s}");
             let ap = |s: &str| format!("language_model.model.layers.{i}.self_attn.{s}");
@@ -333,9 +346,9 @@ impl Model {
                     }
                 };
                 Attn::Kda(Box::new(KdaWeights {
-                    q_proj: qt_load(&shards, b.group_size as usize, &ap("q_proj.weight"), d_inner, d, dbits)?,
-                    k_proj: qt_load(&shards, b.group_size as usize, &ap("k_proj.weight"), d_inner, d, dbits)?,
-                    v_proj: qt_load(&shards, b.group_size as usize, &ap("v_proj.weight"), d_inner, d, dbits)?,
+                    q_proj: DenseQT::Plain(qt_load(&shards, b.group_size as usize, &ap("q_proj.weight"), d_inner, d, dbits)?),
+                    k_proj: DenseQT::Plain(qt_load(&shards, b.group_size as usize, &ap("k_proj.weight"), d_inner, d, dbits)?),
+                    v_proj: DenseQT::Plain(qt_load(&shards, b.group_size as usize, &ap("v_proj.weight"), d_inner, d, dbits)?),
                     q_conv: ld(&shards, &ap("q_conv1d.weight"))?,
                     k_conv: ld(&shards, &ap("k_conv1d.weight"))?,
                     v_conv: ld(&shards, &ap("v_conv1d.weight"))?,
@@ -346,7 +359,7 @@ impl Model {
                     b_proj: qt_load(&shards, b.group_size as usize, &ap("b_proj.weight"), kda_n_heads, d, dbits)?,
                     output_gate,
                     o_norm: ld(&shards, &ap("o_norm.weight"))?,
-                    o_proj: qt_load(&shards, b.group_size as usize, &ap("o_proj.weight"), d, d_inner, dbits)?,
+                    o_proj: DenseQT::Plain(qt_load(&shards, b.group_size as usize, &ap("o_proj.weight"), d, d_inner, dbits)?),
                 }))
             } else {
                 let attn = if q_lora > 0 {
@@ -418,9 +431,48 @@ impl Model {
             };
 
             layers.push(Layer { in_ln, post_ln, attn, ffn, attn_res });
+            // Per-layer progress -- the dense load is otherwise silent for minutes on the real
+            // checkpoint (93 layers, ~13 min), indistinguishable from a hang. Elapsed-so-far makes
+            // a slow load visible, not just a count.
+            if stderr_tty {
+                eprint!("\r  loaded layer {}/{} ({:.0}s)", i + 1, b.n_layers, t_layers.elapsed().as_secs_f32());
+                let _ = std::io::Write::flush(&mut std::io::stderr()); // `\r` doesn't auto-flush
+            } else {
+                eprintln!("  loaded layer {}/{} ({:.0}s)", i + 1, b.n_layers, t_layers.elapsed().as_secs_f32());
+            }
+        }
+        if stderr_tty {
+            eprintln!(); // terminate the rewriting line before chat.rs's "model loaded in ..." prints
         }
 
-        Ok(Model { cfg, embed, lm_head, final_norm, layers, output_attn_res, ebits, route_cfg: RouteConfig::default() })
+        let mut model = Model { cfg, embed, lm_head, final_norm, layers, output_attn_res, ebits, route_cfg: RouteConfig::default() };
+        // Phase N4 (`NUMA_AMX_BRIEF.md`): with `--numa` pools active, row-shard the decode-hot
+        // dense weights across the domains — see `distribute_dense`'s doc for what ships sharded
+        // and what was measured and reverted. Pure storage/placement at load time; the math per
+        // row is unchanged (see `QTSharded`).
+        if let Some(pools) = crate::numa::NodePools::get() {
+            let t = std::time::Instant::now();
+            model.distribute_dense(pools);
+            eprintln!("  --numa: sharded lm_head across {} domains in {:.1}s", pools.n(), t.elapsed().as_secs_f32());
+        }
+        Ok(model)
+    }
+
+    /// Phase N4 (`NUMA_AMX_BRIEF.md`): row-shards the decode-hot dense weights across the NUMA
+    /// domains. Storage/placement only: each row's math is byte-identical through
+    /// `matmul_qt_rows` (see `QTSharded`'s doc for the bit-identity argument).
+    ///
+    /// **What ships sharded: lm_head only.** The KDA q/k/v/o projections — N5a's 72%-of-attention
+    /// target — were built, gated, and REVERTED to plain on the measurement: at 2 cross-domain
+    /// fan-outs per KDA layer (138/token) the fan-out wake/distribution cost exceeded the
+    /// locality win on synth AND real (real kda_proj 0.346 → 0.443 s/token; `PERFORMANCE.md`,
+    /// N4). The `DenseQT` fields, the batched q/k/v fan-out in `kda_step`, and this pass are the
+    /// ready mechanism for re-enabling them the moment the "pools stay hot" follow-up removes
+    /// that per-fan-out cost — flip the four `shard_in_place` calls back on and re-gate. The
+    /// latent down/up and small dense weights stay plain for the same arithmetic (their whole
+    /// per-token cost is smaller than the fan-outs would be).
+    pub fn distribute_dense(&mut self, pools: &crate::numa::NodePools) {
+        self.lm_head.shard_in_place(pools);
     }
 
     pub fn embed_row(&self, tok: usize) -> Vec<f32> {
