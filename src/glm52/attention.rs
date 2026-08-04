@@ -30,6 +30,41 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+thread_local! {
+    // `qabs`/`sc`/`clat` below used to be `vec![0f32; len]`'d fresh on every call — for the
+    // absorbed-decode path that's once per (head, MLA layer, token): K3's real 96 heads × 24 MLA
+    // layers is 2,304 allocate-and-zero cycles per token, three times over (`__memset_avx512_
+    // unaligned_erms` showed up at ~2.5% of total cycles in a real `perf record` of the real
+    // checkpoint — see `PERFORMANCE_KIMI_K3.md`). Same fix as `kernels.rs`'s `YT_SCRATCH`: one
+    // thread-local slot per buffer, reused across calls on the SAME thread instead of
+    // freshly allocated — sound for the same reason that one is (every call happens
+    // synchronously on the calling thread; rayon's worker threads here never call back into
+    // this function reentrantly). Three separate statics, not one shared slot, because `qabs`
+    // stays alive across the score loop while `sc` is being filled (overlapping lifetimes) —
+    // reusing one `RefCell` for both would double-borrow-panic.
+    static QABS_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SC_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CLAT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_scratch<R>(cell: &'static std::thread::LocalKey<std::cell::RefCell<Vec<f32>>>, len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    cell.with(|c| {
+        let mut buf = c.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0.0);
+        }
+        // Unlike `kernels.rs`'s `YT_SCRATCH` (whose consumer always fully OVERWRITES every
+        // element before reading it back, so leftover content from a smaller previous call
+        // never matters), `qabs`/`clat` are ACCUMULATED into (`+=`) by `qt_addrow`/`axpy_f32_avx2`
+        // — they must start at exact zero every time. `Vec::resize` only zero-fills the NEWLY
+        // added tail when growing, leaving the previously-used prefix at whatever a PRIOR call
+        // (different `len`, real computed values, not zeros) left behind — so this always
+        // explicitly zeros the full requested range, not just the grown portion.
+        buf[..len].fill(0.0);
+        f(&mut buf[..len])
+    })
+}
+
 pub fn rmsnorm(v: &mut [f32], w: &[f32], eps: f32) {
     let n = v.len() as f64;
     let ms: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
@@ -483,49 +518,52 @@ pub fn attention(
                 let qr = &qp[qk_nope..qk_nope + qk_rope];
                 let rbase = hh * (qk_nope + vh);
 
-                let mut qabs = vec![0f32; kv_lora];
-                for (dd, &qpd) in qp.iter().enumerate().take(qk_nope) {
-                    qt_addrow(&w.kv_b, rbase + dd, qpd, &mut qabs);
-                }
-
-                // Both reductions below are ported from colibrì's PR #442 (commit `d469c54`,
-                // upstream v1.1.0): the score dot and the value-mix axpy are the two hottest
-                // scalar f32 loops on this path (each runs `nt` times per (s,h), scaling with
-                // context length, unlike `qt_addrow`/`qt_matvec_rows` above which are fixed
-                // O(kv_lora) regardless of `nt`). See `dot_f32_avx2`/`axpy_f32_avx2`'s own docs
-                // in `kernels.rs` for the bit-identity discussion (score reassociates, softmax
-                // downstream absorbs it; value-mix is bit-identical).
-                let mut sc = vec![0f32; nt];
-                for (jj, &t) in positions.iter().enumerate() {
-                    let lt = kv.l_row(t);
-                    let kr = kv.r_row(t);
-                    #[cfg(target_arch = "x86_64")]
-                    let mut a: f32 = if is_x86_feature_detected!("avx2") {
-                        unsafe { dot_f32_avx2(&qabs, lt, kv_lora) }
-                    } else {
-                        qabs.iter().zip(lt).map(|(&x, &y)| x * y).sum()
-                    };
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let mut a: f32 = qabs.iter().zip(lt).map(|(&x, &y)| x * y).sum();
-                    a += qr.iter().zip(kr).map(|(&x, &y)| x * y).sum::<f32>();
-                    sc[jj] = a * cfg.attn_scale;
-                }
-                softmax(&mut sc);
-
-                let mut clat = vec![0f32; kv_lora];
-                for (jj, &t) in positions.iter().enumerate() {
-                    let lt = kv.l_row(t);
-                    let a = sc[jj];
-                    #[cfg(target_arch = "x86_64")]
-                    if is_x86_feature_detected!("avx2") {
-                        unsafe { axpy_f32_avx2(a, lt, &mut clat, kv_lora) };
-                        continue;
+                with_scratch(&QABS_SCRATCH, kv_lora, |qabs| {
+                    for (dd, &qpd) in qp.iter().enumerate().take(qk_nope) {
+                        qt_addrow(&w.kv_b, rbase + dd, qpd, qabs);
                     }
-                    for i in 0..kv_lora {
-                        clat[i] += a * lt[i];
-                    }
-                }
-                qt_matvec_rows(&w.kv_b, rbase + qk_nope, vh, &clat, ctx_slot);
+
+                    // Both reductions below are ported from colibrì's PR #442 (commit `d469c54`,
+                    // upstream v1.1.0): the score dot and the value-mix axpy are the two hottest
+                    // scalar f32 loops on this path (each runs `nt` times per (s,h), scaling with
+                    // context length, unlike `qt_addrow`/`qt_matvec_rows` above which are fixed
+                    // O(kv_lora) regardless of `nt`). See `dot_f32_avx2`/`axpy_f32_avx2`'s own docs
+                    // in `kernels.rs` for the bit-identity discussion (score reassociates, softmax
+                    // downstream absorbs it; value-mix is bit-identical).
+                    with_scratch(&SC_SCRATCH, nt, |sc| {
+                        for (jj, &t) in positions.iter().enumerate() {
+                            let lt = kv.l_row(t);
+                            let kr = kv.r_row(t);
+                            #[cfg(target_arch = "x86_64")]
+                            let mut a: f32 = if is_x86_feature_detected!("avx2") {
+                                unsafe { dot_f32_avx2(qabs, lt, kv_lora) }
+                            } else {
+                                qabs.iter().zip(lt).map(|(&x, &y)| x * y).sum()
+                            };
+                            #[cfg(not(target_arch = "x86_64"))]
+                            let mut a: f32 = qabs.iter().zip(lt).map(|(&x, &y)| x * y).sum();
+                            a += qr.iter().zip(kr).map(|(&x, &y)| x * y).sum::<f32>();
+                            sc[jj] = a * cfg.attn_scale;
+                        }
+                        softmax(sc);
+
+                        with_scratch(&CLAT_SCRATCH, kv_lora, |clat| {
+                            for (jj, &t) in positions.iter().enumerate() {
+                                let lt = kv.l_row(t);
+                                let a = sc[jj];
+                                #[cfg(target_arch = "x86_64")]
+                                if is_x86_feature_detected!("avx2") {
+                                    unsafe { axpy_f32_avx2(a, lt, clat, kv_lora) };
+                                    continue;
+                                }
+                                for i in 0..kv_lora {
+                                    clat[i] += a * lt[i];
+                                }
+                            }
+                            qt_matvec_rows(&w.kv_b, rbase + qk_nope, vh, clat, ctx_slot);
+                        });
+                    });
+                });
             });
         }
     } else {

@@ -70,6 +70,24 @@ Run-to-run noise on the very first generated token specifically was large enough
 here, unlike an earlier draft of this page — the steady-state averages above are the more reliable
 comparison.
 
+**Continued below with the REAL methodology, not the fixed-`--expert-cache 64` one above.**
+Starting at v0.27.0, the safe default capacity became RAM-aware (auto-clamped to 7 on this
+machine, not a fixed number chosen to make comparisons easy) — every row below uses that real
+default, `--expert-cache 7`, no explicit override, which is why this isn't one continuous table
+with the v0.23.0-v0.26.0 rows above:
+
+| Version | Model load | Prefill (7 tokens) | Decode (40 tokens) | Speed (tok/sec) | Change | What changed |
+|---|---|---|---|---|---|---|
+| v0.27.0, RAM-aware `--expert-cache` (auto=7) | 102.3s | ~44s | 283.2s (~7.1s/token) [`--no-usage-cache`] | ~0.141 | vs. capacity 4 (v0.26.0's real-default row): **~27% faster decode**, not just safer | The auto-clamp budget now scales with real `/proc/meminfo` available RAM instead of one machine's incident-driven guess |
+| v0.27.1, decoupled `io_batch_size` | 102.3s | ~44s | 285.5s [`--no-usage-cache`] | ~0.140 | ~0% (statistically the same) | New opt-in knob, kept for different hardware despite no win here — see its own section above |
+| (usage cache ON — the real default; no code change) | — | — | **270.6s** | ~0.148 | **~4.5% faster** | Turning on the existing `usage_cache` pin mechanism (earlier numbers used `--no-usage-cache` to dodge an unrelated `mlock` bug, since fixed) |
+| v0.28.0, `e8m0_decode` bit-trick (replaced a slow `powi()` call) | 102.3s | ~37s | **240.2s** (~6.0s/token) | **~0.167** | **~11.1% faster** than the usage-cache-on baseline above | Real `perf` profiling found a generic power-function call eating ~29% of cycles in MXFP4's block-scale decode — see "Where does compute actually go?" below |
+| v0.28.1, reused attention scratch buffers | 104.1s | ~37s | 237.3s (~5.9s/token) | ~0.169 | ~1.2% faster (small, real, close to this session's run-to-run noise floor) | Replaced per-head `vec![0f32; ...]` allocations in the absorbed-decode path with reused thread-local buffers — `perf` found `__memset_avx512_unaligned_erms` at ~2.5% of cycles |
+
+**Updated overall, v0.23.0 to v0.28.1**: ~610.0+412.8+40×60s≈3423s (~57 min) → ~104.1+36.8+200.5s≈341s
+(~5.7 min), **about 10× faster end to end** (the decode term is `237.3s total prefill+decode` minus
+the `36.8s` prefill, i.e. actual decode-only time, divided across 40 tokens).
+
 **Isolated kernel benchmark** (no disk I/O involved — just the math itself, a stand-in matrix size
 of 4096×4096, same style as GLM-5.2's own kernel-only benchmark table):
 
