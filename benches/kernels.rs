@@ -12,6 +12,7 @@
 //! benchmark toward an unrealistically huge single dot product).
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use rayon::prelude::*;
 use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar, matmul_mxfp4_scalar};
 #[cfg(target_arch = "x86_64")]
 use rabbit::kernels::{
@@ -238,6 +239,68 @@ fn bench_matmul_mxfp4(c: &mut Criterion) {
     group.finish();
 }
 
+/// One real `qt_matvec_rows` call's worth of work (128 sequential `dot_i4_f32_avx512` calls,
+/// `vh=128` at K3's real dims) against a REAL-scale `kv_b`-shaped matrix (`h*(qk_nope+vh)=24576`
+/// rows × `kv_lora.div_ceil(2)=256` bytes/row ≈ 6.29MiB — comparable to this machine's L3, unlike
+/// the plain `qt_matvec_rows_i4` bench above which reuses one 256-byte row 100M+ times). A real
+/// `perf record` on the real checkpoint found `dot_i4_f32_avx512` responsible for ~27% of total
+/// cycles despite doing only ~0.3% of `matmul_mxfp4`'s total arithmetic — the warm single-row
+/// bench above (22.85ns/call) predicts ~6.7ms/token total, wildly below what that cycle share
+/// implies. Hypothesis: `kv_b` would fit comfortably in L3 on its own, but the MASSIVE MoE expert
+/// traffic interleaved with it (many MB per layer, every layer) keeps evicting it before its next
+/// reuse — the same cold-cache story as `matmul_mxfp4_k3_dims_cold`, but for a smaller structure
+/// that would otherwise be cache-friendly. `warm` reuses the same 128-row window every iteration
+/// (like the plain bench, just batched to 128 calls); `cold` evicts the whole matrix (a 64MiB
+/// scratch read) before every timed batch, rotating which 128-row window is read to avoid the
+/// eviction pass itself re-warming the same rows.
+fn bench_qt_matvec_rows_i4_real_scale(c: &mut Criterion) {
+    const ROWS: usize = 24576;
+    const ROW_BYTES: usize = KV_LORA.div_ceil(2);
+    const VH: usize = 128;
+    let kv_b = random_bytes(ROWS * ROW_BYTES, 26);
+    let x = random_i8(KV_LORA, 27).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let evict = random_bytes(64 * 1024 * 1024, 28);
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        let mut group = c.benchmark_group("qt_matvec_rows_i4_real_scale");
+        group.sample_size(30);
+
+        group.bench_function("warm", |b| {
+            b.iter(|| {
+                let mut acc = 0f32;
+                for r in 0..VH {
+                    let row = &kv_b[r * ROW_BYTES..(r + 1) * ROW_BYTES];
+                    acc += unsafe { dot_i4_f32_avx512(black_box(row), black_box(&x), KV_LORA) };
+                }
+                black_box(acc)
+            })
+        });
+
+        let mut offset = 0usize;
+        group.bench_function("cold", |b| {
+            b.iter_batched(
+                || {
+                    let sum: u64 = evict.iter().step_by(64).map(|&v| v as u64).sum();
+                    black_box(sum);
+                    offset = (offset + VH) % (ROWS - VH);
+                    offset
+                },
+                |off| {
+                    let mut acc = 0f32;
+                    for r in 0..VH {
+                        let row = &kv_b[(off + r) * ROW_BYTES..(off + r + 1) * ROW_BYTES];
+                        acc += unsafe { dot_i4_f32_avx512(black_box(row), black_box(&x), KV_LORA) };
+                    }
+                    black_box(acc)
+                },
+                BatchSize::PerIteration,
+            )
+        });
+        group.finish();
+    }
+}
+
 /// `matmul_mxfp4` at K3's REAL routed-expert dims (the real checkpoint's `text_config`:
 /// `routed_expert_hidden_size=3584`, `moe_intermediate_size=3072` — every routed expert's
 /// `w1`/`w3` is `[3072,3584]`, `w2` is `[3072,3584]` too once transposed for the down
@@ -396,6 +459,43 @@ fn bench_matmul_mxfp4_k3_dims_prefetched(c: &mut Criterion) {
     }
 }
 
+/// Isolates "just touch these cold bytes" from "touch them AND dequant+FMA them": same eviction
+/// technique and same total byte volume (`data`+`block_scale`, one call's worth) as
+/// `bench_matmul_mxfp4_k3_dims_cold`, but the timed routine only sums bytes (`rayon`
+/// `par_chunks`, same pool) instead of calling the real kernel. If this lands close to the real
+/// kernel's 470.7µs, the cold-read cost itself (not the dequant math) explains almost all of
+/// it — meaning the earlier ~5x gap against the 1GiB raw-bandwidth probe
+/// (`examples/mem_bandwidth_probe.rs`) is apples-to-oranges (many small ~5.85MB bursts don't
+/// reach the same steady-state throughput a single sustained 1GiB sweep does), not a fixable
+/// inefficiency. If this is meaningfully FASTER than 470.7µs, the dequant math itself is adding
+/// real extra cost beyond the unavoidable cold-read floor, which WOULD be worth optimizing.
+fn bench_mxfp4_cold_readonly(c: &mut Criterion) {
+    const KI: usize = 3584;
+    const KO: usize = 3072;
+    let data = random_bytes(KO * KI.div_ceil(2), 24);
+    let bpr = KI.div_ceil(32);
+    let block_scale: Vec<u8> = (0..KO * bpr).map(|k| 120 + (k % 15) as u8).collect();
+    let evict = random_bytes(64 * 1024 * 1024, 25);
+
+    let mut group = c.benchmark_group("mxfp4_cold_readonly");
+    group.sample_size(30);
+    group.bench_function("rayon_sum", |b| {
+        b.iter_batched(
+            || {
+                let sum: u64 = evict.iter().step_by(64).map(|&v| v as u64).sum();
+                black_box(sum);
+            },
+            |_| {
+                let s1: u64 = data.par_chunks(4096).map(|c| c.iter().step_by(64).map(|&v| v as u64).sum::<u64>()).sum();
+                let s2: u64 = block_scale.par_chunks(4096).map(|c| c.iter().step_by(64).map(|&v| v as u64).sum::<u64>()).sum();
+                black_box(s1 + s2)
+            },
+            BatchSize::PerIteration,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dot_i8i8,
@@ -405,8 +505,10 @@ criterion_group!(
     bench_matmul_mxfp4_k3_dims,
     bench_matmul_mxfp4_k3_dims_cold,
     bench_matmul_mxfp4_k3_dims_prefetched,
+    bench_mxfp4_cold_readonly,
     bench_qt_addrow_i4,
     bench_qt_matvec_rows_i4,
+    bench_qt_matvec_rows_i4_real_scale,
     bench_mla_score_and_vmix
 );
 criterion_main!(benches);

@@ -553,6 +553,71 @@ need reducing how much data must move per token (better long-run cache hit rates
 explored, see "Tried and didn't help" — or a smaller-than-4-bit format, which risks real quality
 loss) rather than more clever scheduling of the movement that already happens.
 
+**This conclusion turned out to be wrong — not because the reasoning was bad, but because it was
+built entirely on INDIRECT evidence (synthetic benchmarks, thread-count experiments) instead of
+actually measuring the real process.** Installed real hardware-counter profiling (`perf` — this
+machine's own `linux-tools-6.17.0-1028-oem` package turned out to be missing the actual `perf`
+binary, a real Ubuntu OEM packaging gap; `linux-tools-generic`'s slightly-mismatched-kernel-version
+`perf` binary works fine for this) and pointed it at the real checkpoint mid-decode:
+
+- **`perf stat`, 20s of real steady-state decode**: IPC **2.01** (instructions per cycle), cache
+  misses only **6.13%** of references. Neither number looks like a memory-bandwidth-starved
+  workload — a genuinely stalled-on-DRAM process typically shows IPC well under 1.0. This directly
+  contradicted the "physical bandwidth wall" conclusion above.
+- **`perf record -g`, same window**: **`__powisf2` (the generic compiler-rt power routine) alone
+  accounted for ~29% of all cycles**, called from inside `matmul_mxfp4_avx512`'s own hot loop.
+
+The source: `quant.rs::e8m0_decode`, called once per 32-element block in every MXFP4 matmul (~1.5
+BILLION times per decode token at K3's scale), was computing `2f32.powi(byte as i32 - 127)` — a
+full generic power-function call for something IEEE-754 already encodes directly. An E8M0 byte
+IS `f32`'s own biased exponent field (both bias 127), so `2^(byte-127)` is just that byte shifted
+into the exponent bits with a zero mantissa: `f32::from_bits((byte as u32) << 23)`, one shift, no
+libm call (`byte == 0`, i.e. `2^-127`, is the one subnormal edge case that needs its own bit
+pattern — everything else is a direct hit). Verified bit-exact against the old `powi` formula for
+all 255 valid byte values (an exhaustive test, not spot checks), and against the full existing
+correctness suite (352/352 tests, `cargo clippy` clean).
+
+**Real, measured impact:**
+
+| | Warm (bench) | Cold (bench, real-checkpoint-like) | Real checkpoint, 40 tokens |
+|---|---|---|---|
+| Before | 222.2µs/call | 470.7µs/call | 270.2s total, 132.6s expert-matmul (3.315s/token) |
+| After | 145.4µs/call (**-31%**) | 220.8µs/call (**-52%**) | 240.2s total, 101.4s expert-matmul (2.535s/token) |
+
+**11.1% faster end-to-end, 23.5% faster on the expert-matmul phase specifically, 0.148→0.167
+tok/s (+12.5%)** — a real, measured, unconditional win (same disk I/O, same thread count, same
+cache settings; nothing else changed). Shipped as **v0.28.0** (a genuine minor-version win, not a
+patch — see [[feedback_rabbit_versioning_convention]]).
+
+**The lesson, worth remembering for future perf work on this project**: every synthetic
+benchmark and indirect experiment above (`RAYON_NUM_THREADS=1`, the cold-cache bench, the prefetch
+bench) was internally consistent and pointed at a plausible-sounding "physical memory-bandwidth
+wall" story — and that story was simply wrong, because none of those tests could see that a huge
+chunk of "expert matmul (compute)" time wasn't memory-bound OR FLOP-bound at all, it was one
+badly-chosen libm call. Real hardware-counter profiling (`perf`) settled in minutes what hours of
+indirect benchmarking could only speculate about. Get `perf` working EARLY on any future
+performance investigation here, rather than as a last resort.
+
+**Re-profiled the FIXED binary — `__powisf2` is gone from the top of the list entirely, confirming
+the fix landed.** New top two: `matmul_mxfp4_avx512` (35.5% total, legitimately the biggest single
+consumer now) and `dot_i4_f32_avx512` (27.1% — MLA's absorbed-decode value-projection dot product,
+`qt_matvec_rows`'s int4 branch). That second number looked suspicious at first glance: K3's real
+config has 24 full-MLA layers (`linear_attn_config.full_attn_layers`, the rest are KDA) × 96 heads
+× `v_head_dim=128` calls/head = 2,304 `qt_matvec_rows` calls/token, each 128
+`dot_i4_f32_avx512` calls of only 512 elements — **0.3% of `matmul_mxfp4`'s total arithmetic**, yet
+supposedly ~77% as many cycles. Built a matching real-scale bench (`qt_matvec_rows_i4_real_scale`,
+a real `kv_b`-sized ~6.29MiB matrix, warm vs. cache-evicted-cold) to check directly rather than
+trust the percentage — same discipline as the `e8m0_decode` investigation. **Result: only a 17%
+cold penalty (2.98µs→3.48µs per 128-call batch), and at real per-token call volume that's ~7-8ms
+total — negligible against the ~5s/token steady-state, and flatly inconsistent with `perf`'s 27%
+cycle-share implying multiple SECONDS/token.** Conclusion: that 27% figure doesn't translate to a
+real, exploitable cost the way `__powisf2`'s did — most likely an artifact of how `perf`'s
+sampling-based cycle attribution behaves across many short, unevenly-scheduled calls in a
+multi-threaded workload, not a genuine second `e8m0_decode`-style bug. Checked and ruled out, not
+just assumed — the same "verify the indirect signal directly before acting on it" lesson applies
+in both directions: sometimes indirect evidence hides a real bug (this session's `powi` find),
+sometimes it manufactures a fake one (this one). v0.28.0's fix remains the one confirmed win here.
+
 ## Reproducing these numbers
 
 **End-to-end table**: `cargo build --release --bin rabbit`, then `./target/release/rabbit --model

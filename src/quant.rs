@@ -309,8 +309,22 @@ fn e2m1_encode(value: f32) -> u8 {
 /// to its `f32` power-of-two value, bias 127 — the same bias IEEE-754 `f32`'s own exponent
 /// field uses. `0xFF` is reserved for NaN in the spec; unreached here since `choose_block_scale`
 /// never emits it (see its doc), so this only ever computes `2^(byte-127)`.
+///
+/// Called on the order of a billion times per decode token (once per 32-element block in
+/// `matmul_mxfp4`'s hot loop — see `kernels.rs`), so this is NOT `2f32.powi(byte as i32 - 127)`
+/// despite computing the exact same value: a real `perf record` of the real checkpoint found
+/// `__powisf2` (the generic compiler-rt power routine `powi` lowers to) alone responsible for
+/// ~29% of total cycles during decode — a needless cost for something IEEE-754 already encodes
+/// directly. Since E8M0's byte IS `f32`'s own biased exponent field (both bias 127), `2^(byte-127)`
+/// is exactly the `f32` bit pattern with that exponent and a zero mantissa — one shift, no libm
+/// call. The single edge case a plain shift gets wrong is `byte == 0` (`2^-127`): that exponent is
+/// below `f32`'s normal range (min normal is `2^-126`), so it needs the one subnormal bit pattern
+/// that represents it instead of the biased-exponent-0 pattern (which would just be `0.0`).
 pub(crate) fn e8m0_decode(byte: u8) -> f32 {
-    2f32.powi(byte as i32 - 127)
+    if byte == 0 {
+        return f32::from_bits(1u32 << 22); // 2^-127 == 0.5 * 2^-126, the largest-mantissa-half subnormal
+    }
+    f32::from_bits((byte as u32) << 23)
 }
 
 /// Picks the E8M0 scale byte for one 32-element block from its max absolute value: the largest
@@ -808,6 +822,18 @@ mod tests {
         assert_eq!(e8m0_decode(128), 2.0);
         assert_eq!(e8m0_decode(126), 0.5);
         assert_eq!(e8m0_decode(127 + 4), 16.0);
+    }
+
+    #[test]
+    fn e8m0_decode_matches_powi_exactly_across_the_whole_valid_byte_range() {
+        // Exhaustive, not spot-checked: every byte 0..=254 (255 is the reserved NaN code,
+        // never produced by `choose_block_scale`) against the reference `2f32.powi` formula the
+        // bit-trick replaced, catching any off-by-one in the exponent-field shift or the one
+        // subnormal special case (`byte == 0`).
+        for byte in 0u8..255 {
+            let reference = 2f32.powi(byte as i32 - 127);
+            assert_eq!(e8m0_decode(byte), reference, "byte {byte}: bit-trick {} != powi reference {reference}", e8m0_decode(byte));
+        }
     }
 
     #[test]
