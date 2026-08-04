@@ -37,6 +37,7 @@ use crate::kimi_k3::config::{Cfg, ConfigError};
 use crate::kimi_k3::moe::LatentMoeWeights;
 use crate::quant::{PackedFormatError, QT};
 use crate::safetensors::{SafetensorsError, Shards};
+use rayon::prelude::*;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -276,8 +277,20 @@ impl Model {
     /// Same as `load`, but reads the checkpoint's `.safetensors` shards from MULTIPLE
     /// directories — see `Shards::open_multi`'s doc.
     pub fn load_multi(dirs: &[PathBuf], dbits: u8, ebits: u8) -> Result<Model, ModelError> {
+        // Diagnostic timing breakdown (2026-07-28): model load takes ~610s on the real 2.8T
+        // checkpoint and nothing had ever measured WHERE that time actually goes -- see
+        // PERFORMANCE_KIMI_K3.md for whatever this investigation found. Three phases: opening
+        // shards (header parsing only, expected near-instant per `Shards::open_multi`'s own
+        // doc), `embed_tokens`/`lm_head`/misc (two huge vocab-sized tensors, read+dequant+
+        // requant, no `.qs` sidecar on the real checkpoint so this pays full BF16->f32->4bit
+        // conversion cost), and the 93-layer loop itself (hundreds of small sequential
+        // `ld`/`qt_load` calls, one blocking read each -- the same "many small syscalls" shape
+        // `io_uring` batching fixed for routed experts, never applied here).
+        let t_open = std::time::Instant::now();
         let cfg = Cfg::load(&dirs[0])?;
         let shards = Shards::open_multi(dirs)?;
+        let open_s = t_open.elapsed().as_secs_f32();
+        let t_head = std::time::Instant::now();
         let b = &cfg.base;
         let d = b.hidden as usize;
         let h = b.n_heads as usize;
@@ -302,8 +315,12 @@ impl Model {
         // wrapper) has no such prefix, which is why this wasn't caught by the oracle test --
         // that's a genuinely different real top-level module, not a bug in the oracle.
         let io_bits = if dbits >= 8 { 16 } else { dbits };
+        let t_embed = std::time::Instant::now();
         let embed = qt_load(&shards, b.group_size as usize, "language_model.model.embed_tokens.weight", b.vocab as usize, d, io_bits)?;
+        let embed_s = t_embed.elapsed().as_secs_f32();
+        let t_lm_head = std::time::Instant::now();
         let lm_head = qt_load(&shards, b.group_size as usize, "language_model.lm_head.weight", b.vocab as usize, d, io_bits)?;
+        let lm_head_s = t_lm_head.elapsed().as_secs_f32();
         let final_norm = ld(&shards, "language_model.model.norm.weight")?;
 
         let output_attn_res = if cfg.attn_res_block > 0 {
@@ -314,9 +331,25 @@ impl Model {
         } else {
             None
         };
+        let head_s = t_head.elapsed().as_secs_f32();
 
-        let mut layers = Vec::with_capacity(b.n_layers as usize);
-        for i in 0..b.n_layers as usize {
+        let t_layers = std::time::Instant::now();
+        // Parallelized across layers (2026-07-28): each layer's tensors are an independent,
+        // read-only pread from `shards` (`Shards::read_f32`/`read_raw` take `&self`, explicit
+        // offset, no shared cursor -- concurrent calls are safe), so this used to be ~600s of
+        // hundreds of small sequential blocking reads with zero overlap, one at a time, the same
+        // "many syscalls each paying full disk latency serially" shape `io_uring` batching fixed
+        // for routed experts -- never applied here until now. `into_par_iter` lets rayon's
+        // thread pool keep the drive's queue depth busy the same way `expert_cache.rs`'s
+        // `io_uring` batching does, just via plain OS threads instead of one ring (simpler,
+        // since load-time reads don't need the early-drain streaming trick expert loading does
+        // -- nothing downstream can start using layer N until every layer is loaded anyway, so
+        // there's no completion-order benefit to chase here). `collect::<Result<Vec<_>, _>>()`
+        // preserves layer order regardless of which finishes first, and surfaces the first error
+        // encountered (if any) same as the sequential loop's own `?` always did.
+        let layers: Vec<Layer> = (0..b.n_layers as usize)
+            .into_par_iter()
+            .map(|i| -> Result<Layer, ModelError> {
             let p = |s: &str| format!("language_model.model.layers.{i}.{s}");
             let ap = |s: &str| format!("language_model.model.layers.{i}.self_attn.{s}");
 
@@ -417,8 +450,17 @@ impl Model {
                 None
             };
 
-            layers.push(Layer { in_ln, post_ln, attn, ffn, attn_res });
-        }
+            Ok(Layer { in_ln, post_ln, attn, ffn, attn_res })
+            })
+            .collect::<Result<Vec<Layer>, ModelError>>()?;
+        let layers_s = t_layers.elapsed().as_secs_f32();
+
+        eprintln!(
+            "model load breakdown: shard-open {open_s:.1}s, embed {embed_s:.1}s, lm_head {lm_head_s:.1}s, \
+             other head tensors {:.1}s, {} layers {layers_s:.1}s",
+            (head_s - embed_s - lm_head_s).max(0.0),
+            b.n_layers
+        );
 
         Ok(Model { cfg, embed, lm_head, final_norm, layers, output_attn_res, ebits, route_cfg: RouteConfig::default() })
     }

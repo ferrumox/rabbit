@@ -44,13 +44,26 @@ will recur on any long-lived checkpoint dir.
 ## Speed by version
 
 Same test both times: `--model <checkpoint-dir> --prompt "What is the capital of France?"
---max-tokens 40`, same real 2.8T checkpoint, same machine, `--expert-cache 64` (the default).
+--max-tokens 40`, same real 2.8T checkpoint, same machine, `--expert-cache 64` EXPLICIT for every
+row (kept fixed on purpose, even after v0.25.0 made `64` no longer the automatic default — see "A
+real crash" below — so this series isolates only the code changes, not the cache-size change).
 
-| Version | Prefill (7 tokens) | Decode (steady-state) | Speed (tok/sec) | Change | What changed |
-|---|---|---|---|---|---|
-| v0.23.0 | 412.8s | ~50-70s/token | 0.014 | — (first working version) | K3 shipped: engine, native-format checkpoint loading, tokenizer, chat template, session persistence — the expert math itself still used the simple, unvectorized loop |
-| v0.24.0, SIMD kernel only | 216.5s | ~37.5s/token avg (range 17.1-44.8s across 40 tokens) | ~0.027 | **Prefill ~1.9× faster; decode ~1.3-1.9× faster** vs v0.23.0 | Taught the expert math to use the CPU's wider instructions, the same idea GLM-5.2's own v0.17.0/v0.22.0 already used for its own number formats |
-| v0.25.0, + `io_uring` for MXFP4 | **210.3s** | **35.0s/token avg** (1401.4s/40 tokens) | **~0.029** | **~3% faster prefill, ~7% faster decode** vs v0.24.0 — measured with `--no-usage-cache` to rule out the red-herring confound below | Batched `io_uring` reads for MXFP4's `{name}.weight_packed`+`{name}.weight_scale` pair, same mechanism GLM-5.2 already had for its own tensor formats — previously every MXFP4 load fell back to one-at-a-time synchronous reads |
+| Version | Model load | Prefill (7 tokens) | Decode (steady-state) | Speed (tok/sec) | Change | What changed |
+|---|---|---|---|---|---|---|
+| v0.23.0 | 610.0s | 412.8s | ~50-70s/token | 0.014 | — (first working version) | K3 shipped: engine, native-format checkpoint loading, tokenizer, chat template, session persistence — the expert math itself still used the simple, unvectorized loop |
+| v0.24.0, SIMD kernel only | 605.5s | 216.5s | ~37.5s/token avg (range 17.1-44.8s across 40 tokens) | ~0.027 | **Prefill ~1.9× faster; decode ~1.3-1.9× faster** vs v0.23.0 | Taught the expert math to use the CPU's wider instructions, the same idea GLM-5.2's own v0.17.0/v0.22.0 already used for its own number formats |
+| v0.25.0, + `io_uring` for MXFP4 | 616.0s | **210.3s** | **35.0s/token avg** (1401.4s/40 tokens) | **~0.029** | **~3% faster prefill, ~7% faster decode** vs v0.24.0 — measured with `--no-usage-cache` to rule out the red-herring confound below | Batched `io_uring` reads for MXFP4's `{name}.weight_packed`+`{name}.weight_scale` pair, same mechanism GLM-5.2 already had for its own tensor formats — previously every MXFP4 load fell back to one-at-a-time synchronous reads |
+| v0.26.0, parallel model load | **102.3s** | 210.3s (unchanged) | 35.0s/token avg (unchanged) | ~0.029 (unchanged) | **Model load ~6.1× faster** (619.5s→102.3s on the run that found this — see its own section below); prefill/decode untouched | Parallelized the 93-layer loading loop with `rayon` — was a purely sequential blocking-read loop, 591.6 of 619.5 load seconds, never batched/threaded before |
+| v0.26.0, **real default config** (`--expert-cache` auto=4, not the fixed 64 above) | **102.3s** | **44.6s** | **~8.1s/token avg** (161.8s/20 tokens) | **~0.124** | Everything above, combined, under the config a real invocation actually uses | Not a new code change — this row swaps the artificially-fixed `--expert-cache 64` for the real auto-clamped default every other row deliberately avoided, to show what actually happens today. See "Does the auto-clamp cost real speed" below for why this is FASTER, not slower, despite the much lower hit rate |
+
+**Overall, same 40-token generation, start of this session to now: ~610.0+412.8+40×60s≈3423s
+(~57 minutes) → ~102.3+44.6+40×8.1s≈471s (~7.9 minutes), about 7.3× faster end to end** — using
+the real default config row above and the v0.23.0 baseline's midpoint decode estimate (no exact
+40-token time was recorded for that oldest run's decode, only the ~50-70s/token range). One caveat
+kept from earlier: the ~8.1s/token figure benefits from this session's OS page cache already being
+warm from many repeated real runs on the same checkpoint — a truly cold first run on a freshly
+booted machine would likely see a slower decode than this (though load and prefill's own
+improvements are pure code changes, unaffected by cache warmth).
 
 Run-to-run noise on the very first generated token specifically was large enough (44.8s / 85.3s /
 122.3s across three different runs on this same machine) that it isn't used as a headline number
@@ -190,16 +203,106 @@ its more commonly-touched shards; **not a clean apples-to-apples comparison with
 cold-cache numbers above**, just confirmation that the fix holds under real conditions without a
 crash.
 
+## v0.26.0: model load, ~6x faster — nobody had ever measured where the 610s went
+
+Every number on this page so far treated model load as a fixed ~610s cost and moved on to
+measuring generation speed instead — reasonable, since load happens once per process and decode
+happens every token, but it meant a genuinely huge, completely unexplained cost sat there
+unquestioned through this whole page. Added a one-time timing breakdown to `kimi_k3::model::
+Model::load_multi` (three phases: opening the `.safetensors` shards, `embed_tokens`/`lm_head`/misc,
+and the 93-layer loop) and ran it once against the real checkpoint:
+
+```
+model load breakdown: shard-open 1.0s, embed 13.0s, lm_head 13.8s, other head tensors 0.0s, 93 layers 591.6s
+model loaded in 619.5s (93 layers)
+```
+
+**591.6 of 619.5 seconds — 95.5% of the entire load — was the 93-layer loop**, not the two huge
+vocab-sized tensors (`embed_tokens`/`lm_head` together were only ~27s, fast, as expected for ~2.35GB
+each at real NVMe speed). The loop itself was hundreds of small, purely sequential blocking reads
+(`ld`/`qt_load`, one `pread` at a time, one layer fully finishing before the next one's first read
+even starts) — the EXACT same "many syscalls each paying full disk latency serially, zero overlap"
+shape `io_uring` batching fixed for routed experts (see this page's earlier sections), just never
+applied to the dense/attention weights loaded once at startup.
+
+**Fixed the same session**: each layer's tensors are independent reads (`Shards::read_f32`/
+`read_raw` take `&self`, explicit `pread` offset, no shared file cursor — safe to call
+concurrently), so the sequential `for i in 0..n_layers` loop became a `rayon` `into_par_iter()` +
+`.collect::<Result<Vec<Layer>, _>>()` — plain OS threads instead of an `io_uring` ring, since load
+time has no equivalent to expert-loading's early-drain trick (nothing downstream can use layer N
+until every layer is loaded anyway, so there's no per-completion streaming benefit to chase, just
+concurrency). Result, same real checkpoint, right after:
+
+```
+model load breakdown: shard-open 0.7s, embed 12.9s, lm_head 13.9s, other head tensors 0.0s, 93 layers 74.6s
+model loaded in 102.3s (93 layers)
+```
+
+**93-layer loop: 591.6s → 74.6s, ~7.9× faster. Total model load: 619.5s → 102.3s, ~6.1× faster** —
+from over 10 minutes to under 2. This has NO effect on decode speed (nothing above this section
+changes) but matters for every single invocation of `--prompt`/`--chat`/`--serve`, since load
+happens once no matter how many tokens get generated afterward — the single biggest fixed-cost win
+on this whole page, found by finally asking where a cost everyone had been treating as immovable
+actually went.
+
+**Correctness confirmed the same session**: the speed measurements above killed the process right
+after load finished (no need to wait for the rest just to time loading) — so a separate full run
+was needed to confirm the parallelized load ISN'T just fast but still produces a correctly-working
+model (rayon loads layers in whatever order threads finish, unlike the old strictly-sequential
+loop, so this genuinely needed checking, not just assuming). Real `--prompt "What is the capital
+of France?" --max-tokens 20` run: load 104.3s, prefill 43.0s, 20 tokens in 154.0s (~7.7s/token) —
+correct, coherent output, same style as every other real run on this page. Total end-to-end time
+for this one run (load+prefill+decode): ~301s, under 5 minutes — a real illustration of how much
+the combined effect of this session's fixes changes the practical experience, down from the
+40+ minute runs this same page's earlier sections were measured with.
+
+## Does the auto-clamp (capacity 4) actually cost real speed? Tested it directly — no, the opposite
+
+A fair question, raised right after the auto-clamp fix: 4 cached experts/layer instead of 64 means
+a much lower hit rate (confirmed: ~8.5% in one real run vs. tens of thousands of hits/run at
+capacity 64 elsewhere on this page) — doesn't that mean more disk re-reads and a real slowdown, not
+just a safety trade-off? Worth testing directly rather than assuming either way, especially since
+earlier fast numbers on this page (~7-8s/token) were flagged as possibly confounded by warm OS page
+cache, not proof that a smaller cache is fine.
+
+Ran a genuinely controlled back-to-back A/B: same prompt, same 20 tokens, `--no-usage-cache` on
+both (removes the pinned-tier variable entirely), run B immediately after run A so both see roughly
+the same OS page-cache state — varying ONLY `--expert-cache` (4 vs. the old flat 64):
+
+```
+Run A (--expert-cache 4):  load 103.7s, prefill  44.6s, 20 tokens in 161.8s (~8.1s/token)
+Run B (--expert-cache 64): load 103.1s, prefill 479.2s, tokens running 18-91s each (killed at 15/20)
+```
+
+**Run B wasn't just slower — it was actively swapping while it ran**: `free -h` mid-run showed
+121Gi/123Gi RAM used, under 1GB free, 27GB of swap in use. Requesting 64 experts/layer resident
+(worst case ~209GB for this checkpoint's real per-expert size, see "A real crash" above) pushes
+this machine into real memory pressure well before it can ever finish filling that cache — and
+swapping is catastrophically slower than any amount of extra disk-read misses a smaller cache
+might cause. Killed run B once the pattern was clear (`kill -9`), to avoid risking a full
+system-wide OOM affecting anything else running on the machine; memory returned to normal (113GB
+free) within seconds of the kill.
+
+**Answer: no, the auto-clamp to 4 is not a speed-for-safety trade-off on this machine — it's
+strictly faster AND safer**, because the "faster" alternative (64) was never actually achievable
+here without swapping first. This doesn't mean 4 is the universally correct number forever — a
+machine with meaningfully more RAM, or a future smarter budget that accounts for how much RAM is
+actually free (not just a fixed 24GB constant), could likely support a higher capacity and a real
+hit-rate win without ever touching swap. That's real, scoped future work if this checkpoint's
+performance ever needs another pass; not done this session.
+
 ## Reproducing these numbers
 
 **End-to-end table**: `cargo build --release --bin rabbit`, then `./target/release/rabbit --model
 <checkpoint-dir> --prompt "What is the capital of France?" --max-tokens 40 --expert-cache 64`. The
 v0.23.0 row was measured on the commit tagged `v0.23.0`, the SIMD-only row on `v0.24.0`, the
-`io_uring` row on `v0.25.0` — **add `--no-usage-cache`** for that last one (or any repeat run on a
-checkpoint dir that already has real generation history in it), per "A red herring" above, or the
-measurement will be contaminated by `mlock` retry overhead unrelated to the thing actually being
-measured. The `--expert-cache 64` in the command above is explicit, so `v0.25.0`'s auto-clamp
-safety fix (see "A real crash, not a red herring" below) doesn't kick in — that's intentional, to
+`io_uring` row on `v0.25.0`, the `v0.26.0` row on `v0.26.0` (only its `Model load` column differs
+from `v0.25.0` — that's the whole point of the row) — **add `--no-usage-cache`** for `v0.25.0`
+onward (or any repeat run on a checkpoint dir that already has real generation history in it), per
+"A red herring" above, or the measurement will be contaminated by `mlock` retry overhead unrelated
+to the thing actually being measured. The `--expert-cache 64` in the command above is explicit, so
+`v0.25.0`'s auto-clamp safety fix (see "A real crash, not a red herring" below) doesn't kick in —
+that's intentional, to
 keep every row in this table using the same cache capacity for a fair comparison.
 
 **Isolated kernel benchmark**: `cargo bench --bench kernels -- matmul_mxfp4`.
