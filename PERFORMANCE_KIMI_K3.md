@@ -288,8 +288,91 @@ strictly faster AND safer**, because the "faster" alternative (64) was never act
 here without swapping first. This doesn't mean 4 is the universally correct number forever — a
 machine with meaningfully more RAM, or a future smarter budget that accounts for how much RAM is
 actually free (not just a fixed 24GB constant), could likely support a higher capacity and a real
-hit-rate win without ever touching swap. That's real, scoped future work if this checkpoint's
-performance ever needs another pass; not done this session.
+hit-rate win without ever touching swap. That's the exact question the next version answers.
+
+## v0.27.0: the safety budget is now RAM-aware, not a fixed guess
+
+The flagged future work above, done the same day: a fixed 24GB budget is exactly the wrong shape
+for this problem — too small wastes real headroom on a bigger machine, too large risks the same
+OOM/swap this whole fix exists to prevent on a smaller one. `expert_cache::safe_mxfp4_capacity`
+now reads real available memory from `/proc/meminfo`'s `MemAvailable` (Linux; falls back to the
+original fixed 24GB constant if that file can't be read — non-Linux, sandboxed, malformed, ...)
+and uses **40% of whatever's actually free right now** as the safety budget, leaving the other 60%
+for this checkpoint's own base-resident weights, KV cache growth, the OS, and anything else running
+on the machine.
+
+Real result on this machine (`MemAvailable` ≈122GB at the time): budget ≈37GB (vs. the old fixed
+24GB), auto-capacity **7** (vs. the old fixed-budget 4) — a real ~75% bigger cache, still safely
+under a third of real available RAM. Ran the exact real `--prompt`/`--no-usage-cache` test from the
+section above with this new capacity, tracking memory every 15s throughout:
+
+```
+expert cache: auto --expert-cache 64 would risk ~310GB peak memory on this checkpoint
+(92 MoE layers x ~35.1MB/expert, LRU + pinned tiers combined) -- lowered the auto
+default to 7 to stay under a ~37GB safety budget (40% of real available RAM, ...)
+
+RAM used climbed steadily: 17GB -> 24GB -> 28GB -> 35GB -> ... -> 46GB (peak), then back to
+7.2GB once generation finished. Swap stayed flat at 6.3-7.4GB throughout -- NO growth, no
+swapping, the entire run. 20 tokens in 161.5s (~8.1s/token) -- essentially the same speed as
+the old capacity-4 run's 161.8s on this short a sample (1040 hits vs. 248 -- a real ~4.2x
+higher hit rate at capacity 7, just not enough absolute misses saved over only 20 tokens to
+show up as a clear wall-clock win yet; would need a longer/repeated real run to see if a bigger
+capacity's hit-rate advantage compounds into a visible speed difference over more tokens).
+```
+
+**The real win here isn't necessarily speed on THIS run — it's that the budget now scales
+correctly with the machine it's running on**, instead of being permanently stuck at whatever
+number one specific 123GB box's incident happened to justify. A machine with less RAM gets a
+smaller, still-safe budget automatically; a machine with more RAM (or this same one, once it's
+running fewer other things and has more `MemAvailable`) gets a bigger one, with no code change
+and no re-guessing needed. Verified with 4 new fast unit tests (`parse_mem_available_kb`'s real
+`/proc/meminfo` text format, missing-field and malformed-value cases, and a
+`safe_mxfp4_capacity_with_budget` test proving a bigger budget genuinely allows a bigger capacity)
+— 350/350 lib tests, clippy clean, release build clean.
+
+**Follow-up at 40 tokens (double the sample): the hit-rate advantage DOES show up as real
+speed once there's enough decode to let it compound.** Controlled back-to-back A/B,
+`--no-usage-cache` both sides, same warm page-cache state:
+
+| | Capacity 4 | Capacity 7 | Change |
+|---|---|---|---|
+| Decode (40 tokens) | 387.8s (~9.7s/token, ~0.10 tok/sec) | 283.2s (~7.1s/token, ~0.14 tok/sec) | **~27% faster** |
+| Final hit rate | 478 hits / 63494 misses (~0.75%) | 1914 hits / 62058 misses (~3.0%) | ~4× higher |
+
+(Run A's own prefill this time was an outlier — 122.5s vs. the ~44-45s seen everywhere else on
+this page, capacity-independent noise, not compared here.) Confirms the earlier 20-token sample
+wasn't a null result, just too short a window: the bigger RAM-aware capacity is a real, measurable
+decode-speed win on top of being safer, not only a safety measure with no performance upside.
+
+## Tried and didn't help
+
+- **Consolidating each MXFP4 expert's 6 `io_uring` reads (`w1`/`w2`/`w3` × `weight_packed`/
+  `weight_scale`) into 1 combined read** — a real shard-header inspection found all 6 tensors
+  genuinely byte-contiguous, back-to-back, on the real checkpoint (confirmed across multiple
+  experts/layers), so one bigger read per expert looked like a clean win: fewer `io_uring` SQEs,
+  less per-completion bookkeeping. A throwaway isolated probe (raw `io_uring` reads against the
+  real checkpoint file, no rabbit code involved) measured it as **faster** — ~1.06-1.53x, bigger
+  win at smaller batch sizes closer to real usage. Built the real fix (`try_submit_mxfp4_combined`
+  in `expert_cache.rs`, with a per-expert contiguity check and a safe fallback to the original
+  per-tensor reads whenever it doesn't hold), verified correct with new unit tests, then measured
+  it end-to-end on the real checkpoint: **~45% SLOWER** (410.0s vs. 283.2s for the same 40 tokens
+  at the same `--expert-cache 7`), and immediately so — the very first token already showed
+  roughly double the disk-wait time, not a gradual drift. Reverted the same session.
+
+  **Real, already-documented explanation, found in this project's own `PERFORMANCE.md`**: a much
+  earlier investigation ("Lead 2" in that file's disk-I/O section) measured, on this SAME drive,
+  that SCATTERED reads are FASTER than sequential ones by 10-22% — "this NVMe likely spreads data
+  across many internal flash channels, and offsets scattered across a wide range may activate more
+  of them at once than a purely sequential burst." Consolidating 6 smaller reads into 1 bigger one
+  does the opposite of what that finding recommends: fewer, bigger, more sequential reads instead
+  of more, smaller, scattered ones — reducing how many of the drive's internal channels get
+  activated concurrently. The isolated probe likely didn't reproduce this effect faithfully (a
+  different queue-depth/timing shape than real generation's actual read pattern). Worth remembering
+  before trying any other "fewer, bigger reads" idea against this specific checkpoint/drive: the
+  established, measured behavior here favors MORE scattered concurrent reads, not fewer combined
+  ones, and a clean isolated micro-benchmark isn't guaranteed to predict this correctly — verify
+  end-to-end on the real checkpoint before trusting an isolated probe's direction, not just its
+  magnitude.
 
 ## Reproducing these numbers
 

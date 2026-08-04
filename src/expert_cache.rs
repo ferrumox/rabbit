@@ -918,23 +918,51 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
     Ok(ExpertSlot { eid, gate_up, down, used })
 }
 
-/// A conservative ceiling on `--expert-cache`'s AUTO default (never applied to an EXPLICIT
-/// `--expert-cache N` — see `crate::model::safe_default_expert_cache_capacity`'s doc for why),
-/// specifically for `ExpertNaming::KimiK3Mxfp4`. Found the hard way (2026-07-28): K3's real
-/// per-expert size (~35MB, `hidden=7168`/`moe_intermediate_size=3072`) is far bigger than
-/// whatever this project's existing `64`-slot-per-layer default was ever validated against, and
-/// K3 has 93 layers — `93 * 64 * 35MB ≈ 209GB` for the ordinary LRU tier ALONE, before even
-/// counting `usage_cache::pin_budget`'s separate, NEVER-evicted tier (up to another `93 * 32 *
-/// 35MB ≈ 104GB` once `confidence` maxes out after enough real generations on the same
-/// checkpoint — see `PERFORMANCE_KIMI_K3.md`'s "A red herring" section). A real `--prompt` run
-/// hit exactly this and got OOM-killed by the kernel (`journalctl -k`: `anon-rss:122899668kB`
-/// right before the kill). 24GB is a deliberately conservative fixed budget (not derived from
-/// this machine's real RAM — this codebase doesn't probe that anywhere else either, and a fixed
-/// constant is simpler/more portable than adding a new OS-query dependency for one heuristic) —
-/// safe on a much smaller machine than the one that hit this bug, while still leaving real
-/// caching benefit (`combined = capacity * n_moe_layers * per_expert_bytes * 1.5`, the `1.5`
-/// accounting for `pin_budget`'s worst case being half of `capacity` at full confidence).
-const SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
+/// Fraction of real available RAM (`/proc/meminfo`'s `MemAvailable`) used as the auto
+/// `--expert-cache` safety budget. Replaces this fix's original fixed 24GB constant (2026-07-28):
+/// a real controlled A/B on the machine that hit the original OOM found the fixed budget was
+/// needlessly conservative THERE (auto-capacity landed at 4, ~8.5% hit rate) — but a fixed number
+/// picked for one machine is exactly wrong-shaped for this problem: too small wastes real headroom
+/// on a bigger machine, too large risks the same OOM/swap on a smaller one. Reading actual
+/// available memory generalizes correctly either way. 40% deliberately leaves the other 60% of
+/// whatever's free RIGHT NOW (at process startup, before this checkpoint's own base-resident
+/// weights, KV cache growth, or anything else on the machine has claimed more) as headroom — see
+/// `SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES`'s doc for what happens when this can't be read.
+const MXFP4_AUTO_CACHE_BUDGET_FRACTION: f64 = 0.4;
+
+/// Fallback safety budget when `/proc/meminfo` can't be read (non-Linux, missing, a sandboxed
+/// environment, a malformed `MemAvailable` line, ...) — the ORIGINAL fixed constant from before
+/// this was made RAM-aware, kept only as a safety net for that case, not the primary mechanism
+/// anymore. Conservative on purpose: better to under-cache on an unusual host than risk the OOM
+/// this whole fix exists to prevent.
+const SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES: u64 = 24_000_000_000;
+
+/// Never clamp the budget below this, however little `MemAvailable` reports — a degenerate
+/// near-zero budget would clamp capacity to 0 or 1 even on a merely busy (not actually
+/// memory-starved) machine; 4GB keeps a small but real cache alive in that case, letting the
+/// existing OOM-safety math (not this floor) be the thing that decides if that's still too much.
+const MXFP4_AUTO_CACHE_BUDGET_FLOOR_BYTES: u64 = 4_000_000_000;
+
+/// Parses `MemAvailable`'s value (in kB) out of `/proc/meminfo`'s real text format
+/// (`"MemAvailable:   122444808 kB"`, arbitrary internal whitespace) — split out from the file
+/// read itself so a unit test can check the parsing against a fixed string, not the real
+/// (host-dependent, non-deterministic) file.
+fn parse_mem_available_kb(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|rest| rest.split_whitespace().next()).and_then(|n| n.parse().ok())
+}
+
+/// Real available RAM right now, in bytes — `None` if it can't be determined (non-Linux, or any
+/// read/parse failure), in which case callers fall back to
+/// `SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES`.
+#[cfg(target_os = "linux")]
+fn available_memory_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_available_kb(&content).map(|kb| kb * 1024)
+}
+#[cfg(not(target_os = "linux"))]
+fn available_memory_bytes() -> Option<u64> {
+    None
+}
 
 /// One MXFP4 expert's real total resident bytes (`w1`+`w2`+`w3`, packed+scale each) at this
 /// checkpoint's real `moe_inter`/`hidden` — shape-only, no disk I/O: builds an empty `QT` of the
@@ -949,12 +977,25 @@ fn mxfp4_expert_bytes(moe_inter: usize, hidden: usize) -> u64 {
 }
 
 /// Clamps `requested` (an AUTO `--expert-cache` default, never an explicit one — see
-/// `SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES`'s doc) so that `n_moe_layers * capacity * 1.5 *
-/// per_expert_bytes` — the LRU tier's own worst case plus `pin_budget`'s worst case on top, the
-/// two tiers this checkpoint's real OOM came from — stays under the fixed safety budget. Prints
-/// one `eprintln!` note when it actually had to lower anything, so a slower-than-expected run is
-/// never a silent surprise.
+/// `crate::model::safe_default_expert_cache_capacity`'s doc for why) so that `n_moe_layers *
+/// capacity * 1.5 * per_expert_bytes` — the LRU tier's own worst case plus `pin_budget`'s worst
+/// case on top, the two tiers this checkpoint's real OOM came from — stays under a RAM-aware
+/// safety budget (`MXFP4_AUTO_CACHE_BUDGET_FRACTION` of real `MemAvailable`, see that constant's
+/// doc). Prints one `eprintln!` note when it actually had to lower anything, so a
+/// slower-than-expected run is never a silent surprise.
 pub(crate) fn safe_mxfp4_capacity(requested: usize, n_moe_layers: usize, moe_inter: usize, hidden: usize) -> usize {
+    let budget = available_memory_bytes()
+        .map(|avail| (avail as f64 * MXFP4_AUTO_CACHE_BUDGET_FRACTION) as u64)
+        .unwrap_or(SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES)
+        .max(MXFP4_AUTO_CACHE_BUDGET_FLOOR_BYTES);
+    safe_mxfp4_capacity_with_budget(requested, n_moe_layers, moe_inter, hidden, budget)
+}
+
+/// The actual clamp math, `budget_bytes` factored out as a parameter so tests can check it
+/// against a fixed, deterministic budget instead of this host's real (and non-deterministic
+/// across machines/CI) `MemAvailable`. `safe_mxfp4_capacity` is the real entry point production
+/// code calls; this is `pub(crate)` only for `#[cfg(test)]` use.
+pub(crate) fn safe_mxfp4_capacity_with_budget(requested: usize, n_moe_layers: usize, moe_inter: usize, hidden: usize, budget_bytes: u64) -> usize {
     if n_moe_layers == 0 {
         return requested;
     }
@@ -963,17 +1004,19 @@ pub(crate) fn safe_mxfp4_capacity(requested: usize, n_moe_layers: usize, moe_int
         return requested;
     }
     let worst_case_multiplier = n_moe_layers as u64 * per_expert * 3 / 2;
-    let max_capacity = (SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES / worst_case_multiplier.max(1)).max(1) as usize;
+    let max_capacity = (budget_bytes / worst_case_multiplier.max(1)).max(1) as usize;
     let clamped = requested.min(max_capacity);
     if clamped < requested {
         eprintln!(
             "expert cache: auto --expert-cache {requested} would risk ~{:.0}GB peak memory on this checkpoint \
              ({n_moe_layers} MoE layers x ~{:.1}MB/expert, LRU + pinned tiers combined) -- lowered the auto \
-             default to {clamped} to stay under a {:.0}GB safety budget. Pass --expert-cache explicitly to \
-             override this (no clamp applies to an explicit value).",
+             default to {clamped} to stay under a ~{:.0}GB safety budget ({:.0}% of real available RAM, or the \
+             fixed fallback if that couldn't be read). Pass --expert-cache explicitly to override this (no \
+             clamp applies to an explicit value).",
             (requested as u64 * worst_case_multiplier) as f64 / 1e9,
             per_expert as f64 / 1e6,
-            SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES as f64 / 1e9,
+            budget_bytes as f64 / 1e9,
+            MXFP4_AUTO_CACHE_BUDGET_FRACTION * 100.0,
         );
     }
     clamped
@@ -1076,24 +1119,29 @@ mod tests {
 
     // ---- safe_mxfp4_capacity (2026-07-28: a real `--prompt` run got OOM-killed at the flat
     // `64` default against K3's real per-expert scale — see this function's own doc and
-    // `PERFORMANCE_KIMI_K3.md`'s "A red herring" section for the real numbers) ----
+    // `PERFORMANCE_KIMI_K3.md`'s "A red herring" section for the real numbers). All tests below
+    // use `safe_mxfp4_capacity_with_budget` with a FIXED budget, not the real
+    // `safe_mxfp4_capacity` entry point — that one reads this host's live `/proc/meminfo`,
+    // which is exactly the non-determinism these tests need to avoid (a CI box or a future dev
+    // machine with different real RAM would otherwise get a different, flaky answer).
+    const TEST_BUDGET_BYTES: u64 = 24_000_000_000;
 
     /// At K3's real real dimensions (`moe_intermediate_size=3072`, `hidden_size=7168`,
     /// `num_hidden_layers=93`), the flat `64` default must get clamped to something whose
-    /// combined LRU+pinned worst case actually fits the fixed safety budget — fast (no real
+    /// combined LRU+pinned worst case actually fits the given safety budget — fast (no real
     /// checkpoint, shape-only math), unlike confirming this against the real 1.56TB checkpoint.
     #[test]
     fn safe_mxfp4_capacity_clamps_the_flat_default_at_real_k3_scale() {
         let (moe_inter, hidden, n_moe_layers) = (3072usize, 7168usize, 93usize);
-        let clamped = safe_mxfp4_capacity(64, n_moe_layers, moe_inter, hidden);
+        let clamped = safe_mxfp4_capacity_with_budget(64, n_moe_layers, moe_inter, hidden, TEST_BUDGET_BYTES);
         assert!(clamped < 64, "the flat default must actually get lowered at K3's real scale, got {clamped}");
         assert!(clamped >= 1, "must never clamp to 0 and silently disable caching entirely");
 
         let per_expert = mxfp4_expert_bytes(moe_inter, hidden);
         let combined_worst_case = n_moe_layers as u64 * clamped as u64 * per_expert * 3 / 2;
         assert!(
-            combined_worst_case <= SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES,
-            "clamped capacity {clamped} still risks {combined_worst_case} bytes, over the {SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES} byte budget"
+            combined_worst_case <= TEST_BUDGET_BYTES,
+            "clamped capacity {clamped} still risks {combined_worst_case} bytes, over the {TEST_BUDGET_BYTES} byte budget"
         );
     }
 
@@ -1103,15 +1151,48 @@ mod tests {
     /// to protect against.
     #[test]
     fn safe_mxfp4_capacity_does_not_touch_an_already_safe_request() {
-        assert_eq!(safe_mxfp4_capacity(2, 93, 3072, 7168), 2);
-        assert_eq!(safe_mxfp4_capacity(8, 1, 16, 16), 8, "tiny synthetic shapes: nowhere near the budget");
+        assert_eq!(safe_mxfp4_capacity_with_budget(2, 93, 3072, 7168, TEST_BUDGET_BYTES), 2);
+        assert_eq!(safe_mxfp4_capacity_with_budget(8, 1, 16, 16, TEST_BUDGET_BYTES), 8, "tiny synthetic shapes: nowhere near the budget");
     }
 
     /// `n_moe_layers == 0` (a checkpoint with no MoE layers at all, or called before any are
     /// known) must return the request unchanged rather than divide by zero.
     #[test]
     fn safe_mxfp4_capacity_handles_zero_moe_layers() {
-        assert_eq!(safe_mxfp4_capacity(64, 0, 3072, 7168), 64);
+        assert_eq!(safe_mxfp4_capacity_with_budget(64, 0, 3072, 7168, TEST_BUDGET_BYTES), 64);
+    }
+
+    /// A bigger budget must allow (not force) a bigger capacity — the whole point of making the
+    /// budget RAM-aware instead of a fixed constant: a machine with more real available memory
+    /// should get more real caching benefit, not the same conservative number regardless.
+    #[test]
+    fn safe_mxfp4_capacity_scales_up_with_a_bigger_budget() {
+        let (moe_inter, hidden, n_moe_layers) = (3072usize, 7168usize, 93usize);
+        let small_budget = safe_mxfp4_capacity_with_budget(64, n_moe_layers, moe_inter, hidden, 24_000_000_000);
+        let big_budget = safe_mxfp4_capacity_with_budget(64, n_moe_layers, moe_inter, hidden, 48_000_000_000);
+        assert!(big_budget > small_budget, "doubling the budget should allow a bigger auto capacity, got {small_budget} vs {big_budget}");
+    }
+
+    // ---- parse_mem_available_kb / available_memory_bytes (2026-07-28: replaced the fixed 24GB
+    // budget with one based on real `/proc/meminfo` — a fixed number is either wastefully
+    // conservative on a bigger machine or, worse, still unsafe on a smaller one) ----
+
+    #[test]
+    fn parse_mem_available_kb_reads_the_real_proc_meminfo_format() {
+        let fixture = "MemTotal:       129433076 kB\nMemFree:        10000000 kB\nMemAvailable:   122444808 kB\nBuffers:          123456 kB\n";
+        assert_eq!(parse_mem_available_kb(fixture), Some(122444808));
+    }
+
+    #[test]
+    fn parse_mem_available_kb_returns_none_when_the_field_is_missing() {
+        let fixture = "MemTotal:       129433076 kB\nMemFree:        10000000 kB\n";
+        assert_eq!(parse_mem_available_kb(fixture), None);
+    }
+
+    #[test]
+    fn parse_mem_available_kb_returns_none_on_a_malformed_value() {
+        let fixture = "MemAvailable:   not-a-number kB\n";
+        assert_eq!(parse_mem_available_kb(fixture), None);
     }
 
     struct TempDir(std::path::PathBuf);
