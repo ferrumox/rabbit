@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
-[--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] [--think] \
+[--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] \
+[--io-batch-size N] [--think] \
 [--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K] \
 [--shard-dirs <dir1,dir2,...>]";
 
@@ -33,6 +34,9 @@ struct Args {
     /// `None` = auto (see `LoadArgs::cache_capacity`'s doc) — `--expert-cache N` overrides it
     /// explicitly.
     cache_capacity: Option<usize>,
+    /// `None` = match `cache_capacity` (today's original coupled behavior — see
+    /// `LoadArgs::io_batch_size`'s doc). `--io-batch-size N` sets it independently.
+    io_batch_size: Option<usize>,
     session: Option<PathBuf>,
     no_usage_cache: bool,
     cache_route: bool,
@@ -58,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dbits = 4u8;
     let mut ebits = 4u8;
     let mut cache_capacity = None;
+    let mut io_batch_size = None;
     let mut session = None;
     let mut no_usage_cache = false;
     let mut cache_route = false;
@@ -83,6 +88,7 @@ fn parse_args() -> Result<Args, String> {
             "--dbits" => dbits = next("--dbits")?.parse().map_err(|e| format!("--dbits: {e}"))?,
             "--ebits" => ebits = next("--ebits")?.parse().map_err(|e| format!("--ebits: {e}"))?,
             "--expert-cache" => cache_capacity = Some(next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?),
+            "--io-batch-size" => io_batch_size = Some(next("--io-batch-size")?.parse().map_err(|e| format!("--io-batch-size: {e}"))?),
             "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--no-usage-cache" => no_usage_cache = true,
             "--cache-route" => cache_route = true,
@@ -116,6 +122,7 @@ fn parse_args() -> Result<Args, String> {
         dbits,
         ebits,
         cache_capacity,
+        io_batch_size,
         session,
         no_usage_cache,
         cache_route,
@@ -137,6 +144,7 @@ fn load_args(args: &Args) -> LoadArgs {
         dbits: args.dbits,
         ebits: args.ebits,
         cache_capacity: args.cache_capacity,
+        io_batch_size: args.io_batch_size,
         no_usage_cache: args.no_usage_cache,
         cache_route: args.cache_route,
     }
@@ -168,10 +176,19 @@ fn run_single_shot(args: &Args, prompt: &str) -> Result<(), Box<dyn std::error::
 
     let mut kv = KvState::new(&sess.model);
     let t1 = std::time::Instant::now();
-    let (text, _pos, n, _profile) = chat::generate_reply(&mut sess, &mut kv, &prompt_ids, 0, print_progress)?;
+    let (text, _pos, n, profile) = chat::generate_reply(&mut sess, &mut kv, &prompt_ids, 0, print_progress)?;
     let elapsed = t1.elapsed().as_secs_f32();
     println!("{text}");
     eprintln!("\n{n} tokens in {elapsed:.1}s ({:.1} tok/s)", n as f32 / elapsed.max(0.001));
+    let accounted = profile.attention_s + profile.expert_wait_s + profile.expert_matmul_s + profile.lm_head_s;
+    eprintln!(
+        "  phase breakdown: attention {:.1}s, expert wait (disk) {:.1}s, expert matmul (compute) {:.1}s, lm_head {:.1}s, other/unaccounted {:.1}s",
+        profile.attention_s,
+        profile.expert_wait_s,
+        profile.expert_matmul_s,
+        profile.lm_head_s,
+        (elapsed - accounted).max(0.0)
+    );
 
     if sess.usage_cache_enabled
         && let Err(e) = sess.caches.save_usage(&sess.model_dir)

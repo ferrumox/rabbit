@@ -133,10 +133,16 @@ pub struct ExpertCaches(Vec<Option<ExpertCache>>);
 
 impl ExpertCaches {
     pub fn new(model: &Model, capacity: usize) -> ExpertCaches {
+        Self::new_with_io_batch(model, capacity, capacity)
+    }
+
+    /// Like `new`, but `io_batch_size` (see `ExpertCache::io_batch_size`'s doc) is set
+    /// independently of `capacity` instead of defaulting to match it.
+    pub fn new_with_io_batch(model: &Model, capacity: usize, io_batch_size: usize) -> ExpertCaches {
         let v = model
             .layers
             .iter()
-            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, ExpertNaming::KimiLinear)) } else { None })
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family_with_io_batch(capacity, io_batch_size, ExpertNaming::KimiLinear)) } else { None })
             .collect();
         ExpertCaches(v)
     }

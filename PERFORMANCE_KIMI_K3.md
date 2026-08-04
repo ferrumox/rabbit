@@ -344,6 +344,49 @@ this page, capacity-independent noise, not compared here.) Confirms the earlier 
 wasn't a null result, just too short a window: the bigger RAM-aware capacity is a real, measurable
 decode-speed win on top of being safer, not only a safety measure with no performance upside.
 
+## v0.27.1: decoupling I/O batch size from cache capacity — kept, even though it didn't help here
+
+(A patch, not a new minor version — this project's convention going forward: the middle version
+number marks a real, measured improvement; a patch is for maintained-but-neutral work like this,
+following the same v0.23.0/v0.24.0/... pattern used everywhere else on this page.)
+
+Following the read-consolidation dead end above, another angle on the same question: `moe.rs`'s
+`io_uring` round size (`chunk_size`) had ALWAYS been the exact same number as the resident
+`ExpertCache`'s eviction `capacity` (`let chunk_size = cache.capacity().max(1);`) — one round =
+one capacity-sized chunk, by original design. Once `capacity` got auto-clamped small for memory
+safety (see "A real crash" above), that coupling ALSO shrinks how many reads get submitted
+concurrently per round — down to 7, well under K3's real `topk` of 16. Given this page's own
+"Lead 2" finding that more concurrent scattered reads are better on this drive, a smaller round
+size looked like a real, unintended cost of the memory fix.
+
+Added a genuinely new, independent knob: `ExpertCache::io_batch_size` (defaults to `capacity`,
+today's original coupled behavior, unless set explicitly) plus a `--io-batch-size N` CLI flag.
+Verified SAFE to decouple (not just convenient): `finish_loading_streaming`'s `on_slot` callback
+already consumes every expert's data the moment ITS OWN read lands, strictly BEFORE that batch's
+insertion-and-eviction pass runs — so a round bigger than `capacity` just means some of that
+round's experts won't stay cached afterward, never a stale-data read. New unit test proves this
+directly (`io_batch_size_bigger_than_capacity_still_streams_every_experts_correct_values`): a
+10-expert batch against a 2-slot cache still streams all 10 correct values through `on_slot`
+before the resident cache shrinks back to 2.
+
+**Real result: no measurable difference.** `--expert-cache 7 --io-batch-size 16` (the real `topk`,
+letting a whole token's routing fit in one round) measured 285.5s for 40 tokens — statistically
+the same as the coupled baseline's 283.2s. The explanation was ALSO already sitting in this
+project's own `PERFORMANCE.md`, in "Lead 1" this time: a much earlier investigation already found
+NO relationship between `io_uring` queue depth and achieved bandwidth on this drive once genuinely
+disk-bound ("rounds with just 1-3 misses averaged 3.47 GB/s, rounds with 26+ misses averaged the
+same 3.47 GB/s") — this drive is already saturated at small queue depths, so submitting more reads
+per round doesn't unlock more throughput. The earlier capacity 4→7 win (see above) came from the
+higher HIT RATE (fewer real disk reads needed at all), not from bigger rounds.
+
+**Kept anyway, unlike the read-consolidation attempt**: `io_batch_size` defaults to matching
+`capacity` exactly, so every existing caller (and every other version's own measurements on this
+page) is completely unaffected unless `--io-batch-size` is passed explicitly — zero regression
+risk for a feature that happened not to help on THIS drive/checkpoint. Real, tested, working
+infrastructure that might pay off on different hardware (a drive that DOES reward deeper queues,
+unlike this one) or a future architecture, without costing anything today. 351/351 lib tests,
+clippy clean, release build clean.
+
 ## Tried and didn't help
 
 - **Consolidating each MXFP4 expert's 6 `io_uring` reads (`w1`/`w2`/`w3` × `weight_packed`/
@@ -373,6 +416,142 @@ decode-speed win on top of being safer, not only a safety measure with no perfor
   ones, and a clean isolated micro-benchmark isn't guaranteed to predict this correctly — verify
   end-to-end on the real checkpoint before trusting an isolated probe's direction, not just its
   magnitude.
+
+- **Building a frequency-aware (LFU-style) eviction policy for `ExpertCache`'s ordinary LRU
+  tier** — investigated, not built: rabbit already has a mechanism that does most of this job,
+  `usage_cache`'s pin-candidate system (persisted `.rabbit_usage` history promotes historically hot
+  experts to a never-evicted tier), and every real measurement on this page had been run with
+  `--no-usage-cache` to dodge the `mlock` log-spam bug (now fixed, see "A red herring" above) —
+  meaning this session had never actually measured what the EXISTING mechanism does. Ran the same
+  real test WITH it enabled (the default): hit rate jumped from ~3% to **~15.1%** (9659/63972,
+  ~5× higher), but wall-clock only improved from 283.2s to **270.6s** (~4.5%) for the same 40
+  tokens — a much smaller win than the hit-rate jump alone would suggest, because the dominant
+  remaining cost is genuinely-cold misses (a context this specific never touched before) that no
+  history-based caching, existing or new, can avoid. Building a NEW eviction policy on top would
+  very likely show the same diminishing-returns shape. Recommendation: use the existing
+  `usage_cache` mechanism (the default) in real use rather than routinely disabling it — no new
+  code needed.
+
+- **Raising `--expert-cache` capacity above the RAM-aware auto-clamp (16 vs. the auto value 7)** —
+  real result: **SLOWER, not faster** (307.8s vs. 283.2s for the same 40 tokens), despite a much
+  better hit rate (~30.5%, 19492/63972, vs. ~3%). Tracked memory throughout with `free -h`: NOT a
+  repeat of the earlier swap/OOM story (swap stayed flat, "used" memory stabilized at a safe
+  ~62GB) — instead, `buff/cache` (the OS's own page-cache, not rabbit's) dropped from ~88GB to
+  ~61GB over the same window, as the kernel reclaimed page-cache space to make room for rabbit's
+  own growing resident expert cache. This project's recent measurements have been benefiting
+  heavily from that SAME OS page-cache staying warm across this session's many repeated real runs
+  on the same checkpoint — growing rabbit's OWN cache competes with and shrinks that free benefit,
+  a real trade-off between the two caches for the same physical RAM that a naive "bigger capacity
+  is safer AND faster" assumption misses entirely. At least on this specific machine/workload, the
+  current auto-clamped 7 looks like a genuinely good point, not just a conservative one.
+
+## Where does "compute" actually go? A real, still-open finding
+
+With disk-side tuning (cache size/policy, I/O batch size) exhausted above, the natural next
+question was the OTHER side of the per-token time split: rabbit already has a built-in phase
+profiler (`generate::StepProfile`, feeding the HTTP server's `/profile` dashboard) that was never
+actually printed for the CLI `--prompt` path — `main.rs` was discarding it (`let (text, _pos, n,
+_profile) = ...`). Wired it up (one `eprintln!` after the final token, zero behavior change
+otherwise) to get a real phase breakdown instead of guessing from "100% minus I/O":
+
+**40 tokens, `--expert-cache 7`, real checkpoint, usage cache on (default):**
+
+| Phase | Time | % of total |
+|---|---|---|
+| Attention (MLA/KDA) | 16.0s | 5.9% |
+| Expert wait (pure `io_uring` stall) | 119.8s | 44.3% |
+| **Expert matmul (compute)** | **132.6s** | **49.1%** |
+| lm_head | 0.4s | 0.2% |
+| other/unaccounted | 1.5s | 0.6% |
+
+**Expert matmul compute is now the single largest phase — bigger than disk wait.** This matches
+item 32's original rough estimate ("disk I/O only ~30-40%") with a real number instead of a guess,
+and rules out any further disk-side tuning as the next lever: that side is genuinely spent.
+
+**Is the MXFP4 kernel itself the bottleneck? No — checked directly, and the answer is surprising.**
+Added a benchmark at K3's REAL routed-expert dims (`bench_matmul_mxfp4_k3_dims`,
+`routed_expert_hidden_size=3584` / `moe_intermediate_size=3072`, both from the real
+`config.json`, not the generic `I=O=4096` the existing bench used) — AVX-512: **222.2µs/call**.
+K3 does 16 experts × 3 matmuls (`w1`/`w2`/`w3`) × 92 MoE layers = 4,416 such calls per decode
+token, so the kernel's own ideal throughput predicts **~0.98s/token** of routed-expert compute —
+vs. the **3.315s/token** actually measured (132.6s ÷ 40). Even being generous about the 2 shared
+experts' extra (unquantized, ~20-25% of the routed MAC volume) not being in that 0.98s estimate,
+there's a real, unexplained multi-x gap between "kernel at its best" and "what actually happens."
+
+**Tested the obvious hypothesis (thread-dispatch overhead across ~4,400 tiny rayon calls/token) —
+wrong, but the test revealed something more interesting.** Every `matmul_*` kernel parallelizes
+over output rows via rayon's global pool; forced it down to 1 thread
+(`RAYON_NUM_THREADS=1`, zero code changes) and re-ran 15 real tokens:
+
+| | 12 threads (default) | 1 thread |
+|---|---|---|
+| Expert matmul (compute) | 3.315s/token | 3.953s/token |
+
+Only **~19% slower with 1/12th the threads** — if this were genuinely FLOP-bound, dropping from
+12 to 1 thread should cost roughly 8-12x, not 19%. **The 12 threads are barely buying anything.**
+Working hypothesis, not yet confirmed: the isolated kernel bench reuses the SAME `data`/
+`block_scale`/`x` buffers across 100+ iterations (warm in L1/L2 after the first pass) — but every
+real expert's bytes just arrived fresh off disk via `io_uring` and are genuinely cold in cache the
+first time the matmul touches them. If the real cost is DRAM latency/bandwidth filling the cache
+for data touched exactly once, more CPU threads competing for the same memory bus wouldn't help
+much — which is exactly what was measured. This would mean "compute" is really a THIRD, previously
+invisible cost layer (cold-cache fill for freshly streamed weights), distinct from both `io_uring`
+disk wait and actual FLOPs — and would mean further SIMD/kernel tuning (the kernel is already
+demonstrably fast, per the bench above) is not the right next lever either.
+
+**Confirmed with a direct test.** Added `bench_matmul_mxfp4_k3_dims_cold`: same call, same real K3
+dims, but `iter_batched`'s untimed setup reads a 64MiB scratch buffer (bigger than this machine's
+combined L2+L3, ~36MiB) before every timed call, evicting `data`/`block_scale`/`x`/`y` from cache
+first — simulating a real expert's just-arrived, never-touched-before bytes instead of the plain
+bench's warm-buffer-reused-100-times pattern. Result: **470.7µs/call cold vs. 222.2µs/call warm —
+~2.1x slower**, a real, substantial, directly-measured cache effect, not a guess.
+
+Redoing the per-token estimate with the COLD number: 4,416 calls/token × 470.7µs = **2.08s/token**
+of routed-expert compute (cold), vs. the plain-warm estimate's 0.98s/token — already closes most
+of the earlier gap against the measured 3.315s/token (blended routed+shared). The 2 shared experts
+(unquantized, so a larger per-element footprint than 4-bit-packed MXFP4, and just as cold in cache)
+plausibly account for the small remainder, though that side wasn't separately benched this session.
+
+**Conclusion: "expert matmul (compute)" is mostly a cold-cache DRAM-fill cost, not a FLOPs or
+thread-scheduling problem.** This rules out BOTH further SIMD/kernel micro-optimization (already
+demonstrably fast when warm) AND rayon-threading changes as the next lever — a genuinely different
+kind of cost than either.
+
+**Tested the natural next idea (software prefetch) directly — it made things WORSE, not
+better, which is itself informative.** `bench_matmul_mxfp4_k3_dims_prefetched`: prefetch
+(`_mm_prefetch`) the target expert's `data`/`block_scale` as soon as they're "known" (simulating
+right after its `io_uring` read lands), then run one FULL `matmul_mxfp4_avx512` call against a
+different, already-warm buffer (simulating overlapping with another expert's compute — exactly
+what the earlier "per-expert early drain" mechanism already does), THEN time the real matmul on
+the (hopefully now-warm) prefetched buffer:
+
+| | time/call |
+|---|---|
+| Cold, no prefetch | 470.7µs |
+| Prefetched + one overlapping matmul | **578.8µs — worse** |
+
+Two explanations, both pointing the same direction: (1) all 12 threads already saturate memory
+bandwidth during any single `matmul_mxfp4` call (rayon parallelizes every call across every core),
+so a prefetch competing for that same already-full pipe doesn't get ahead — it just adds
+contention; and/or (2) the "overlapping work" itself (a whole matmul touching ~5.5MB, comparable to
+this machine's per-core L2 and a meaningful fraction of total L3) evicts the just-prefetched lines
+before they're used — prefetching one full expert ahead is too coarse a distance for a cache this
+size. **Both explanations lead to the same practical conclusion: this specific software lever
+doesn't help, and finer-grained prefetch-distance tuning would be chasing diminishing, uncertain
+returns on a cost that increasingly looks like a genuine, physical memory-bandwidth limit** — not
+something rabbit's code can address further with the CPU-only, single-machine architecture it has
+today.
+
+**Where this leaves K3 performance overall**: disk I/O (44%) is at its measured limit (see the
+"Tried and didn't help" section above — every disk-side lever tested there was neutral or harmful),
+and "compute" (49%) is mostly memory-bandwidth-bound DRAM traffic for weights that are used exactly
+once per token and must be freshly pulled from disk-then-RAM every time. **Nearly all of K3's
+decode time is now bottlenecked by data movement, not by anything rabbit's own code is doing
+inefficiently** — a meaningfully different, and more final-feeling, conclusion than earlier
+sessions' "there's probably more low-hanging fruit" framing. Any further large win would likely
+need reducing how much data must move per token (better long-run cache hit rates — already
+explored, see "Tried and didn't help" — or a smaller-than-4-bit format, which risks real quality
+loss) rather than more clever scheduling of the movement that already happens.
 
 ## Reproducing these numbers
 

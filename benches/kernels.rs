@@ -11,7 +11,7 @@
 //! is 12288-ish territory; 4096 sits in the same order of magnitude without skewing the
 //! benchmark toward an unrealistically huge single dot product).
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar, matmul_mxfp4_scalar};
 #[cfg(target_arch = "x86_64")]
 use rabbit::kernels::{
@@ -238,12 +238,173 @@ fn bench_matmul_mxfp4(c: &mut Criterion) {
     group.finish();
 }
 
+/// `matmul_mxfp4` at K3's REAL routed-expert dims (the real checkpoint's `text_config`:
+/// `routed_expert_hidden_size=3584`, `moe_intermediate_size=3072` — every routed expert's
+/// `w1`/`w3` is `[3072,3584]`, `w2` is `[3072,3584]` too once transposed for the down
+/// direction, same MAC count either way), not the generic `I=O=4096` above — lets a real
+/// per-token compute-time estimate (`n_calls * this` vs. the measured `expert_matmul_s` phase
+/// in `PERFORMANCE_KIMI_K3.md`) be computed directly instead of scaled/guessed.
+fn bench_matmul_mxfp4_k3_dims(c: &mut Criterion) {
+    const KI: usize = 3584;
+    const KO: usize = 3072;
+    let x = random_i8(KI, 14).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let data = random_bytes(KO * KI.div_ceil(2), 15);
+    let bpr = KI.div_ceil(32);
+    let block_scale: Vec<u8> = (0..KO * bpr).map(|k| 120 + (k % 15) as u8).collect();
+    let mut y = vec![0f32; KO];
+    let mut group = c.benchmark_group("matmul_mxfp4_k3_dims");
+
+    group.bench_function("scalar", |b| {
+        b.iter(|| matmul_mxfp4_scalar(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, KI, KO))
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        group.bench_function("avx2", |b| {
+            b.iter(|| unsafe {
+                matmul_mxfp4_avx2(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, KI, KO)
+            })
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        group.bench_function("avx512", |b| {
+            b.iter(|| unsafe {
+                matmul_mxfp4_avx512(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, KI, KO)
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// Same call as `bench_matmul_mxfp4_k3_dims`'s `avx512` case, but with `data`/`block_scale`/`x`/
+/// `y` forced COLD in cache before every timed call, via `iter_batched`'s untimed setup reading a
+/// 64MiB scratch buffer (bigger than this machine's combined L2+L3, ~36MiB) to evict everything
+/// else. The plain bench above reuses the same buffers across 100+ back-to-back iterations —
+/// warm in L1/L2 after the first pass — but a REAL expert's bytes just arrived off disk via
+/// `io_uring` and are genuinely cold the first (and only) time the matmul touches them per token.
+/// Exists to directly test a real, still-open hypothesis from `PERFORMANCE_KIMI_K3.md` ("Where
+/// does compute actually go?"): that the measured real-checkpoint compute time
+/// (~751µs/call average) is dominated by cold-cache DRAM fill, not FLOPs — if so, this bench
+/// should land close to that real number instead of the warm bench's 222µs.
+fn bench_matmul_mxfp4_k3_dims_cold(c: &mut Criterion) {
+    const KI: usize = 3584;
+    const KO: usize = 3072;
+    let x = random_i8(KI, 16).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let data = random_bytes(KO * KI.div_ceil(2), 17);
+    let bpr = KI.div_ceil(32);
+    let block_scale: Vec<u8> = (0..KO * bpr).map(|k| 120 + (k % 15) as u8).collect();
+    let mut y = vec![0f32; KO];
+    let evict = random_bytes(64 * 1024 * 1024, 18);
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        let mut group = c.benchmark_group("matmul_mxfp4_k3_dims_cold");
+        group.sample_size(30);
+        group.bench_function("avx512", |b| {
+            b.iter_batched(
+                || {
+                    let sum: u64 = evict.iter().step_by(64).map(|&v| v as u64).sum();
+                    black_box(sum);
+                },
+                |_| unsafe {
+                    matmul_mxfp4_avx512(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, KI, KO)
+                },
+                BatchSize::PerIteration,
+            )
+        });
+        group.finish();
+    }
+}
+
+/// One cache line (64B) per `_mm_prefetch(_MM_HINT_T0)` — issuing a prefetch for every line of
+/// `buf` doesn't wait for any of them to land; it just tells the memory subsystem to start
+/// pulling them in while the CPU goes on to do something else, which is the whole point of the
+/// bench below.
+#[cfg(target_arch = "x86_64")]
+unsafe fn prefetch_all(buf: &[u8]) {
+    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    let mut i = 0;
+    while i < buf.len() {
+        unsafe { _mm_prefetch(buf.as_ptr().add(i) as *const i8, _MM_HINT_T0) };
+        i += 64;
+    }
+}
+
+/// Tests the ceiling of the "software prefetch" idea from `PERFORMANCE_KIMI_K3.md`'s "Where does
+/// compute actually go?": if an expert's `data`/`block_scale` are prefetched as soon as they're
+/// known (e.g. right when its `io_uring` read lands) and something else useful runs while the
+/// prefetch is in flight (e.g. another expert's matmul — simulated here by `filler`, a real
+/// `matmul_mxfp4_avx512` call against an already-warm buffer of the same size), does the TIMED
+/// call recover most of the cold penalty measured by the `_cold` bench above (470.7µs), landing
+/// back near the warm bench's 222.2µs? If yes, prefetch-ahead is worth building into
+/// `expert_cache.rs`'s real dispatch; if the timed call is still close to 470.7µs, memory
+/// bandwidth (not latency) is the real limit and prefetching earlier wouldn't help — the
+/// `filler` call competes for the same bandwidth as the real hardware would while a prefetch is
+/// in flight, so this isn't just an optimistic best case.
+fn bench_matmul_mxfp4_k3_dims_prefetched(c: &mut Criterion) {
+    const KI: usize = 3584;
+    const KO: usize = 3072;
+    let x = random_i8(KI, 19).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let data = random_bytes(KO * KI.div_ceil(2), 20);
+    let bpr = KI.div_ceil(32);
+    let block_scale: Vec<u8> = (0..KO * bpr).map(|k| 120 + (k % 15) as u8).collect();
+    let mut y = vec![0f32; KO];
+    let evict = random_bytes(64 * 1024 * 1024, 21);
+
+    // The "other expert" whose compute is meant to overlap with this iteration's prefetch —
+    // reused every iteration (deliberately kept warm, like a just-computed neighbor would be
+    // partway through the same batch), so its own cost stays constant and doesn't contaminate
+    // the measurement of how well prefetch hid the TARGET buffer's cold-cache penalty.
+    let filler_x = random_i8(KI, 22).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let filler_data = random_bytes(KO * KI.div_ceil(2), 23);
+    let filler_scale: Vec<u8> = (0..KO * bpr).map(|k| 120 + (k % 15) as u8).collect();
+    let mut filler_y = vec![0f32; KO];
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        let mut group = c.benchmark_group("matmul_mxfp4_k3_dims_prefetched");
+        group.sample_size(30);
+        group.bench_function("avx512", |b| {
+            b.iter_batched(
+                || {
+                    let sum: u64 = evict.iter().step_by(64).map(|&v| v as u64).sum();
+                    black_box(sum);
+                    unsafe {
+                        prefetch_all(&data);
+                        prefetch_all(&block_scale);
+                        matmul_mxfp4_avx512(
+                            black_box(&mut filler_y),
+                            black_box(&filler_x),
+                            black_box(&filler_data),
+                            black_box(&filler_scale),
+                            1,
+                            KI,
+                            KO,
+                        );
+                    }
+                },
+                |_| unsafe {
+                    matmul_mxfp4_avx512(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, KI, KO)
+                },
+                BatchSize::PerIteration,
+            )
+        });
+        group.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_dot_i8i8,
     bench_dot_i4i8,
     bench_matmul_i4,
     bench_matmul_mxfp4,
+    bench_matmul_mxfp4_k3_dims,
+    bench_matmul_mxfp4_k3_dims_cold,
+    bench_matmul_mxfp4_k3_dims_prefetched,
     bench_qt_addrow_i4,
     bench_qt_matvec_rows_i4,
     bench_mla_score_and_vmix

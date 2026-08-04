@@ -221,18 +221,19 @@ mod uring_load {
         }
     }
 
-    /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity:
-    /// `naming.tensor_count()` tensors/expert (3, or 2 for a fused-gate-up checkpoint), plus up
-    /// to one scale-sidecar read per tensor (`.qs` packed scale, FP8 `_scale_inv`, or — always,
-    /// not just "up to", for `KimiK3Mxfp4` — the `.weight_scale` E8M0 sidecar; the three are
-    /// mutually exclusive per tensor, so this sizing is a worst-case upper bound in the first two
-    /// cases and exact in the MXFP4 case) submitted in the SAME batch instead of a synchronous
-    /// pre-read — see `submit_batch`'s doc for why.
+    /// Creates the persistent ring sized for `io_batch_size` experts/round (see
+    /// `ExpertCache::io_batch_size`'s doc — NOT `capacity`, since a round can submit more reads
+    /// than the resident cache holds onto afterward): `naming.tensor_count()` tensors/expert (3,
+    /// or 2 for a fused-gate-up checkpoint), plus up to one scale-sidecar read per tensor (`.qs`
+    /// packed scale, FP8 `_scale_inv`, or — always, not just "up to", for `KimiK3Mxfp4` — the
+    /// `.weight_scale` E8M0 sidecar; the three are mutually exclusive per tensor, so this sizing
+    /// is a worst-case upper bound in the first two cases and exact in the MXFP4 case) submitted
+    /// in the SAME batch instead of a synchronous pre-read — see `submit_batch`'s doc for why.
     /// Returns `None` if `io_uring` isn't usable on this host (the `io_uring_disabled` sysctl, a
     /// seccomp profile blocking the syscalls, ...) — every `submit_batch` call then falls back
     /// to a synchronous load, same as a hard per-call failure would.
-    pub(super) fn new_ring(cache_capacity: usize, naming: ExpertNaming) -> Option<Ring> {
-        Ring::new(cache_capacity * naming.tensor_count() * 2).ok()
+    pub(super) fn new_ring(io_batch_size: usize, naming: ExpertNaming) -> Option<Ring> {
+        Ring::new(io_batch_size * naming.tensor_count() * 2).ok()
     }
 
     /// A batch of expert reads submitted to `ring` but not yet awaited — `complete_batch` must
@@ -620,6 +621,10 @@ pub struct ExpertCache {
     #[cfg(target_os = "linux")]
     ring: Option<uring_load::Ring>,
     naming: ExpertNaming,
+    /// How many experts' reads `moe.rs` submits together in ONE `io_uring` round — see
+    /// `io_batch_size()`'s doc for why this is a SEPARATE concept from `capacity` (resident
+    /// memory) and defaults to matching it.
+    io_batch_size: usize,
 }
 
 impl ExpertCache {
@@ -632,6 +637,24 @@ impl ExpertCache {
         self.capacity
     }
 
+    /// How many experts `moe.rs` should submit together in one `io_uring` round (its own
+    /// `chunk_size`) — a DIFFERENT concept from `capacity`, added 2026-07-29 after a real
+    /// checkpoint measurement showed the two being permanently coupled (the original design: one
+    /// round = one `capacity`-sized chunk) has a real cost once `capacity` gets clamped small for
+    /// memory safety (see `PERFORMANCE_KIMI_K3.md`'s auto-clamp story): a small `capacity` also
+    /// forces small, less-concurrent `io_uring` rounds, and this project's OWN prior investigation
+    /// (`PERFORMANCE.md`'s "Lead 2") found MORE concurrent scattered reads measurably faster on
+    /// this drive, not fewer. Decoupling lets a round submit MORE reads than the resident cache
+    /// can hold onto afterward — correct because `finish_loading_streaming`'s `on_slot` callback
+    /// already consumes each expert's data the moment ITS OWN read lands, strictly BEFORE that
+    /// batch's insertion-and-eviction pass runs (see `finish_loading_streaming`'s body) — so a
+    /// same-batch eviction only means "this expert won't stay cached long," never "its compute
+    /// used stale/missing data." Defaults to `capacity` (today's original coupled behavior)
+    /// unless `for_family_with_io_batch` sets it explicitly — see that constructor's doc.
+    pub fn io_batch_size(&self) -> usize {
+        self.io_batch_size
+    }
+
     pub fn new(capacity: usize) -> ExpertCache {
         Self::for_family(capacity, ExpertNaming::Glm52)
     }
@@ -639,8 +662,18 @@ impl ExpertCache {
     /// Like `new`, but for a checkpoint whose routed experts use a different on-disk
     /// tensor-name convention (see `ExpertNaming`) — e.g. Kimi Linear's
     /// `block_sparse_moe.experts.{eid}.{w1,w2,w3}` instead of GLM-5.2's
-    /// `mlp.experts.{eid}.{gate_proj,up_proj,down_proj}`.
+    /// `mlp.experts.{eid}.{gate_proj,up_proj,down_proj}`. `io_batch_size` defaults to `capacity`
+    /// (coupled, the original behavior) — use `for_family_with_io_batch` to set it independently.
     pub fn for_family(capacity: usize, naming: ExpertNaming) -> ExpertCache {
+        Self::for_family_with_io_batch(capacity, capacity, naming)
+    }
+
+    /// Like `for_family`, but `io_batch_size` (see that method's doc) is set independently of
+    /// `capacity` instead of defaulting to match it — the real entry point `--io-batch-size`
+    /// wires up when explicitly passed; every other caller (tests, examples, `for_family` itself)
+    /// keeps using the coupled default. The `io_uring` ring is sized off `io_batch_size` (it must
+    /// fit whatever `moe.rs` actually submits per round), NOT `capacity`.
+    pub fn for_family_with_io_batch(capacity: usize, io_batch_size: usize, naming: ExpertNaming) -> ExpertCache {
         ExpertCache {
             capacity,
             slots: Vec::new(),
@@ -653,8 +686,9 @@ impl ExpertCache {
             load_nanos: 0,
             io_wait_nanos: 0,
             #[cfg(target_os = "linux")]
-            ring: uring_load::new_ring(capacity, naming),
+            ring: uring_load::new_ring(io_batch_size, naming),
             naming,
+            io_batch_size,
         }
     }
 
@@ -1783,6 +1817,52 @@ mod tests {
         split_cache.finish_loading(pending2, &shards, &cfg, 0, 32).unwrap();
         assert_eq!(split_cache.hits, plain_cache.hits + eids.len() as u64);
         assert_eq!(split_cache.misses, plain_cache.misses);
+    }
+
+    /// The whole point of decoupling `io_batch_size` from `capacity` (2026-07-29): a batch
+    /// bigger than the resident cache must still correctly compute EVERY expert's contribution
+    /// via the streaming `on_slot` callback, even though most of them get evicted again almost
+    /// immediately afterward (capacity far smaller than the batch). Uses `begin_loading`/
+    /// `finish_loading_streaming` directly (the same pair `moe.rs` calls), capturing every
+    /// streamed slot's values via `on_slot` BEFORE any eviction — the same way `moe.rs`'s real
+    /// callback consumes each expert's data the moment it lands.
+    #[test]
+    fn io_batch_size_bigger_than_capacity_still_streams_every_experts_correct_values() {
+        let (n_experts, moe_inter, hidden) = (10, 4, 6);
+        let fixture = build_experts_fixture("rabbit_test_ecache_io_batch_decouple", n_experts, moe_inter, hidden);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(n_experts as i32, moe_inter as i32, hidden as i32);
+        let eids: Vec<usize> = (0..n_experts).collect();
+
+        // capacity=2 (memory-safe, small) but io_batch_size=10 (the whole batch fits one round)
+        // -- decoupled on purpose, unlike `ExpertCache::new`'s coupled default.
+        let mut cache = ExpertCache::for_family_with_io_batch(2, n_experts, ExpertNaming::Glm52);
+        let mut reference = ExpertCache::new(n_experts); // capacity=10: holds all of them, for comparison
+        for &eid in &eids {
+            reference.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
+        }
+
+        let mut streamed = Vec::new();
+        let pending = cache.begin_loading(&shards, &cfg, 0, &eids, 32).unwrap();
+        cache
+            .finish_loading_streaming(pending, &shards, &cfg, 0, 32, |slot| {
+                streamed.push((slot.eid, qt_values(slot.gate()), qt_values(slot.up()), qt_values(&slot.down)));
+            })
+            .unwrap();
+
+        assert_eq!(streamed.len(), n_experts, "every expert's data must stream through on_slot, regardless of resident capacity");
+        for (eid, gate, up, down) in &streamed {
+            let want = reference.get(*eid).unwrap();
+            assert_eq!(gate, &qt_values(want.gate()), "expert {eid} gate_proj");
+            assert_eq!(up, &qt_values(want.up()), "expert {eid} up_proj");
+            assert_eq!(down, &qt_values(&want.down), "expert {eid} down_proj");
+        }
+
+        // AFTER streaming, the resident cache must still respect `capacity` (2), not
+        // `io_batch_size` (10) -- the whole point of keeping the two concepts separate.
+        assert!(cache.len() <= 2, "resident cache must stay within capacity, got {}", cache.len());
+        assert_eq!(cache.io_batch_size(), n_experts);
+        assert_eq!(cache.capacity(), 2);
     }
 
     #[test]

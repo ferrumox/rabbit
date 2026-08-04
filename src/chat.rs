@@ -27,6 +27,16 @@ pub struct LoadArgs {
     /// found this, see `expert_cache::safe_mxfp4_capacity`'s doc). `Some(n)` (`--expert-cache n`)
     /// always wins over this, whatever the risk — never silently overridden.
     pub cache_capacity: Option<usize>,
+    /// `None` = match the resolved `cache_capacity` (today's original coupled behavior — one
+    /// `io_uring` round submits exactly `capacity`-worth of reads). `Some(n)` (`--io-batch-size
+    /// n`) decouples them: `moe.rs` submits `n` experts' reads per round regardless of how many
+    /// stay resident afterward. Added 2026-07-29 after finding a small, memory-safe `capacity`
+    /// (see `cache_capacity`'s own doc) also throttles per-round read concurrency — and this
+    /// project's own `PERFORMANCE.md` ("Lead 2") already found MORE concurrent scattered reads
+    /// measurably faster on this drive, not fewer. See
+    /// `expert_cache::ExpertCache::io_batch_size`'s doc for the full reasoning and why this is
+    /// safe to decouple from `capacity` at all.
+    pub io_batch_size: Option<usize>,
     pub no_usage_cache: bool,
     /// opt-in CACHE_ROUTE (see `moe::RouteConfig`) — off by default, matching colibrì's own
     /// stance, since it's still unmeasured on rabbit's own architecture.
@@ -74,7 +84,8 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
 
     let shards = Shards::open_multi(&shard_dirs)?;
     let cache_capacity = args.cache_capacity.unwrap_or_else(|| model::safe_default_expert_cache_capacity(&model));
-    let mut caches = ExpertCaches::new(&model, cache_capacity);
+    let io_batch_size = args.io_batch_size.unwrap_or(cache_capacity);
+    let mut caches = ExpertCaches::new_with_io_batch(&model, cache_capacity, io_batch_size);
     let usage_cache_enabled = !args.no_usage_cache;
     if usage_cache_enabled {
         let stats = caches.warm_start(&args.model_dir, cache_capacity);

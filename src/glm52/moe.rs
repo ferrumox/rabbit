@@ -380,15 +380,18 @@ pub fn moe(
 
     // Fase 8: resolve cache misses via `ensure_loaded` — on Linux that's one `io_uring`
     // submission per chunk for every miss expert's 3 tensors, instead of the `get_or_load`
-    // loop's `pread`-per-tensor, per-expert. Chunked at `cache.capacity()`: a single
-    // `ensure_loaded` call can't keep more than `capacity` experts resident at once (past
-    // that, its own LRU eviction would reclaim earlier insertions from the SAME call before
-    // this loop gets to read them back), so a batch whose unique-expert count exceeds
-    // capacity — a long prompt's prefill with a high `topk`, easily hundreds of unique ids
-    // across a real 256-expert layer — must be dispatched in capacity-sized groups instead of
-    // one `ensure_loaded(uniq)` call.
+    // loop's `pread`-per-tensor, per-expert. Chunked at `cache.io_batch_size()` (2026-07-29:
+    // a SEPARATE knob from `cache.capacity()`, defaulting to match it — see that method's own
+    // doc for why the two used to be permanently the same number and why that had a real cost).
+    // Correctness doesn't depend on this matching `capacity` at all: every miss expert's
+    // contribution is applied via `finish_loading_streaming`'s `on_slot` callback the MOMENT its
+    // own reads land, strictly BEFORE that batch's insertion-and-eviction pass runs — a batch
+    // bigger than `capacity` just means some of it won't stay cached afterward, never a
+    // stale-data read. Still needs SOME chunking for unbounded batches (a long prompt's prefill
+    // with a high `topk`, easily hundreds of unique ids across a real 256-expert layer) rather
+    // than one `ensure_loaded(uniq)` call for the whole thing.
     let uniq = unique_experts(&routing);
-    let chunk_size = cache.capacity().max(1);
+    let chunk_size = cache.io_batch_size().max(1);
     let mut chunks = uniq.chunks(chunk_size);
 
     // Overlap the FIRST chunk's disk read with the shared expert's compute: the shared expert

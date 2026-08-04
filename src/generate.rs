@@ -59,11 +59,18 @@ pub struct ExpertCaches(Vec<Option<ExpertCache>>);
 
 impl ExpertCaches {
     pub fn new(model: &Model, capacity: usize) -> ExpertCaches {
+        Self::new_with_io_batch(model, capacity, capacity)
+    }
+
+    /// Like `new`, but `io_batch_size` (how many experts' reads `moe.rs` submits per `io_uring`
+    /// round — see `ExpertCache::io_batch_size`'s doc) is set independently of `capacity`
+    /// (resident memory) instead of defaulting to match it.
+    pub fn new_with_io_batch(model: &Model, capacity: usize, io_batch_size: usize) -> ExpertCaches {
         let naming = if model.fused_gate_up { ExpertNaming::Glm52FusedGateUp } else { ExpertNaming::Glm52 };
         let v = model
             .layers
             .iter()
-            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family(capacity, naming)) } else { None })
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family_with_io_batch(capacity, io_batch_size, naming)) } else { None })
             .collect();
         ExpertCaches(v)
     }

@@ -243,10 +243,18 @@ pub fn safe_default_expert_cache_capacity(model: &Model) -> usize {
 
 impl ExpertCaches {
     pub fn new(model: &Model, capacity: usize) -> ExpertCaches {
+        Self::new_with_io_batch(model, capacity, capacity)
+    }
+
+    /// Like `new`, but `io_batch_size` (how many experts' reads `moe.rs` submits per `io_uring`
+    /// round — see `expert_cache::ExpertCache::io_batch_size`'s doc) is set independently of
+    /// `capacity` (resident memory) instead of defaulting to match it. Wired up by `chat.rs`'s
+    /// `--io-batch-size` flag.
+    pub fn new_with_io_batch(model: &Model, capacity: usize, io_batch_size: usize) -> ExpertCaches {
         match model {
-            Model::Glm52(m) => ExpertCaches::Glm52(crate::generate::ExpertCaches::new(m, capacity)),
-            Model::KimiLinear(m) => ExpertCaches::KimiLinear(crate::kimi_linear::generate::ExpertCaches::new(m, capacity)),
-            Model::KimiK3(m) => ExpertCaches::KimiK3(crate::kimi_k3::generate::ExpertCaches::new(m, capacity)),
+            Model::Glm52(m) => ExpertCaches::Glm52(crate::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
+            Model::KimiLinear(m) => ExpertCaches::KimiLinear(crate::kimi_linear::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
+            Model::KimiK3(m) => ExpertCaches::KimiK3(crate::kimi_k3::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
         }
     }
 
