@@ -1,5 +1,8 @@
 # Performance history
 
+**This page covers GLM-5.2 only.** See `PERFORMANCE_KIMI_K3.md` for Kimi K3's own performance
+history — a separate architecture, checkpoint, and set of optimizations.
+
 ## In plain terms
 
 rabbit runs a 744-billion-parameter AI model on a single ordinary computer by keeping most of the

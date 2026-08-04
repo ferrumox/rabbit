@@ -17,6 +17,18 @@
 //! reassociation to worry about — every tier must agree bit-for-bit there, which is exactly
 //! what this module's parity tests check.
 //!
+//! `matmul_mxfp4` (Kimi K3's routed-expert format) got the same AVX2/AVX-512F-BW treatment as
+//! `matmul_i4` once a real checkpoint existed to validate against (2026-07-28): E2M1's 8-point
+//! magnitude table is looked up via `_mm256_permutevar8x32_ps`/`_mm512_permutexvar_ps` (index =
+//! the nibble's low 3 bits, sign = bit 3 XORed into the float's sign bit), then scaled by the
+//! current 32-element block's E8M0 factor, decoded once per block with the existing scalar
+//! `e8m0_decode` rather than vectorized (only `cols/32` of them per row, not `cols`). AVX-512's
+//! 32-lane block happens to exactly match its natural 2x16-lane chunk (same split as
+//! `matmul_i4_avx512`'s dual accumulator), so one block = one loop iteration there; AVX2 walks it
+//! as two 16-lane sub-iterations sharing the same block scale. Profiling the real 2.8T checkpoint
+//! found compute, not disk I/O, dominates decode time (~60-70% of each token) with the scalar
+//! kernel — this is the fix for that.
+//!
 //! `y[S,O] = x[S,I] @ W^T` throughout, `W` given in one of the `QT` formats from `quant.rs`.
 //! The IDOT kernels additionally quantize activations to int8 per row (`qrow_i8`, scalar only
 //! in the original — never vectorized there, so not here either) so the whole dot product
@@ -215,11 +227,24 @@ fn matmul_i2_scalar(y: &mut [f32], x: &[f32], q2: &[u8], scale: &[f32], s: usize
 
 /// y[S,O] = x[S,I] @ W^T, W in OCP-MX FP4 (`QTKind::MxFp4` — see `quant.rs`'s doc): 4-bit E2M1
 /// elements, one E8M0 scale per 32-element block along the row (not per-row, unlike every other
-/// format here). Scalar only for now — correctness first, matching this project's own
-/// established order (see the module doc's history: SIMD tiers arrived after a proven scalar
-/// baseline for every other format too), and there's no real MXFP4 checkpoint to benchmark
-/// against yet regardless (see `rabbit-plan.md`'s Phase 2 entry).
+/// format here). Dispatches AVX-512F/BW > AVX2 > scalar, same tier ladder as `matmul_i4` — added
+/// once the real Kimi K3 checkpoint (routed experts are natively MXFP4) showed compute, not disk
+/// I/O, dominates decode time with the scalar kernel (see `matmul_mxfp4_avx2`/`_avx512`'s docs).
 pub fn matmul_mxfp4(y: &mut [f32], x: &[f32], data: &[u8], block_scale: &[u8], s: usize, i: usize, o: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            return unsafe { matmul_mxfp4_avx512(y, x, data, block_scale, s, i, o) };
+        }
+        if has_avx2() {
+            return unsafe { matmul_mxfp4_avx2(y, x, data, block_scale, s, i, o) };
+        }
+    }
+    matmul_mxfp4_scalar(y, x, data, block_scale, s, i, o)
+}
+
+/// `pub` so `benches/kernels.rs` can compare tiers directly — same reason `matmul_i4_scalar` is.
+pub fn matmul_mxfp4_scalar(y: &mut [f32], x: &[f32], data: &[u8], block_scale: &[u8], s: usize, i: usize, o: usize) {
     let rb = i.div_ceil(2);
     let bpr = i.div_ceil(32);
     with_yt_scratch(o * s, |yt| {
@@ -613,6 +638,164 @@ mod simd {
         }
     }
 
+    /// The 8 non-negative magnitudes `E2M1_MAGNITUDES` (`quant.rs`) holds, register-resident for
+    /// `_mm256_permutevar8x32_ps` (which needs exactly 8 f32 lanes) and duplicated for
+    /// `_mm512_permutexvar_ps` (16 lanes; the top 8 are never selected since indices are always
+    /// `nibble & 7 <= 7`, but the intrinsic still requires a full 16-lane operand).
+    const MXFP4_TABLE8: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+    /// MXFP4-packed weight row (16 elements, i.e. 8 bytes) · f32 activation row -> f32,
+    /// pre-scaled by `sv` (the caller's already-decoded current-block E8M0 factor broadcast to
+    /// all 8 lanes). Factored out of `dot_mxfp4_f32_avx2` so both 8-lane halves of a 16-lane
+    /// unpack share the same magnitude-table-lookup + sign-XOR sequence. `nib32` holds 8 nibble
+    /// values (0..16) in the low byte of each i32 lane, same convention `dot_i4_f32_avx2`'s
+    /// `w0`/`w1` conversion uses.
+    #[target_feature(enable = "avx2")]
+    fn mxfp4_decode8_avx2(nib32: __m256i, table: __m256, sv: __m256) -> __m256 {
+        let idx = _mm256_and_si256(nib32, _mm256_set1_epi32(0x7));
+        let mag = _mm256_permutevar8x32_ps(table, idx);
+        let sign = _mm256_slli_epi32::<28>(_mm256_and_si256(nib32, _mm256_set1_epi32(0x8)));
+        let signed = _mm256_castsi256_ps(_mm256_xor_si256(_mm256_castps_si256(mag), sign));
+        _mm256_mul_ps(signed, sv)
+    }
+
+    /// OCP-MX FP4 weight row (`QTKind::MxFp4`: 4-bit E2M1 nibbles + one E8M0 byte per 32-element
+    /// block) · f32 activation row -> f32. `n` = logical (unpacked) length; `bs` = this row's
+    /// block-scale bytes (`ceil(n/32)` of them). The E8M0 factor is decoded once per 32-element
+    /// block via the plain scalar `e8m0_decode` (cheap — only `n/32` calls total, not `n`) and
+    /// baked into the weight vector before the FMA, so the running accumulator never needs a
+    /// separate per-block rescale step.
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_mxfp4_f32_avx2(w: &[u8], bs: &[u8], xs: &[f32], n: usize) -> f32 {
+        unsafe {
+            let m4 = _mm_set1_epi8(0x0F);
+            let table = _mm256_loadu_ps(MXFP4_TABLE8.as_ptr());
+            let mut acc = _mm256_setzero_ps();
+            let mut i = 0;
+            while i + 16 <= n {
+                let sv = _mm256_set1_ps(e8m0_decode(bs[i / 32]));
+                let by = _mm_loadl_epi64(w.as_ptr().add(i >> 1) as *const __m128i);
+                let lo = _mm_and_si128(by, m4);
+                let hi = _mm_and_si128(_mm_srli_epi16::<4>(by), m4);
+                let nib = _mm_unpacklo_epi8(lo, hi);
+                let w_lo = mxfp4_decode8_avx2(_mm256_cvtepu8_epi32(nib), table, sv);
+                let w_hi = mxfp4_decode8_avx2(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(nib)), table, sv);
+                acc = _mm256_fmadd_ps(_mm256_loadu_ps(xs.as_ptr().add(i)), w_lo, acc);
+                acc = _mm256_fmadd_ps(_mm256_loadu_ps(xs.as_ptr().add(i + 8)), w_hi, acc);
+                i += 16;
+            }
+            let mut a = hsum256(acc);
+            while i < n {
+                let byte = w[i >> 1];
+                let nibble = if i & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                a += xs[i] * e2m1_decode(nibble) * e8m0_decode(bs[i / 32]);
+                i += 1;
+            }
+            a
+        }
+    }
+
+    /// OCP-MX FP4 weight row · f32 activation row -> f32, AVX-512F/BW dual-accumulator tier —
+    /// same `acc0`/`acc1` split as `dot_i4_f32_avx512`, except here the 32-element chunk IS one
+    /// full MXFP4 block, so both halves share exactly one E8M0 decode per iteration instead of
+    /// needing per-half bookkeeping.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn dot_mxfp4_f32_avx512(w: &[u8], bs: &[u8], xs: &[f32], n: usize) -> f32 {
+        unsafe {
+            let m4 = _mm_set1_epi8(0x0F);
+            let idx_mask = _mm512_set1_epi32(0x7);
+            let sign_mask = _mm512_set1_epi32(0x8);
+            let table16 = [
+                MXFP4_TABLE8[0], MXFP4_TABLE8[1], MXFP4_TABLE8[2], MXFP4_TABLE8[3],
+                MXFP4_TABLE8[4], MXFP4_TABLE8[5], MXFP4_TABLE8[6], MXFP4_TABLE8[7],
+                MXFP4_TABLE8[0], MXFP4_TABLE8[1], MXFP4_TABLE8[2], MXFP4_TABLE8[3],
+                MXFP4_TABLE8[4], MXFP4_TABLE8[5], MXFP4_TABLE8[6], MXFP4_TABLE8[7],
+            ];
+            let table = _mm512_loadu_ps(table16.as_ptr());
+            let mut acc0 = _mm512_setzero_ps();
+            let mut acc1 = _mm512_setzero_ps();
+            let mut i = 0;
+            while i + 32 <= n {
+                let sv = _mm512_set1_ps(e8m0_decode(bs[i / 32]));
+                let by = _mm_loadu_si128(w.as_ptr().add(i >> 1) as *const __m128i);
+                let lo = _mm_and_si128(by, m4);
+                let hi = _mm_and_si128(_mm_srli_epi16::<4>(by), m4);
+                let n0 = _mm512_cvtepu8_epi32(_mm_unpacklo_epi8(lo, hi));
+                let n1 = _mm512_cvtepu8_epi32(_mm_unpackhi_epi8(lo, hi));
+
+                let idx0 = _mm512_and_si512(n0, idx_mask);
+                let mag0 = _mm512_permutexvar_ps(idx0, table);
+                let sign0 = _mm512_slli_epi32::<28>(_mm512_and_si512(n0, sign_mask));
+                let w0 = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(mag0), sign0)), sv);
+
+                let idx1 = _mm512_and_si512(n1, idx_mask);
+                let mag1 = _mm512_permutexvar_ps(idx1, table);
+                let sign1 = _mm512_slli_epi32::<28>(_mm512_and_si512(n1, sign_mask));
+                let w1 = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(mag1), sign1)), sv);
+
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(xs.as_ptr().add(i)), w0, acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(xs.as_ptr().add(i + 16)), w1, acc1);
+                i += 32;
+            }
+            let mut a = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+            while i < n {
+                let byte = w[i >> 1];
+                let nibble = if i & 1 == 0 { byte & 0xF } else { byte >> 4 };
+                a += xs[i] * e2m1_decode(nibble) * e8m0_decode(bs[i / 32]);
+                i += 1;
+            }
+            a
+        }
+    }
+
+    /// y[S,O] = x[S,I] @ W^T, W in OCP-MX FP4 (`QTKind::MxFp4`), AVX2 tier — walks each
+    /// 32-element block as two 16-lane sub-iterations of `dot_mxfp4_f32_avx2`.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx2")`. `x` must have length >=
+    /// `s*i`, `data` length >= `o*ceil(i/2)`, `block_scale` length >= `o*ceil(i/32)`, `y` length
+    /// >= `s*o`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn matmul_mxfp4_avx2(y: &mut [f32], x: &[f32], data: &[u8], block_scale: &[u8], s: usize, i: usize, o: usize) {
+        let rb = i.div_ceil(2);
+        let bpr = i.div_ceil(32);
+        with_yt_scratch(o * s, |yt| {
+            yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+                let w = &data[oi * rb..(oi + 1) * rb];
+                let bs = &block_scale[oi * bpr..(oi + 1) * bpr];
+                for (si, slot) in row.iter_mut().enumerate() {
+                    let xs = &x[si * i..(si + 1) * i];
+                    *slot = unsafe { dot_mxfp4_f32_avx2(w, bs, xs, i) };
+                }
+            });
+            transpose_so(y, yt, s, o);
+        });
+    }
+
+    /// y[S,O] = x[S,I] @ W^T, W in OCP-MX FP4, AVX-512F/BW dual-accumulator tier — one loop
+    /// iteration per 32-element block, matching `matmul_i4_avx512`'s chunking exactly.
+    ///
+    /// # Safety
+    /// Caller must have verified `is_x86_feature_detected!("avx512f")` and `"avx512bw"`. `x`
+    /// must have length >= `s*i`, `data` length >= `o*ceil(i/2)`, `block_scale` length >=
+    /// `o*ceil(i/32)`, `y` length >= `s*o`.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub unsafe fn matmul_mxfp4_avx512(y: &mut [f32], x: &[f32], data: &[u8], block_scale: &[u8], s: usize, i: usize, o: usize) {
+        let rb = i.div_ceil(2);
+        let bpr = i.div_ceil(32);
+        with_yt_scratch(o * s, |yt| {
+            yt.par_chunks_mut(s).enumerate().for_each(|(oi, row)| {
+                let w = &data[oi * rb..(oi + 1) * rb];
+                let bs = &block_scale[oi * bpr..(oi + 1) * bpr];
+                for (si, slot) in row.iter_mut().enumerate() {
+                    let xs = &x[si * i..(si + 1) * i];
+                    *slot = unsafe { dot_mxfp4_f32_avx512(w, bs, xs, i) };
+                }
+            });
+            transpose_so(y, yt, s, o);
+        });
+    }
+
     /// int2-packed weight row · f32 activation row -> f32. `n` = logical (unpacked) length.
     #[target_feature(enable = "avx2")]
     unsafe fn dot_i2_f32_avx2(w: &[u8], xs: &[f32], n: usize) -> f32 {
@@ -874,7 +1057,7 @@ use simd::*;
 #[cfg(target_arch = "x86_64")]
 pub use simd::{
     axpy_f32_avx2, axpy_i4_f32_avx512, dot_f32_avx2, dot_i4_f32_avx512, dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2,
-    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512,
+    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512, matmul_mxfp4_avx2, matmul_mxfp4_avx512,
 };
 
 // mirrors matmul_q_idot/matmul_i4_idot's C signature 1:1; both are private, single-call-site
@@ -1400,7 +1583,12 @@ mod tests {
         }
         let mut y = vec![0.0f32; s * rows];
         matmul_qt(&mut y, &x, &t, s);
-        assert_eq!(y, expected);
+        // Tolerance, not exact: matmul_qt now dispatches to matmul_mxfp4's AVX2/AVX-512 tiers on
+        // this hardware, which reassociate the sum (per-block partial sums vs. this test's plain
+        // sequential one) — same reasoning as matmul_i4's tiers, see kernels.rs's module doc.
+        for (a, b) in y.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
     }
 
     #[test]
@@ -1703,6 +1891,87 @@ mod tests {
             unsafe { matmul_i4_avx2(&mut y_avx2, &x, &data, &scale, 1, cols, rows) };
             let mut y_avx512 = vec![0.0; rows];
             unsafe { matmul_i4_avx512(&mut y_avx512, &x, &data, &scale, 1, cols, rows) };
+            for (a, b) in y_avx2.iter().zip(&y_avx512) {
+                assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
+            }
+        }
+    }
+
+    /// Extracts the raw `(data, block_scale)` byte buffers from a freshly-filled MXFP4 `QT` —
+    /// shared setup for the three parity tests below.
+    fn mxfp4_fixture(rows: usize, cols: usize, seed: u32) -> (Vec<u8>, Vec<u8>) {
+        let w = random_vec(rows * cols, seed);
+        let mut t = QT::alloc_mxfp4(rows, cols);
+        t.fill(&w);
+        match &t.kind {
+            QTKind::MxFp4 { data, block_scale } => (data.clone(), block_scale.clone()),
+            _ => panic!("expected MxFp4"),
+        }
+    }
+
+    #[test]
+    fn matmul_mxfp4_avx2_matches_scalar_within_tolerance() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP: no AVX2 on this CPU");
+            return;
+        }
+        let rows = 3;
+        // 32 and 65 specifically exercise the block boundary (block size == 32); 16/17 exercise
+        // AVX2's own 16-lane sub-iteration boundary within the first block.
+        for &cols in &[1usize, 7, 16, 17, 32, 33, 65] {
+            let (data, block_scale) = mxfp4_fixture(rows, cols, cols as u32 * 3 + 9);
+            let x = random_vec(cols, cols as u32 * 7 + 10);
+
+            let mut y_scalar = vec![0.0; rows];
+            matmul_mxfp4_scalar(&mut y_scalar, &x, &data, &block_scale, 1, cols, rows);
+            let mut y_avx2 = vec![0.0; rows];
+            unsafe { matmul_mxfp4_avx2(&mut y_avx2, &x, &data, &block_scale, 1, cols, rows) };
+            for (a, b) in y_scalar.iter().zip(&y_avx2) {
+                assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_mxfp4_avx512_matches_scalar_within_tolerance() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")) {
+            eprintln!("SKIP: no AVX-512F/BW on this CPU");
+            return;
+        }
+        let rows = 3;
+        for &cols in &[1usize, 7, 16, 17, 32, 33, 65] {
+            let (data, block_scale) = mxfp4_fixture(rows, cols, cols as u32 * 3 + 9);
+            let x = random_vec(cols, cols as u32 * 7 + 10);
+
+            let mut y_scalar = vec![0.0; rows];
+            matmul_mxfp4_scalar(&mut y_scalar, &x, &data, &block_scale, 1, cols, rows);
+            let mut y_avx512 = vec![0.0; rows];
+            unsafe { matmul_mxfp4_avx512(&mut y_avx512, &x, &data, &block_scale, 1, cols, rows) };
+            for (a, b) in y_scalar.iter().zip(&y_avx512) {
+                assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_mxfp4_avx512_matches_avx2_within_tolerance() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")) {
+            eprintln!("SKIP: no AVX-512F/BW on this CPU");
+            return;
+        }
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP: no AVX2 on this CPU");
+            return;
+        }
+        let rows = 3;
+        for &cols in &[1usize, 7, 16, 17, 32, 33, 65] {
+            let (data, block_scale) = mxfp4_fixture(rows, cols, cols as u32 * 3 + 9);
+            let x = random_vec(cols, cols as u32 * 7 + 10);
+
+            let mut y_avx2 = vec![0.0; rows];
+            unsafe { matmul_mxfp4_avx2(&mut y_avx2, &x, &data, &block_scale, 1, cols, rows) };
+            let mut y_avx512 = vec![0.0; rows];
+            unsafe { matmul_mxfp4_avx512(&mut y_avx512, &x, &data, &block_scale, 1, cols, rows) };
             for (a, b) in y_avx2.iter().zip(&y_avx512) {
                 assert!((a - b).abs() < 1e-4, "cols={cols}: {a} vs {b}");
             }

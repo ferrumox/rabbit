@@ -12,11 +12,11 @@
 //! benchmark toward an unrealistically huge single dot product).
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar};
+use rabbit::kernels::{axpy_i4_f32_scalar, dot_i4_f32_scalar, dot_i4i8_scalar, dot_i8i8_scalar, matmul_i4_scalar, matmul_mxfp4_scalar};
 #[cfg(target_arch = "x86_64")]
 use rabbit::kernels::{
     axpy_f32_avx2, axpy_i4_f32_avx512, dot_f32_avx2, dot_i4_f32_avx512, dot_i4i8_avx2, dot_i4i8_avx512vnni, dot_i8i8_avx2,
-    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512,
+    dot_i8i8_avx512vnni, matmul_i4_avx2, matmul_i4_avx512, matmul_mxfp4_avx2, matmul_mxfp4_avx512,
 };
 use std::hint::black_box;
 
@@ -199,11 +199,51 @@ fn bench_mla_score_and_vmix(c: &mut Criterion) {
     group.finish();
 }
 
+/// `matmul_mxfp4` (Kimi K3's routed-expert format on real disk) — same tier ladder and
+/// dual-accumulator AVX-512F/BW structure as `matmul_i4` (32-element blocks map exactly onto
+/// its 2x16-lane chunking), see `kernels.rs`'s module doc. `block_scale` bytes are clamped to a
+/// sane E8M0 range (not `0xFF`'s reserved NaN code, not extreme exponents) — real values only
+/// ever come from `choose_block_scale`, and arbitrary/extreme bytes would risk skewing the
+/// timing with denormal/overflow float handling unrelated to the kernel's actual cost.
+fn bench_matmul_mxfp4(c: &mut Criterion) {
+    let x = random_i8(I, 12).iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let data = random_bytes(O * I.div_ceil(2), 13);
+    let bpr = I.div_ceil(32);
+    let block_scale: Vec<u8> = (0..O * bpr).map(|k| 120 + (k % 15) as u8).collect();
+    let mut y = vec![0f32; O];
+    let mut group = c.benchmark_group("matmul_mxfp4");
+
+    group.bench_function("scalar", |b| {
+        b.iter(|| matmul_mxfp4_scalar(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, I, O))
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        group.bench_function("avx2", |b| {
+            b.iter(|| unsafe {
+                matmul_mxfp4_avx2(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, I, O)
+            })
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        group.bench_function("avx512", |b| {
+            b.iter(|| unsafe {
+                matmul_mxfp4_avx512(black_box(&mut y), black_box(&x), black_box(&data), black_box(&block_scale), 1, I, O)
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_dot_i8i8,
     bench_dot_i4i8,
     bench_matmul_i4,
+    bench_matmul_mxfp4,
     bench_qt_addrow_i4,
     bench_qt_matvec_rows_i4,
     bench_mla_score_and_vmix
