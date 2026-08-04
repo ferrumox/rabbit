@@ -224,6 +224,23 @@ impl KvState {
     }
 }
 
+/// `main.rs`'s AUTO `--expert-cache` default (used only when the flag isn't passed explicitly —
+/// see `LoadArgs::cache_capacity`'s doc) — `64` everywhere EXCEPT a real K3 checkpoint (native
+/// MXFP4 routed experts), where that flat default risks OOM at this checkpoint's real scale (see
+/// `expert_cache::safe_mxfp4_capacity`'s doc for the real numbers and the real crash that found
+/// this). An EXPLICIT `--expert-cache N` always wins over this — never silently overridden,
+/// whatever the risk, matching this whole flag's existing "the user's own choice" contract.
+pub fn safe_default_expert_cache_capacity(model: &Model) -> usize {
+    const DEFAULT: usize = 64;
+    match model {
+        Model::KimiK3(m) if m.cfg.mxfp4_experts => {
+            let n_moe_layers = m.layers.iter().filter(|l| matches!(l.ffn, crate::kimi_k3::model::Ffn::Moe(_))).count();
+            crate::expert_cache::safe_mxfp4_capacity(DEFAULT, n_moe_layers, m.cfg.base.moe_inter as usize, m.cfg.base.hidden as usize)
+        }
+        _ => DEFAULT,
+    }
+}
+
 impl ExpertCaches {
     pub fn new(model: &Model, capacity: usize) -> ExpertCaches {
         match model {

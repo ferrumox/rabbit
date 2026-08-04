@@ -118,14 +118,12 @@ impl ExpertNaming {
     }
 
     /// `true` iff this naming's weights are MXFP4-packed on disk (`{name}.weight_packed`/
-    /// `{name}.weight_scale`, read via `qt_load_mxfp4`) rather than a plain `{name}.weight`
-    /// tensor (`qt_load`). Also used by `ExpertCache::for_family` to skip creating the `io_uring`
-    /// ring entirely for this naming — the ring's batching machinery (`uring_load`) only knows
-    /// how to read one tensor per logical weight, not the packed+scale pair MXFP4 needs, so every
-    /// MXFP4 load goes through the plain synchronous path (`submit_batch` already falls back to
-    /// it whenever `ring` is `None`, so this alone is enough — no changes needed inside
-    /// `uring_load` itself). A real, deliberate perf/correctness tradeoff for this session: a
-    /// correct synchronous loader now, `io_uring`-batched MXFP4 is future work.
+    /// `{name}.weight_scale`) rather than a plain `{name}.weight` tensor. Used by `load_expert`'s
+    /// synchronous path to pick `qt_load_mxfp4` over `qt_load`, and by `uring_load::submit_batch`
+    /// to read the packed+scale pair instead of one plain tensor (see `Req::mxfp4_scale`'s doc) —
+    /// `io_uring`-batched MXFP4 used to be out of scope (every load fell back to the plain
+    /// synchronous path) until it was built to close the gap once disk I/O, not compute, became
+    /// the dominant cost per token (see `PERFORMANCE_KIMI_K3.md`).
     fn is_mxfp4(&self) -> bool {
         matches!(self, ExpertNaming::KimiK3Mxfp4)
     }
@@ -164,7 +162,7 @@ impl ExpertNaming {
 
 #[cfg(target_os = "linux")]
 mod uring_load {
-    use super::{Cfg, ExpertNaming, ExpertSlot, GateUp, ModelError, QT};
+    use super::{Cfg, ExpertNaming, ExpertSlot, GateUp, ModelError, QT, mxfp4_from_raw};
     use crate::safetensors::{DType, SafetensorsError, Shards, TensorLocation, dequant_fp8_blockscale};
     use io_uring::{IoUring, opcode, types};
 
@@ -192,6 +190,14 @@ mod uring_load {
         /// correctly instead of falling through to `Shards::decode_f32`'s *unscaled*
         /// per-element FP8 decode.
         fp8_scale: Option<usize>,
+        /// `Some(index into Pending::scale_bufs)` for `ExpertNaming::KimiK3Mxfp4` (mutually
+        /// exclusive with `packed_scale`/`fp8_scale` — MXFP4 is never also `.qs`-packed or raw
+        /// FP8): the `{name}.weight_scale` E8M0 sidecar. Unlike the other two scale kinds, this
+        /// one is NOT decoded to `f32` on completion — it's raw bytes (one E8M0 exponent byte per
+        /// 32-element block), used verbatim by `mxfp4_from_raw`, same as the synchronous
+        /// `qt_load_mxfp4` path. Also unlike the other two, `loc` itself isn't a plain float
+        /// tensor to decode either — it's `{name}.weight_packed`, also used verbatim.
+        mxfp4_scale: Option<usize>,
     }
 
     /// A persistent `io_uring` instance, reused across every `submit_batch` call for as long as
@@ -217,9 +223,11 @@ mod uring_load {
 
     /// Creates the persistent ring for an `ExpertCache` of the given ADT capacity:
     /// `naming.tensor_count()` tensors/expert (3, or 2 for a fused-gate-up checkpoint), plus up
-    /// to one scale-sidecar read per tensor (`.qs` packed scale or FP8 `_scale_inv` — mutually
-    /// exclusive per tensor, so this is a worst-case upper bound, not a typical one) submitted
-    /// in the SAME batch instead of a synchronous pre-read — see `submit_batch`'s doc for why.
+    /// to one scale-sidecar read per tensor (`.qs` packed scale, FP8 `_scale_inv`, or — always,
+    /// not just "up to", for `KimiK3Mxfp4` — the `.weight_scale` E8M0 sidecar; the three are
+    /// mutually exclusive per tensor, so this sizing is a worst-case upper bound in the first two
+    /// cases and exact in the MXFP4 case) submitted in the SAME batch instead of a synchronous
+    /// pre-read — see `submit_batch`'s doc for why.
     /// Returns `None` if `io_uring` isn't usable on this host (the `io_uring_disabled` sysctl, a
     /// seccomp profile blocking the syscalls, ...) — every `submit_batch` call then falls back
     /// to a synchronous load, same as a hard per-call failure would.
@@ -270,6 +278,21 @@ mod uring_load {
         for &eid in misses {
             let specs = naming.tensor_specs(layer, eid, i, d);
             for (name, rows, cols) in &specs {
+                if naming.is_mxfp4() {
+                    // `name` is the BASE name here (see `ExpertNaming::tensor_specs`'s doc) —
+                    // unlike every other naming, there's no plain `{name}` tensor to look up at
+                    // all, and the scale sidecar always exists (not a maybe-present `.qs`/FP8
+                    // check like the branches below).
+                    let packed_name = format!("{name}.weight_packed");
+                    let scale_name = format!("{name}.weight_scale");
+                    let loc = shards.tensor_location(&packed_name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(packed_name)))?;
+                    let sloc = shards.tensor_location(&scale_name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(scale_name)))?;
+                    let mxfp4_scale = Some(scale_locs.len());
+                    scale_locs.push(sloc);
+                    reqs.push(Req { rows: *rows, cols: *cols, loc, packed_scale: None, fp8_scale: None, mxfp4_scale });
+                    continue;
+                }
+
                 let loc = shards.tensor_location(name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(name.clone())))?;
 
                 let mut packed_scale = None;
@@ -283,7 +306,7 @@ mod uring_load {
                     fp8_scale = Some(scale_locs.len());
                     scale_locs.push(sloc);
                 }
-                reqs.push(Req { rows: *rows, cols: *cols, loc, packed_scale, fp8_scale });
+                reqs.push(Req { rows: *rows, cols: *cols, loc, packed_scale, fp8_scale, mxfp4_scale: None });
             }
         }
 
@@ -353,14 +376,17 @@ mod uring_load {
         mut on_slot: impl FnMut(&ExpertSlot),
     ) -> Result<(Vec<ExpertSlot>, u64), std::io::Error> {
         let tensors = naming.tensor_count();
-        let Pending { reqs, mut bufs, scale_bufs, eids } = pending;
+        let Pending { reqs, mut bufs, mut scale_bufs, eids } = pending;
         let total = reqs.len() + scale_bufs.len();
         let n_experts = eids.len();
 
         // `scale_owner[s]` = which expert (index into `eids`) scale-sidecar read `s` belongs
         // to; `needed[e]` = how many of expert `e`'s reads (`tensors` main + 0-`tensors` scale)
-        // must land before it's fully decodable.
+        // must land before it's fully decodable. `is_mxfp4_scale[s]` marks the ones that must
+        // stay raw bytes rather than get decoded to `f32` below (E8M0 exponent bytes, not
+        // IEEE-754 floats — see `Req::mxfp4_scale`'s doc).
         let mut scale_owner = vec![usize::MAX; scale_bufs.len()];
+        let mut is_mxfp4_scale = vec![false; scale_bufs.len()];
         let mut needed = vec![tensors; n_experts];
         for (local, req) in reqs.iter().enumerate() {
             let owner = local / tensors;
@@ -371,6 +397,11 @@ mod uring_load {
             if let Some(idx) = req.fp8_scale {
                 scale_owner[idx] = owner;
                 needed[owner] += 1;
+            }
+            if let Some(idx) = req.mxfp4_scale {
+                scale_owner[idx] = owner;
+                needed[owner] += 1;
+                is_mxfp4_scale[idx] = true;
             }
         }
         let mut got = vec![0usize; n_experts];
@@ -409,8 +440,13 @@ mod uring_load {
                         n => return Err(std::io::Error::from_raw_os_error(-n)),
                     }
                     // decode as soon as this specific scale lands (plain byte->f32
-                    // reinterpretation, no I/O left to do) rather than waiting for the round.
-                    scales[sidx] = Shards::decode_f32(buf, DType::F32);
+                    // reinterpretation, no I/O left to do) rather than waiting for the round —
+                    // except MXFP4's E8M0 sidecar, which stays raw bytes (see
+                    // `Req::mxfp4_scale`'s doc); `qt_from_raw` grabs it straight out of
+                    // `scale_bufs` below instead of through `scales`.
+                    if !is_mxfp4_scale[sidx] {
+                        scales[sidx] = Shards::decode_f32(buf, DType::F32);
+                    }
                     owner = scale_owner[sidx];
                 }
 
@@ -423,7 +459,16 @@ mod uring_load {
                     // `Vec<u8>`) instead of `raw.to_vec()`-cloning it — same reasoning as the
                     // buffer-copy fix this replaced (see `PERFORMANCE.md`).
                     let base = owner * tensors;
-                    let mut take = |k: usize| qt_from_raw(std::mem::take(&mut bufs[base + k]), &reqs[base + k], bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()));
+                    let mut take = |k: usize| -> Result<QT, std::io::Error> {
+                        let req = &reqs[base + k];
+                        let raw = std::mem::take(&mut bufs[base + k]);
+                        if let Some(sidx) = req.mxfp4_scale {
+                            let block_scale = std::mem::take(&mut scale_bufs[sidx]);
+                            return mxfp4_from_raw(raw, block_scale, req.rows, req.cols, "expert tensor (weight_packed)", "expert tensor (weight_scale)")
+                                .map_err(|e| std::io::Error::other(e.to_string()));
+                        }
+                        qt_from_raw(raw, req, bits, group_size, &scales).map_err(|e| std::io::Error::other(e.to_string()))
+                    };
                     let slot = if tensors == 2 {
                         let gate_up = take(0)?;
                         let down = take(1)?;
@@ -607,12 +652,8 @@ impl ExpertCache {
             misses: 0,
             load_nanos: 0,
             io_wait_nanos: 0,
-            // MXFP4 naming never gets a ring — `uring_load` only knows how to batch one raw
-            // tensor per logical weight, not the `.weight_packed`+`.weight_scale` pair MXFP4
-            // needs, so every load for this naming must go through the plain synchronous path
-            // (see `ExpertNaming::is_mxfp4`'s doc).
             #[cfg(target_os = "linux")]
-            ring: if naming.is_mxfp4() { None } else { uring_load::new_ring(capacity, naming) },
+            ring: uring_load::new_ring(capacity, naming),
             naming,
         }
     }
@@ -877,6 +918,67 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
     Ok(ExpertSlot { eid, gate_up, down, used })
 }
 
+/// A conservative ceiling on `--expert-cache`'s AUTO default (never applied to an EXPLICIT
+/// `--expert-cache N` — see `crate::model::safe_default_expert_cache_capacity`'s doc for why),
+/// specifically for `ExpertNaming::KimiK3Mxfp4`. Found the hard way (2026-07-28): K3's real
+/// per-expert size (~35MB, `hidden=7168`/`moe_intermediate_size=3072`) is far bigger than
+/// whatever this project's existing `64`-slot-per-layer default was ever validated against, and
+/// K3 has 93 layers — `93 * 64 * 35MB ≈ 209GB` for the ordinary LRU tier ALONE, before even
+/// counting `usage_cache::pin_budget`'s separate, NEVER-evicted tier (up to another `93 * 32 *
+/// 35MB ≈ 104GB` once `confidence` maxes out after enough real generations on the same
+/// checkpoint — see `PERFORMANCE_KIMI_K3.md`'s "A red herring" section). A real `--prompt` run
+/// hit exactly this and got OOM-killed by the kernel (`journalctl -k`: `anon-rss:122899668kB`
+/// right before the kill). 24GB is a deliberately conservative fixed budget (not derived from
+/// this machine's real RAM — this codebase doesn't probe that anywhere else either, and a fixed
+/// constant is simpler/more portable than adding a new OS-query dependency for one heuristic) —
+/// safe on a much smaller machine than the one that hit this bug, while still leaving real
+/// caching benefit (`combined = capacity * n_moe_layers * per_expert_bytes * 1.5`, the `1.5`
+/// accounting for `pin_budget`'s worst case being half of `capacity` at full confidence).
+const SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES: u64 = 24_000_000_000;
+
+/// One MXFP4 expert's real total resident bytes (`w1`+`w2`+`w3`, packed+scale each) at this
+/// checkpoint's real `moe_inter`/`hidden` — shape-only, no disk I/O: builds an empty `QT` of the
+/// right shape and reads its own `resident_bytes()`, the exact same math the real loaded tensors
+/// would report.
+fn mxfp4_expert_bytes(moe_inter: usize, hidden: usize) -> u64 {
+    ExpertNaming::KimiK3Mxfp4
+        .tensor_specs(0, 0, moe_inter, hidden)
+        .iter()
+        .map(|(_, rows, cols)| QT::alloc_mxfp4(*rows, *cols).resident_bytes() as u64)
+        .sum()
+}
+
+/// Clamps `requested` (an AUTO `--expert-cache` default, never an explicit one — see
+/// `SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES`'s doc) so that `n_moe_layers * capacity * 1.5 *
+/// per_expert_bytes` — the LRU tier's own worst case plus `pin_budget`'s worst case on top, the
+/// two tiers this checkpoint's real OOM came from — stays under the fixed safety budget. Prints
+/// one `eprintln!` note when it actually had to lower anything, so a slower-than-expected run is
+/// never a silent surprise.
+pub(crate) fn safe_mxfp4_capacity(requested: usize, n_moe_layers: usize, moe_inter: usize, hidden: usize) -> usize {
+    if n_moe_layers == 0 {
+        return requested;
+    }
+    let per_expert = mxfp4_expert_bytes(moe_inter, hidden);
+    if per_expert == 0 {
+        return requested;
+    }
+    let worst_case_multiplier = n_moe_layers as u64 * per_expert * 3 / 2;
+    let max_capacity = (SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES / worst_case_multiplier.max(1)).max(1) as usize;
+    let clamped = requested.min(max_capacity);
+    if clamped < requested {
+        eprintln!(
+            "expert cache: auto --expert-cache {requested} would risk ~{:.0}GB peak memory on this checkpoint \
+             ({n_moe_layers} MoE layers x ~{:.1}MB/expert, LRU + pinned tiers combined) -- lowered the auto \
+             default to {clamped} to stay under a {:.0}GB safety budget. Pass --expert-cache explicitly to \
+             override this (no clamp applies to an explicit value).",
+            (requested as u64 * worst_case_multiplier) as f64 / 1e9,
+            per_expert as f64 / 1e6,
+            SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES as f64 / 1e9,
+        );
+    }
+    clamped
+}
+
 /// Reads a routed expert's real on-disk MXFP4 tensors directly into a `QTKind::MxFp4` — no
 /// decode/requantize step, since rabbit's own `QTKind::MxFp4` byte layout was confirmed
 /// bit-for-bit identical to the real quantizer's (see `ExpertNaming::KimiK3Mxfp4`'s doc): `data`
@@ -886,18 +988,40 @@ fn qt_load_mxfp4(shards: &Shards, base_name: &str, rows: usize, cols: usize) -> 
     let scale_name = format!("{base_name}.weight_scale");
     let data = shards.read_raw(&packed_name, false).map_err(ModelError::Safetensors)?;
     let block_scale = shards.read_raw(&scale_name, false).map_err(ModelError::Safetensors)?;
+    mxfp4_from_raw(data, block_scale, rows, cols, &packed_name, &scale_name)
+}
 
+/// Shared by `qt_load_mxfp4` (the synchronous path) and `uring_load::complete_batch_streaming`
+/// (the `io_uring` path) — validates `data`/`block_scale`'s byte lengths against the shapes
+/// `weight_packed`/`weight_scale` must have and constructs `QTKind::MxFp4` directly. No float
+/// decode step either way: rabbit's own MXFP4 byte layout already matches the real quantizer's
+/// (see `ExpertNaming::KimiK3Mxfp4`'s doc), so the raw bytes are used verbatim.
+fn mxfp4_from_raw(data: Vec<u8>, block_scale: Vec<u8>, rows: usize, cols: usize, packed_name: &str, scale_name: &str) -> Result<QT, ModelError> {
     let expected_data = rows * cols.div_ceil(2);
     if data.len() != expected_data {
-        return Err(ModelError::ShapeMismatch { name: packed_name, expected: expected_data, got: data.len() });
+        return Err(ModelError::ShapeMismatch { name: packed_name.to_string(), expected: expected_data, got: data.len() });
     }
     let expected_scale = rows * cols.div_ceil(32);
     if block_scale.len() != expected_scale {
-        return Err(ModelError::ShapeMismatch { name: scale_name, expected: expected_scale, got: block_scale.len() });
+        return Err(ModelError::ShapeMismatch { name: scale_name.to_string(), expected: expected_scale, got: block_scale.len() });
     }
 
     Ok(QT { rows, cols, bits: 4, kind: QTKind::MxFp4 { data, block_scale } })
 }
+
+/// `true` once any `mlock` call this process has made has failed — checked/set by
+/// `mlock_best_effort` below. `RLIMIT_MEMLOCK` (the overwhelmingly likely real cause on an
+/// unprivileged process, see that function's doc) doesn't change over a process's lifetime, so a
+/// single failure means every future attempt will fail identically. Found the hard way
+/// (2026-07-28): a real, long session that promotes many experts to `pinned` (which grows over
+/// time as `usage_cache`'s persisted history accumulates across runs) was retrying — and
+/// re-logging — this same doomed syscall thousands of times, real measured overhead that once
+/// erased this same session's `io_uring`-for-MXFP4 win entirely in one A/B (see
+/// `PERFORMANCE_KIMI_K3.md`). `Relaxed` ordering: this is a best-effort perf/log-spam guard, not
+/// a correctness barrier — a handful of redundant syscalls from a benign race right at the first
+/// failure is harmless, unlike `usage`/`pinned`'s own state which is never touched concurrently
+/// anyway (this whole struct is `&mut self`-only, no interior mutability elsewhere).
+static MLOCK_KNOWN_TO_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Best-effort `mlock` on a pinned expert's backing buffers, so the OS can't swap out memory
 /// pinning exists specifically to keep resident — same "unsafe libc call, best-effort, never a
@@ -905,7 +1029,14 @@ fn qt_load_mxfp4(shards: &Shards, base_name: &str, rows: usize, cols: usize) -> 
 /// (commonly `RLIMIT_MEMLOCK` too low for an unprivileged process) is logged once and otherwise
 /// ignored: losing the OS-level guarantee just means a pinned expert *could* get swapped under
 /// real memory pressure, same risk profile as not pinning it at all — not a correctness issue.
+/// Once ANY attempt fails, every later call (this expert's remaining buffers, and every future
+/// expert) short-circuits immediately via `MLOCK_KNOWN_TO_FAIL` — no more syscalls, no more log
+/// lines, for the rest of the process. See that flag's doc for why this is safe to assume.
 fn mlock_best_effort(slot: &ExpertSlot) {
+    use std::sync::atomic::Ordering;
+    if MLOCK_KNOWN_TO_FAIL.load(Ordering::Relaxed) {
+        return;
+    }
     let gate_up_qts: Vec<&QT> = match &slot.gate_up {
         GateUp::Separate { gate, up } => vec![gate, up],
         GateUp::Fused { gate_up } => vec![gate_up],
@@ -925,7 +1056,13 @@ fn mlock_best_effort(slot: &ExpertSlot) {
         };
         for (ptr, len) in bufs {
             if len > 0 && unsafe { libc::mlock(ptr as *const libc::c_void, len) } != 0 {
-                eprintln!("usage cache: mlock failed for a pinned expert (best-effort, continuing): {}", std::io::Error::last_os_error());
+                if !MLOCK_KNOWN_TO_FAIL.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "usage cache: mlock failed for a pinned expert (best-effort, disabling further mlock attempts this process): {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                return;
             }
         }
     }
@@ -936,6 +1073,46 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    // ---- safe_mxfp4_capacity (2026-07-28: a real `--prompt` run got OOM-killed at the flat
+    // `64` default against K3's real per-expert scale — see this function's own doc and
+    // `PERFORMANCE_KIMI_K3.md`'s "A red herring" section for the real numbers) ----
+
+    /// At K3's real real dimensions (`moe_intermediate_size=3072`, `hidden_size=7168`,
+    /// `num_hidden_layers=93`), the flat `64` default must get clamped to something whose
+    /// combined LRU+pinned worst case actually fits the fixed safety budget — fast (no real
+    /// checkpoint, shape-only math), unlike confirming this against the real 1.56TB checkpoint.
+    #[test]
+    fn safe_mxfp4_capacity_clamps_the_flat_default_at_real_k3_scale() {
+        let (moe_inter, hidden, n_moe_layers) = (3072usize, 7168usize, 93usize);
+        let clamped = safe_mxfp4_capacity(64, n_moe_layers, moe_inter, hidden);
+        assert!(clamped < 64, "the flat default must actually get lowered at K3's real scale, got {clamped}");
+        assert!(clamped >= 1, "must never clamp to 0 and silently disable caching entirely");
+
+        let per_expert = mxfp4_expert_bytes(moe_inter, hidden);
+        let combined_worst_case = n_moe_layers as u64 * clamped as u64 * per_expert * 3 / 2;
+        assert!(
+            combined_worst_case <= SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES,
+            "clamped capacity {clamped} still risks {combined_worst_case} bytes, over the {SAFE_MXFP4_AUTO_CACHE_BUDGET_BYTES} byte budget"
+        );
+    }
+
+    /// A request that's already safe at this checkpoint's scale (e.g. a small synthetic test
+    /// fixture, or a deliberately conservative `--expert-cache`) must pass through unchanged —
+    /// this function only ever lowers, never raises, and never interferes when there's nothing
+    /// to protect against.
+    #[test]
+    fn safe_mxfp4_capacity_does_not_touch_an_already_safe_request() {
+        assert_eq!(safe_mxfp4_capacity(2, 93, 3072, 7168), 2);
+        assert_eq!(safe_mxfp4_capacity(8, 1, 16, 16), 8, "tiny synthetic shapes: nowhere near the budget");
+    }
+
+    /// `n_moe_layers == 0` (a checkpoint with no MoE layers at all, or called before any are
+    /// known) must return the request unchanged rather than divide by zero.
+    #[test]
+    fn safe_mxfp4_capacity_handles_zero_moe_layers() {
+        assert_eq!(safe_mxfp4_capacity(64, 0, 3072, 7168), 64);
+    }
 
     struct TempDir(std::path::PathBuf);
     impl TempDir {
@@ -1134,6 +1311,53 @@ mod tests {
     }
 
     const E2M1_TEST_MAGNITUDES: [f32; 7] = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+    /// Like `build_k3_mxfp4_experts_fixture`, but `n_experts` of them, all round-tripped through
+    /// `QT::alloc_mxfp4`/`fill` (no hand-encoded bytes — that byte-order check is already covered
+    /// by `kimi_k3_mxfp4_naming_reads_weight_packed_and_weight_scale_directly`). Used to compare
+    /// the `io_uring` batch path against `get_or_load`'s sequential one across a real MULTI-expert
+    /// batch, the shape `submit_batch`/`complete_batch_streaming`'s MXFP4 branch actually runs at.
+    fn build_k3_mxfp4_multi_experts_fixture(name: &str, n_experts: usize, moe_inter: usize, hidden: usize) -> TempDir {
+        let dir = TempDir::new(name);
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut push_raw = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, shape: Vec<usize>, bytes: Vec<u8>| {
+            let start = data.len() as u64;
+            data.extend_from_slice(&bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": "U8", "shape": shape, "data_offsets": [start, end]}));
+        };
+        let mk = |rows: usize, cols: usize, seed: u32| -> (Vec<u8>, Vec<u8>) {
+            let mut s = seed;
+            let w: Vec<f32> = (0..rows * cols).map(|_| xorshift(&mut s)).collect();
+            let mut t = QT::alloc_mxfp4(rows, cols);
+            t.fill(&w);
+            match t.kind {
+                QTKind::MxFp4 { data, block_scale } => (data, block_scale),
+                _ => unreachable!(),
+            }
+        };
+        for eid in 0..n_experts {
+            let p = |suf: &str| format!("language_model.model.layers.0.block_sparse_moe.experts.{eid}.{suf}");
+            let (w1_packed, w1_scale) = mk(moe_inter, hidden, (eid as u32) * 3 + 1);
+            push_raw(&mut header, format!("{}.weight_packed", p("w1")), vec![moe_inter, hidden], w1_packed);
+            push_raw(&mut header, format!("{}.weight_scale", p("w1")), vec![moe_inter, hidden.div_ceil(32)], w1_scale);
+            let (w3_packed, w3_scale) = mk(moe_inter, hidden, (eid as u32) * 3 + 2);
+            push_raw(&mut header, format!("{}.weight_packed", p("w3")), vec![moe_inter, hidden], w3_packed);
+            push_raw(&mut header, format!("{}.weight_scale", p("w3")), vec![moe_inter, hidden.div_ceil(32)], w3_scale);
+            let (w2_packed, w2_scale) = mk(hidden, moe_inter, (eid as u32) * 3 + 3);
+            push_raw(&mut header, format!("{}.weight_packed", p("w2")), vec![hidden, moe_inter], w2_packed);
+            push_raw(&mut header, format!("{}.weight_scale", p("w2")), vec![hidden, moe_inter.div_ceil(32)], w2_scale);
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+        dir
+    }
 
     fn tiny_cfg(n_experts: i32, moe_inter: i32, hidden: i32) -> Cfg {
         Cfg {
@@ -1402,6 +1626,42 @@ mod tests {
             assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} gate_proj");
             assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} up_proj");
             assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down_proj");
+        }
+    }
+
+    /// Same contract as `ensure_loaded_matches_sequential_get_or_load_values`, but for
+    /// `ExpertNaming::KimiK3Mxfp4` — the whole point of this session's `io_uring` work: before
+    /// this, `ExpertCache::for_family` never even created a ring for this naming (every load fell
+    /// back to sequential), so `ensure_loaded`'s batch path for MXFP4 was previously untested
+    /// because it didn't exist. Proves `submit_batch`/`complete_batch_streaming`'s
+    /// `{name}.weight_packed`+`{name}.weight_scale` handling decodes identically to
+    /// `get_or_load`'s sequential `qt_load_mxfp4` — same real-checkpoint tensor naming, same
+    /// `QTKind::MxFp4` values, across a real multi-expert batch (not just the single-expert,
+    /// hand-encoded-bytes shape check `kimi_k3_mxfp4_naming_reads_weight_packed_and_weight_scale_
+    /// directly` already covers).
+    #[test]
+    fn ensure_loaded_matches_sequential_get_or_load_values_for_mxfp4() {
+        let (n_experts, moe_inter, hidden) = (4, 4, 40); // hidden>32: w1/w3 span 2 blocks/row
+        let fixture = build_k3_mxfp4_multi_experts_fixture("rabbit_test_ecache_mxfp4_uring", n_experts, moe_inter, hidden);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(n_experts as i32, moe_inter as i32, hidden as i32);
+        let eids: Vec<usize> = (0..n_experts).collect();
+
+        let mut batch_cache = ExpertCache::for_family(8, ExpertNaming::KimiK3Mxfp4);
+        batch_cache.ensure_loaded(&shards, &cfg, 0, &eids, 4).unwrap();
+
+        let mut sequential_cache = ExpertCache::for_family(8, ExpertNaming::KimiK3Mxfp4);
+        for &eid in &eids {
+            sequential_cache.get_or_load(&shards, &cfg, 0, eid, 4).unwrap();
+        }
+
+        for &eid in &eids {
+            let a = batch_cache.get(eid).unwrap();
+            let b = sequential_cache.get(eid).unwrap();
+            assert!(matches!(a.gate().kind, QTKind::MxFp4 { .. }), "expert {eid}: io_uring path should still produce QTKind::MxFp4");
+            assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} w1/gate");
+            assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} w3/up");
+            assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} w2/down");
         }
     }
 

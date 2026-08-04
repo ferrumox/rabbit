@@ -30,7 +30,9 @@ struct Args {
     seed: u64,
     dbits: u8,
     ebits: u8,
-    cache_capacity: usize,
+    /// `None` = auto (see `LoadArgs::cache_capacity`'s doc) — `--expert-cache N` overrides it
+    /// explicitly.
+    cache_capacity: Option<usize>,
     session: Option<PathBuf>,
     no_usage_cache: bool,
     cache_route: bool,
@@ -55,7 +57,7 @@ fn parse_args() -> Result<Args, String> {
     let mut seed = 0x9E3779B97F4A7C15u64;
     let mut dbits = 4u8;
     let mut ebits = 4u8;
-    let mut cache_capacity = 64usize;
+    let mut cache_capacity = None;
     let mut session = None;
     let mut no_usage_cache = false;
     let mut cache_route = false;
@@ -80,7 +82,7 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => seed = next("--seed")?.parse().map_err(|e| format!("--seed: {e}"))?,
             "--dbits" => dbits = next("--dbits")?.parse().map_err(|e| format!("--dbits: {e}"))?,
             "--ebits" => ebits = next("--ebits")?.parse().map_err(|e| format!("--ebits: {e}"))?,
-            "--expert-cache" => cache_capacity = next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?,
+            "--expert-cache" => cache_capacity = Some(next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?),
             "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--no-usage-cache" => no_usage_cache = true,
             "--cache-route" => cache_route = true,

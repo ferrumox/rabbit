@@ -21,7 +21,12 @@ pub struct LoadArgs {
     pub seed: u64,
     pub dbits: u8,
     pub ebits: u8,
-    pub cache_capacity: usize,
+    /// `None` = pick a safe default once the model's real architecture/size is known
+    /// (`model::safe_default_expert_cache_capacity`) — `64` for every checkpoint except a real
+    /// K3 one, where that flat default risks OOM at K3's real per-expert scale (a real crash
+    /// found this, see `expert_cache::safe_mxfp4_capacity`'s doc). `Some(n)` (`--expert-cache n`)
+    /// always wins over this, whatever the risk — never silently overridden.
+    pub cache_capacity: Option<usize>,
     pub no_usage_cache: bool,
     /// opt-in CACHE_ROUTE (see `moe::RouteConfig`) — off by default, matching colibrì's own
     /// stance, since it's still unmeasured on rabbit's own architecture.
@@ -68,10 +73,11 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
     let tokenizer = Tokenizer::load(&args.model_dir, &model)?;
 
     let shards = Shards::open_multi(&shard_dirs)?;
-    let mut caches = ExpertCaches::new(&model, args.cache_capacity);
+    let cache_capacity = args.cache_capacity.unwrap_or_else(|| model::safe_default_expert_cache_capacity(&model));
+    let mut caches = ExpertCaches::new(&model, cache_capacity);
     let usage_cache_enabled = !args.no_usage_cache;
     if usage_cache_enabled {
-        let stats = caches.warm_start(&args.model_dir, args.cache_capacity);
+        let stats = caches.warm_start(&args.model_dir, cache_capacity);
         if stats.pin_candidates > 0 {
             eprintln!(
                 "usage cache: {} historical selections, confidence {:.2}, {} pin candidates marked",
