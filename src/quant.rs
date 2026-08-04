@@ -13,6 +13,31 @@
 //! `round_ties_even` here is required for token-exact parity with the C oracle, not a style
 //! preference.
 
+use std::sync::Arc;
+
+/// Backing storage for one packed byte buffer inside `QTKind::MxFp4` — every other `QTKind`
+/// variant still stores a plain owned `Vec<u8>` directly, unchanged. `Owned` behaves exactly
+/// like those plain `Vec<u8>` fields always did; `Mapped` is the opt-in `--mmap-experts` load
+/// path's alternative (see `expert_cache.rs`'s `mmap_load` module and
+/// `safetensors.rs`'s `Shards::tensor_mmap_range`): a shared `mmap` handle plus the byte range
+/// within it holding this buffer's bytes, avoiding the owned allocation + copy entirely.
+/// `as_slice()` erases the distinction for every reader (`QT::row_f32`,
+/// `kernels.rs::matmul_mxfp4`/`qt_addrow`/`qt_matvec_rows`, `expert_cache.rs::mlock_best_effort`,
+/// ...): both variants deref to the exact same bytes an owned buffer would have held.
+pub enum ByteStore {
+    Owned(Vec<u8>),
+    Mapped { mmap: Arc<memmap2::Mmap>, range: std::ops::Range<usize> },
+}
+
+impl ByteStore {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ByteStore::Owned(v) => v.as_slice(),
+            ByteStore::Mapped { mmap, range } => &mmap[range.clone()],
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn lrint(x: f32) -> i32 {
     x.round_ties_even() as i32
@@ -78,8 +103,10 @@ pub enum QTKind {
     /// per 32-element block along the row — NOT a per-row `f32` scale like every other variant
     /// here. See `e2m1_decode`/`e8m0_decode`'s docs for the exact bit layouts (OCP Microscaling
     /// Formats (MX) v1.0 spec). `data.len() == rows * cols.div_ceil(2)`,
-    /// `block_scale.len() == rows * cols.div_ceil(32)`.
-    MxFp4 { data: Vec<u8>, block_scale: Vec<u8> },
+    /// `block_scale.len() == rows * cols.div_ceil(32)`. Stored as `ByteStore` (not a plain
+    /// `Vec<u8>`, unlike every other variant here) so the `--mmap-experts` load path can hold
+    /// mapped byte ranges instead — see `ByteStore`'s own doc.
+    MxFp4 { data: ByteStore, block_scale: ByteStore },
 }
 
 impl QT {
@@ -108,7 +135,36 @@ impl QT {
             rows,
             cols,
             bits: 4,
-            kind: QTKind::MxFp4 { data: vec![0; rows * cols.div_ceil(2)], block_scale: vec![0; rows * cols.div_ceil(32)] },
+            kind: QTKind::MxFp4 {
+                data: ByteStore::Owned(vec![0; rows * cols.div_ceil(2)]),
+                block_scale: ByteStore::Owned(vec![0; rows * cols.div_ceil(32)]),
+            },
+        }
+    }
+
+    /// Builds an MXFP4 `QT` directly from mmap'd byte ranges instead of allocating and filling
+    /// owned buffers — the `--mmap-experts` load path's constructor (see
+    /// `expert_cache.rs`'s `mmap_load` module), parallel to `alloc_mxfp4` + `fill()`'s
+    /// owned-buffer path but skipping the allocation and copy entirely. Performs no validation
+    /// of `data_range`/`scale_range`'s lengths against `rows`/`cols` — callers (`expert_cache.rs`)
+    /// already validate that against the checkpoint's declared shape before calling this, the
+    /// same way `mxfp4_from_raw` does for the owned path.
+    pub fn from_mmap_mxfp4(
+        rows: usize,
+        cols: usize,
+        data_mmap: Arc<memmap2::Mmap>,
+        data_range: std::ops::Range<usize>,
+        scale_mmap: Arc<memmap2::Mmap>,
+        scale_range: std::ops::Range<usize>,
+    ) -> QT {
+        QT {
+            rows,
+            cols,
+            bits: 4,
+            kind: QTKind::MxFp4 {
+                data: ByteStore::Mapped { mmap: data_mmap, range: data_range },
+                block_scale: ByteStore::Mapped { mmap: scale_mmap, range: scale_range },
+            },
         }
     }
 
@@ -139,7 +195,17 @@ impl QT {
                 *data = d;
                 *scale = s;
             }
-            QTKind::MxFp4 { data, block_scale } => pack_mxfp4(w, data, block_scale, self.rows, self.cols),
+            QTKind::MxFp4 { data, block_scale } => {
+                // `fill` quantizes fresh f32 weights into this `QT`'s OWN buffers -- only
+                // meaningful for owned storage. A `Mapped` MXFP4 (the `--mmap-experts` load
+                // path's `from_mmap_mxfp4`) is always constructed already-filled, straight from
+                // the checkpoint's on-disk bytes, and is never mutated afterward -- reaching this
+                // branch on one would be a caller bug, not a real runtime state.
+                let (ByteStore::Owned(d), ByteStore::Owned(bs)) = (data, block_scale) else {
+                    panic!("QT::fill called on a mmap-backed MxFp4 (Mapped storage is filled once at construction, never re-filled)");
+                };
+                pack_mxfp4(w, d, bs, self.rows, self.cols)
+            }
         }
     }
 
@@ -257,6 +323,8 @@ impl QT {
                     .collect()
             }
             QTKind::MxFp4 { data, block_scale } => {
+                let data = data.as_slice();
+                let block_scale = block_scale.as_slice();
                 let rb = cols.div_ceil(2);
                 let bpr = cols.div_ceil(32);
                 let wr = &data[row * rb..(row + 1) * rb];
@@ -909,5 +977,41 @@ mod tests {
         let mxfp4_short = QT::alloc_mxfp4(rows, short_cols).resident_bytes();
         let i4_short = QT::alloc(rows, short_cols, 4, false).resident_bytes();
         assert!(mxfp4_short < i4_short, "mxfp4 {mxfp4_short} should be cheaper than i4 {i4_short} for a short row (few blocks)");
+    }
+
+    /// `--mmap-experts`'s whole premise (see `expert_cache.rs`'s `mmap_load` module and
+    /// `PERFORMANCE_KIMI_K3.md`) rests on `ByteStore::Mapped` dequantizing identically to
+    /// `ByteStore::Owned` holding the exact same bytes — this is that proof, at the `quant.rs`
+    /// level (independent of `safetensors.rs`/`expert_cache.rs`'s own mmap wiring).
+    #[test]
+    fn mxfp4_mapped_byte_store_matches_owned_row_f32() {
+        let rows = 2;
+        let cols = 40; // > 32 -> exercises 2 blocks per row, same shape as the fill/round-trip test above
+        let w = random_matrix(rows, cols, 77);
+        let mut owned = QT::alloc_mxfp4(rows, cols);
+        owned.fill(&w);
+        let (data_bytes, scale_bytes) = match &owned.kind {
+            QTKind::MxFp4 { data, block_scale } => (data.as_slice().to_vec(), block_scale.as_slice().to_vec()),
+            _ => panic!("expected MxFp4"),
+        };
+
+        // Write the exact same bytes to a temp file and mmap it -- the same shape of mapping
+        // `expert_cache.rs`'s `mmap_load` module builds via `Shards::tensor_mmap_range`.
+        let mut path = std::env::temp_dir();
+        path.push(format!("rabbit_test_quant_mxfp4_mmap_{}_{}", std::process::id(), cols));
+        let mut all_bytes = data_bytes.clone();
+        all_bytes.extend_from_slice(&scale_bytes);
+        std::fs::write(&path, &all_bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: `path` is a private, just-written temp file this test alone owns; nothing else
+        // mutates it while mapped (matching the real invariant `safetensors.rs`'s doc documents).
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+        std::fs::remove_file(&path).ok(); // unlinking doesn't invalidate the existing mapping
+
+        let mapped = QT::from_mmap_mxfp4(rows, cols, Arc::clone(&mmap), 0..data_bytes.len(), mmap, data_bytes.len()..all_bytes.len());
+
+        for o in 0..rows {
+            assert_eq!(mapped.row_f32(o), owned.row_f32(o), "row {o}");
+        }
     }
 }

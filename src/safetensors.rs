@@ -1,8 +1,18 @@
 //! Port of `st.h` — indexes and reads tensors from one or more `.safetensors` shards.
 //!
-//! Uses `pread` (via `FileExt::read_at`), never `mmap`: mmap leaves pages resident in the
-//! process, which corrupts peak-RSS accounting — the streaming architecture needs to know
+//! Uses `pread` (via `FileExt::read_at`), never `mmap`, BY DEFAULT: mmap leaves pages resident
+//! in the process, which corrupts peak-RSS accounting — the streaming architecture needs to know
 //! exactly how much RAM it holds so it never trips the OOM killer. See `rabbit-plan.md`.
+//!
+//! The one exception is the opt-in `--mmap-experts` experiment (`Shards::mmap_shard`/
+//! `tensor_mmap_range`/`madvise_willneed` below, off by default): a scoped alternative load path
+//! for `expert_cache.rs`'s ordinary LRU miss path, testing the hypothesis (see
+//! `PERFORMANCE_KIMI_K3.md`) that this project's OWN resident `Vec<u8>` buffers double-cache
+//! against the OS page cache for the same physical pages. Letting the kernel own the one copy
+//! (via `mmap`) instead of also holding a second, rabbit-owned copy is exactly the tradeoff that
+//! makes the RSS accounting above inexact under this flag — `expert_cache.rs`'s
+//! `safe_mxfp4_capacity` doc explains why that's still safe (a conservative upper bound, not
+//! wrong in the unsafe direction).
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,6 +22,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
@@ -205,6 +216,12 @@ pub struct Shards {
     files: Vec<File>,
     tensors: Vec<Tensor>,
     index: HashMap<String, usize>,
+    /// Lazily-created, cached mmap handle per shard file (same indexing as `files`) — only ever
+    /// populated by the opt-in `--mmap-experts` path (`mmap_shard` below); the default `pread`
+    /// path never touches this. `OnceLock` gives cheap, thread-safe, at-most-once mapping without
+    /// needing `&mut self` (`Shards` is normally shared read-only across worker threads via
+    /// `Arc<Shards>`).
+    mmaps: Vec<OnceLock<Arc<memmap2::Mmap>>>,
 }
 
 impl Shards {
@@ -322,7 +339,8 @@ impl Shards {
             files.push(file);
         }
 
-        Ok(Shards { files, tensors, index })
+        let mmaps = files.iter().map(|_| OnceLock::new()).collect();
+        Ok(Shards { files, tensors, index, mmaps })
     }
 
     /// Every indexed tensor across every shard in this `Shards` — the converter's
@@ -472,6 +490,93 @@ impl Shards {
         decode_floats(raw, dtype, &mut out);
         out
     }
+
+    /// Returns (creating on first use) a shared, read-only `mmap` of shard `file_index` — the
+    /// `--mmap-experts` opt-in path's entry point (see this module's top doc). Cheap to call
+    /// repeatedly: the actual `mmap(2)` syscall only happens once per shard per `Shards`
+    /// instance (`OnceLock`), every later call just clones the `Arc`.
+    ///
+    /// # Safety
+    /// `memmap2::Mmap::map` is unsafe because the memory it hands back can become invalid if the
+    /// underlying file is truncated or mutated while mapped (the OS gives no protection against
+    /// that in general). That precondition holds here: every `.safetensors` shard `Shards` opens
+    /// is treated as read-only for the entire process lifetime — never written, truncated, or
+    /// otherwise mutated after `open`/`open_multi` returns (see this module's top doc and
+    /// `rabbit-plan.md`) — the exact same invariant `expert_cache.rs`'s `io_uring` usage already
+    /// leans on for its own unsafe raw-pointer reads. The backing `File` is kept alive in
+    /// `self.files` for as long as `Shards` (and so any `Arc<Mmap>` handed out here) lives.
+    fn mmap_shard(&self, file_index: usize) -> Result<Arc<memmap2::Mmap>, SafetensorsError> {
+        if let Some(m) = self.mmaps[file_index].get() {
+            return Ok(Arc::clone(m));
+        }
+        // SAFETY: see the doc comment above — the shard file is read-only for the process's
+        // entire lifetime, so no writer can ever race this mapping.
+        let mmap = unsafe { memmap2::Mmap::map(&self.files[file_index]) }?;
+        let arc = Arc::new(mmap);
+        // Best-effort cache: if another thread raced us and already set it, just use theirs
+        // (both mappings are equally valid views of the same read-only file, so there's no
+        // correctness difference, only a wasted `mmap` call on the loser — acceptable for a
+        // once-per-shard-per-process event).
+        let _ = self.mmaps[file_index].set(Arc::clone(&arc));
+        Ok(self.mmaps[file_index].get().cloned().unwrap_or(arc))
+    }
+
+    /// Given a tensor name, returns its shard's mmap handle plus the absolute byte range within
+    /// that mapping holding the tensor's raw bytes — the mmap-path counterpart to
+    /// `tensor_location` (which the default `io_uring`/`pread` path uses instead). `Ok(None)` if
+    /// the tensor doesn't exist (matching `tensor_location`'s own `Option` return, not an error —
+    /// callers that need a hard error, like `expert_cache.rs`'s mmap loader, map that themselves).
+    /// `--mmap-experts` only; the default load path never calls this.
+    pub fn tensor_mmap_range(&self, name: &str) -> Result<Option<MmapTensorRange>, SafetensorsError> {
+        let Some(t) = self.find(name) else { return Ok(None) };
+        let mmap = self.mmap_shard(t.file_index)?;
+        let start = t.offset as usize;
+        let end = start + t.nbytes as usize;
+        Ok(Some(MmapTensorRange { mmap, range: start..end }))
+    }
+
+    /// Best-effort `MADV_WILLNEED` hint over `range` within `mmap` — tells the kernel to start
+    /// pulling those pages in from disk in the background, the mmap path's analogue of this
+    /// module's own `posix_fadvise(..., POSIX_FADV_WILLNEED)` (see `prefetch`) and of
+    /// `expert_cache.rs`'s `io_uring` batch submission. A hint only: never blocks, and a failure
+    /// (or the kernel just ignoring it) is silently fine — nothing here is a correctness
+    /// requirement, only a possible latency win. `--mmap-experts` only.
+    ///
+    /// `madvise(2)` requires `addr` to be page-aligned; `range.start` is rounded DOWN to the
+    /// nearest page boundary and the hinted length extended to match (never shrunk — rounding
+    /// the END up too would risk covering unrelated data past a mapping that isn't itself a
+    /// whole number of pages long, so instead `range.end` is clamped to `mmap.len()`).
+    ///
+    /// # Safety
+    /// `addr`/`len` are derived from `range`, clamped to `0..mmap.len()` before the call, so the
+    /// hinted region can never fall outside `mmap`'s own mapping — the one precondition
+    /// `madvise` needs. `madvise` itself only touches kernel page-table bookkeeping for the
+    /// given range; it never reads or writes the mapped bytes, so there is no data race to
+    /// reason about even under concurrent access from other threads.
+    pub fn madvise_willneed(mmap: &memmap2::Mmap, range: std::ops::Range<usize>) {
+        let page = page_size();
+        let end = range.end.min(mmap.len());
+        let start_aligned = (range.start.min(end) / page) * page;
+        if start_aligned >= end {
+            return;
+        }
+        let len = end - start_aligned;
+        // SAFETY: see the doc comment above.
+        unsafe {
+            let ptr = mmap.as_ptr().add(start_aligned) as *mut libc::c_void;
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+    }
+}
+
+/// Page size used to align `madvise_willneed`'s hinted range — this codebase has no existing
+/// `PAGE_SIZE` constant to reuse (checked), so this reads the real value via `sysconf` (correct
+/// even on the rare platform where it isn't 4096), falling back to the near-universal 4096 only
+/// if the syscall itself fails, which it does not on any real Linux/Unix host — defensive only.
+fn page_size() -> usize {
+    // SAFETY: `sysconf` is a pure query with no pointer arguments; always safe to call.
+    let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if sz > 0 { sz as usize } else { 4096 }
 }
 
 /// File descriptor + absolute byte range + dtype for one tensor — see `Shards::tensor_location`.
@@ -481,6 +586,14 @@ pub struct TensorLocation {
     pub offset: u64,
     pub nbytes: u64,
     pub dtype: DType,
+}
+
+/// mmap handle + absolute byte range for one tensor — see `Shards::tensor_mmap_range`, the
+/// `--mmap-experts` opt-in path's counterpart to `TensorLocation` above (which the default
+/// `pread`/`io_uring` path uses instead).
+pub struct MmapTensorRange {
+    pub mmap: Arc<memmap2::Mmap>,
+    pub range: std::ops::Range<usize>,
 }
 
 #[cfg(test)]
@@ -749,6 +862,54 @@ mod tests {
             let expected = if r < 128 { block0_scale } else { block1_scale };
             assert_eq!(v, expected, "row {r}");
         }
+    }
+
+    #[test]
+    fn tensor_mmap_range_bytes_match_read_raw() {
+        let dir = TempDir::new("rabbit_test_st_mmap_range");
+        let shard = build_safetensors(&[
+            ("dense.weight", "F32", vec![2, 3], f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            ("expert.raw", "U8", vec![4], vec![10, 20, 30, 40]),
+        ]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        for name in ["dense.weight", "expert.raw"] {
+            let MmapTensorRange { mmap, range } = shards.tensor_mmap_range(name).unwrap().expect("tensor exists");
+            let via_mmap = &mmap[range];
+            let via_read_raw = shards.read_raw(name, false).unwrap();
+            assert_eq!(via_mmap, via_read_raw.as_slice(), "{name}");
+        }
+
+        assert!(shards.tensor_mmap_range("does.not.exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn mmap_shard_is_cached_across_repeated_lookups() {
+        let dir = TempDir::new("rabbit_test_st_mmap_cache");
+        let shard = build_safetensors(&[("a", "F32", vec![1], f32_bytes(&[1.0]))]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+
+        let mmap1 = shards.tensor_mmap_range("a").unwrap().unwrap().mmap;
+        let mmap2 = shards.tensor_mmap_range("a").unwrap().unwrap().mmap;
+        // same underlying allocation, not just equal bytes -- proves the `OnceLock` cache hit,
+        // not a fresh `mmap(2)` syscall on the second lookup.
+        assert!(Arc::ptr_eq(&mmap1, &mmap2));
+    }
+
+    #[test]
+    fn madvise_willneed_does_not_panic_across_edge_case_ranges() {
+        let dir = TempDir::new("rabbit_test_st_madvise");
+        let shard = build_safetensors(&[("a", "F32", vec![8], f32_bytes(&[0.0; 8]))]);
+        fs::write(dir.0.join("model.safetensors"), shard).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+        let MmapTensorRange { mmap, range } = shards.tensor_mmap_range("a").unwrap().unwrap();
+
+        Shards::madvise_willneed(&mmap, range.clone()); // ordinary, unaligned range
+        Shards::madvise_willneed(&mmap, 0..mmap.len()); // whole mapping
+        Shards::madvise_willneed(&mmap, 0..0); // empty range -- must be a no-op, not a panic
+        Shards::madvise_willneed(&mmap, mmap.len()..mmap.len() + 4096); // past the end -- clamped away
     }
 
     #[test]

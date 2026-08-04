@@ -147,6 +147,27 @@ impl ExpertCaches {
         ExpertCaches(v)
     }
 
+    /// Like `new_with_io_batch`, but also sets the opt-in `--mmap-experts` flag — see
+    /// `crate::generate::ExpertCaches::new_with_io_batch_mmap`'s doc (this is the exact same
+    /// sibling-constructor pattern, ported to Kimi Linear's naming). Kimi Linear checkpoints
+    /// never use `ExpertNaming::KimiK3Mxfp4`, so this flag is currently a no-op for this family
+    /// (see `ExpertCache::begin_loading`'s `naming.is_mxfp4()` gate) — wired up anyway for
+    /// consistency and to keep the CLI flag family-agnostic.
+    pub fn new_with_io_batch_mmap(model: &Model, capacity: usize, io_batch_size: usize, mmap_experts: bool) -> ExpertCaches {
+        let v = model
+            .layers
+            .iter()
+            .map(|l| {
+                if matches!(l.ffn, Ffn::Moe(_)) {
+                    Some(ExpertCache::for_family_with_io_batch_mmap(capacity, io_batch_size, ExpertNaming::KimiLinear, mmap_experts))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ExpertCaches(v)
+    }
+
     /// Summed `hits`/`misses`/`load_nanos` across every MoE layer's cache — see
     /// `crate::generate::ExpertCaches::hit_miss_totals`'s doc.
     pub fn hit_miss_totals(&self) -> (u64, u64, u64) {

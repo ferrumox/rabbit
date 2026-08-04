@@ -47,6 +47,14 @@ pub struct LoadArgs {
     /// `config.json`/tokenizer files still come from `model_dir` alone. Empty by default (every
     /// shard in `model_dir`, matching every version of rabbit before this option existed).
     pub shard_dirs: Vec<PathBuf>,
+    /// Opt-in `--mmap-experts` experiment (default `false`) — routes the ordinary LRU expert
+    /// cache's miss path through an `mmap`-backed load instead of the default owned-buffer
+    /// `pread`/`io_uring` path, for MXFP4 checkpoints only (see
+    /// `expert_cache::ExpertCache::begin_loading`'s mmap branch and `PERFORMANCE_KIMI_K3.md` for
+    /// the double-caching hypothesis this tests). Never affects the pinned tier or the auto
+    /// `--expert-cache` clamp math (see `expert_cache::safe_mxfp4_capacity`'s doc for why that
+    /// stays a safe, if conservative, upper bound under this flag).
+    pub mmap_experts: bool,
 }
 
 pub struct Session {
@@ -85,7 +93,7 @@ pub fn load_session(args: &LoadArgs) -> Result<Session, Box<dyn std::error::Erro
     let shards = Shards::open_multi(&shard_dirs)?;
     let cache_capacity = args.cache_capacity.unwrap_or_else(|| model::safe_default_expert_cache_capacity(&model));
     let io_batch_size = args.io_batch_size.unwrap_or(cache_capacity);
-    let mut caches = ExpertCaches::new_with_io_batch(&model, cache_capacity, io_batch_size);
+    let mut caches = ExpertCaches::new_with_io_batch_mmap(&model, cache_capacity, io_batch_size, args.mmap_experts);
     let usage_cache_enabled = !args.no_usage_cache;
     if usage_cache_enabled {
         let stats = caches.warm_start(&args.model_dir, cache_capacity);

@@ -75,6 +75,22 @@ impl ExpertCaches {
         ExpertCaches(v)
     }
 
+    /// Like `new_with_io_batch`, but also sets the opt-in `--mmap-experts` flag on every layer's
+    /// `ExpertCache` (see `expert_cache::ExpertCache::for_family_with_io_batch_mmap`'s doc). A
+    /// new sibling constructor, not a `new_with_io_batch` parameter, so every existing call site
+    /// (tests, `new_with_io_batch` itself) keeps compiling and behaving unchanged; only
+    /// `model.rs`'s top-level `ExpertCaches::new_with_io_batch_mmap` (in turn only called from
+    /// `chat.rs::load_session`, which reads the real `--mmap-experts` flag) uses this.
+    pub fn new_with_io_batch_mmap(model: &Model, capacity: usize, io_batch_size: usize, mmap_experts: bool) -> ExpertCaches {
+        let naming = if model.fused_gate_up { ExpertNaming::Glm52FusedGateUp } else { ExpertNaming::Glm52 };
+        let v = model
+            .layers
+            .iter()
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family_with_io_batch_mmap(capacity, io_batch_size, naming, mmap_experts)) } else { None })
+            .collect();
+        ExpertCaches(v)
+    }
+
     /// Summed `hits`/`misses`/`load_nanos` across every MoE layer's cache — a coarse signal
     /// for whether generation time is still dominated by disk loads (misses climbing, I/O time
     /// a large share of the step) or has become compute-bound (hits dominating, I/O time small

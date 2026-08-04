@@ -53,7 +53,7 @@
 
 use crate::glm52::config::Cfg;
 use crate::glm52::model::{ModelError, qt_load};
-use crate::quant::{QT, QTKind};
+use crate::quant::{ByteStore, QT, QTKind};
 use crate::safetensors::Shards;
 use std::collections::HashMap;
 
@@ -506,6 +506,82 @@ mod uring_load {
     }
 }
 
+/// The `--mmap-experts` opt-in load path — see `ExpertCache::begin_loading`'s mmap branch (the
+/// only caller) and `safetensors.rs`'s module doc for the double-caching hypothesis this whole
+/// flag exists to test (see `PERFORMANCE_KIMI_K3.md`). Only used for `naming.is_mxfp4()`
+/// checkpoints: `ByteStore::Mapped` (`quant.rs`) currently only exists on `QTKind::MxFp4`, so
+/// this module has no equivalent for the other four quant kinds' plain owned `Vec<u8>` fields.
+///
+/// Unlike `uring_load`, there is no separate "submit" / "wait for completion" split here: a
+/// `QT::from_mmap_mxfp4` slice is valid the instant it's constructed (the mapping already
+/// exists — see `Shards::mmap_shard`), so `load_batch` both issues the (best-effort,
+/// non-blocking) `MADV_WILLNEED` hint AND builds the finished `ExpertSlot`s in one pass, and
+/// `begin_loading` can return `LoadKind::Sync` directly instead of a `LoadKind::Async` that
+/// `finish_loading` would need a new case to await. The kernel faults pages in lazily, on
+/// first real touch by the matmul kernels later, not here — same "the hint is optional, the
+/// data becomes available regardless" contract `posix_fadvise`'s `WILLNEED` already has
+/// elsewhere in this codebase.
+mod mmap_load {
+    use super::{Cfg, ExpertNaming, ExpertSlot, GateUp, ModelError, QT};
+    use crate::safetensors::{MmapTensorRange, SafetensorsError, Shards};
+
+    /// mmap-backed counterpart to `sequential_fallback`/`uring_load::submit_batch` for a whole
+    /// round of misses.
+    pub(super) fn load_batch(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], used: u64, naming: ExpertNaming) -> Result<Vec<ExpertSlot>, ModelError> {
+        let moe_inter = cfg.moe_inter as usize;
+        let hidden = cfg.hidden as usize;
+        misses.iter().map(|&eid| load_one(shards, layer, eid, moe_inter, hidden, used, naming)).collect()
+    }
+
+    /// One expert's `gate`/`up`/`down` MXFP4 tensors, all mmap'd — `naming.is_mxfp4()` (the only
+    /// caller checks this before calling `load_batch` at all) always reads 3 separate tensors,
+    /// never the fused `gate_up_proj` shape (`tensor_count()` is 3 for every MXFP4 naming, 2
+    /// only for `Glm52FusedGateUp`, which isn't MXFP4), so `GateUp::Separate` is always correct
+    /// here.
+    fn load_one(shards: &Shards, layer: usize, eid: usize, moe_inter: usize, hidden: usize, used: u64, naming: ExpertNaming) -> Result<ExpertSlot, ModelError> {
+        let specs = naming.tensor_specs(layer, eid, moe_inter, hidden);
+        let gate = qt_mmap_mxfp4(shards, &specs[0].0, specs[0].1, specs[0].2)?;
+        let up = qt_mmap_mxfp4(shards, &specs[1].0, specs[1].1, specs[1].2)?;
+        let down = qt_mmap_mxfp4(shards, &specs[2].0, specs[2].1, specs[2].2)?;
+        Ok(ExpertSlot { eid, gate_up: GateUp::Separate { gate, up }, down, used })
+    }
+
+    /// Maps `{base_name}.weight_packed`/`{base_name}.weight_scale` (the same pair
+    /// `qt_load_mxfp4`/`mxfp4_from_raw` read into owned buffers) and builds a `QT` directly over
+    /// the mapped byte ranges — no allocation, no `pread`, no `read_raw` copy. Issues a
+    /// best-effort `MADV_WILLNEED` hint for both ranges before returning, mirroring
+    /// `uring_load::submit_batch` kicking off its reads without waiting for them.
+    fn qt_mmap_mxfp4(shards: &Shards, base_name: &str, rows: usize, cols: usize) -> Result<QT, ModelError> {
+        let packed_name = format!("{base_name}.weight_packed");
+        let scale_name = format!("{base_name}.weight_scale");
+        let MmapTensorRange { mmap: data_mmap, range: data_range } = shards
+            .tensor_mmap_range(&packed_name)
+            .map_err(ModelError::Safetensors)?
+            .ok_or_else(|| ModelError::Safetensors(SafetensorsError::MissingTensor(packed_name.clone())))?;
+        let MmapTensorRange { mmap: scale_mmap, range: scale_range } = shards
+            .tensor_mmap_range(&scale_name)
+            .map_err(ModelError::Safetensors)?
+            .ok_or_else(|| ModelError::Safetensors(SafetensorsError::MissingTensor(scale_name.clone())))?;
+
+        // Same shape validation `mxfp4_from_raw` does for the owned path — a mismatched/corrupt
+        // checkpoint deserves a message here too, not a wrong-length slice discovered only once
+        // the matmul kernel reads past the end of it.
+        let expected_data = rows * cols.div_ceil(2);
+        if data_range.len() != expected_data {
+            return Err(ModelError::ShapeMismatch { name: packed_name, expected: expected_data, got: data_range.len() });
+        }
+        let expected_scale = rows * cols.div_ceil(32);
+        if scale_range.len() != expected_scale {
+            return Err(ModelError::ShapeMismatch { name: scale_name, expected: expected_scale, got: scale_range.len() });
+        }
+
+        Shards::madvise_willneed(&data_mmap, data_range.clone());
+        Shards::madvise_willneed(&scale_mmap, scale_range.clone());
+
+        Ok(QT::from_mmap_mxfp4(rows, cols, data_mmap, data_range, scale_mmap, scale_range))
+    }
+}
+
 /// The gate/up half of an expert's FFN weights — either the original two separate tensors, or
 /// (see `bin/fuse_gate_up.rs`) one pre-fused `[2*moe_inter, hidden]` tensor read and matmul'd in
 /// a single shot. `moe.rs`'s `apply_single_expert` matches on this to pick the right compute
@@ -625,6 +701,12 @@ pub struct ExpertCache {
     /// `io_batch_size()`'s doc for why this is a SEPARATE concept from `capacity` (resident
     /// memory) and defaults to matching it.
     io_batch_size: usize,
+    /// `--mmap-experts` opt-in flag (default `false`, off everywhere except through
+    /// `for_family_with_io_batch_mmap`) — see `begin_loading`'s mmap branch and the `mmap_load`
+    /// module below. Only ever changes behavior for `naming.is_mxfp4()` checkpoints (the only
+    /// `QTKind` with a `Mapped` `ByteStore` option, see `quant.rs`); every other naming keeps
+    /// using the existing `io_uring`/sequential-`pread` path regardless of this flag.
+    mmap_experts: bool,
 }
 
 impl ExpertCache {
@@ -689,7 +771,19 @@ impl ExpertCache {
             ring: uring_load::new_ring(io_batch_size, naming),
             naming,
             io_batch_size,
+            mmap_experts: false,
         }
+    }
+
+    /// Like `for_family_with_io_batch`, but also sets the opt-in `--mmap-experts` flag (default
+    /// `false` everywhere else, including every existing test/bench/example call site) — see
+    /// `begin_loading`'s mmap branch and this file's `mmap_load` module for what it changes.
+    /// Added as a NEW constructor rather than a `for_family_with_io_batch` parameter so every
+    /// existing call site keeps compiling — and behaving — completely unchanged; only the one
+    /// production entry point that reads `--mmap-experts` (`chat.rs::load_session`, via each
+    /// model family's own `ExpertCaches::new_with_io_batch_mmap`) needs to call this instead.
+    pub fn for_family_with_io_batch_mmap(capacity: usize, io_batch_size: usize, naming: ExpertNaming, mmap_experts: bool) -> ExpertCache {
+        ExpertCache { mmap_experts, ..Self::for_family_with_io_batch(capacity, io_batch_size, naming) }
     }
 
     pub fn len(&self) -> usize {
@@ -783,6 +877,18 @@ impl ExpertCache {
         // `load_nanos` readings against total wall-clock time, which didn't move the way the
         // I/O counter suggested it should have — see the project memory for the full story.
         let load_t = std::time::Instant::now();
+
+        // `--mmap-experts` opt-in path: bypasses BOTH the `io_uring` branch below and the
+        // sequential-`pread` fallback entirely — see `mmap_load`'s doc for why this can just
+        // return `LoadKind::Sync` (no separate "wait" step the way the io_uring path needs one).
+        // Scoped to `naming.is_mxfp4()` because `ByteStore::Mapped` (see `quant.rs`) only exists
+        // on `QTKind::MxFp4` today; every other naming ignores this flag and keeps using
+        // whichever of the two paths below it always has.
+        if self.mmap_experts && self.naming.is_mxfp4() {
+            let loaded = mmap_load::load_batch(shards, cfg, layer, &misses, self.clock, self.naming)?;
+            self.load_nanos += load_t.elapsed().as_nanos() as u64;
+            return Ok(PendingExpertLoad(LoadKind::Sync(loaded)));
+        }
 
         #[cfg(target_os = "linux")]
         if let Some(pending) = uring_load::submit_batch(&mut self.ring, shards, cfg, layer, &misses, self.naming)? {
@@ -1017,6 +1123,19 @@ fn mxfp4_expert_bytes(moe_inter: usize, hidden: usize) -> u64 {
 /// safety budget (`MXFP4_AUTO_CACHE_BUDGET_FRACTION` of real `MemAvailable`, see that constant's
 /// doc). Prints one `eprintln!` note when it actually had to lower anything, so a
 /// slower-than-expected run is never a silent surprise.
+///
+/// This math is UNCHANGED for `--mmap-experts` (deliberately, in this first experimental cut —
+/// see `PERFORMANCE_KIMI_K3.md`): it still assumes every resident expert costs a full owned
+/// `Vec<u8>` worth of real RAM, same as the default `pread`/`io_uring` path. Under
+/// `--mmap-experts` that's no longer exactly true — a mapped-but-unfaulted page costs nothing
+/// against `MemAvailable` until something actually reads it, and even a faulted-in page is
+/// reclaimable page cache the kernel can drop under pressure, unlike an owned buffer holding an
+/// unconditional allocation. So this clamp becomes a CONSERVATIVE upper bound rather than an
+/// exact one when that flag is on: it may clamp a capacity lower than `--mmap-experts` could
+/// actually support safely, but it can never clamp too HIGH and risk the OOM this function
+/// exists to prevent. Getting the accounting exactly right for the mmap path (e.g. reading
+/// `MADV_WILLNEED`'d-but-not-yet-faulted pages some other way) is left for a follow-up once this
+/// experiment's real A/B numbers justify the extra complexity.
 pub(crate) fn safe_mxfp4_capacity(requested: usize, n_moe_layers: usize, moe_inter: usize, hidden: usize) -> usize {
     let budget = available_memory_bytes()
         .map(|avail| (avail as f64 * MXFP4_AUTO_CACHE_BUDGET_FRACTION) as u64)
@@ -1083,7 +1202,7 @@ fn mxfp4_from_raw(data: Vec<u8>, block_scale: Vec<u8>, rows: usize, cols: usize,
         return Err(ModelError::ShapeMismatch { name: scale_name.to_string(), expected: expected_scale, got: block_scale.len() });
     }
 
-    Ok(QT { rows, cols, bits: 4, kind: QTKind::MxFp4 { data, block_scale } })
+    Ok(QT { rows, cols, bits: 4, kind: QTKind::MxFp4 { data: ByteStore::Owned(data), block_scale: ByteStore::Owned(block_scale) } })
 }
 
 /// `true` once any `mlock` call this process has made has failed — checked/set by
@@ -1128,6 +1247,15 @@ fn mlock_best_effort(slot: &ExpertSlot) {
                 vec![(data.as_ptr(), data.len()), (scale.as_ptr() as *const u8, std::mem::size_of_val(scale.as_slice()))]
             }
             QTKind::MxFp4 { data, block_scale } => {
+                // `as_slice()` erases the `Owned`/`Mapped` distinction (see `ByteStore`'s doc in
+                // `quant.rs`) -- a `Mapped` entry only ever reaches here if it was ALSO a pin
+                // candidate (the `--mmap-experts` LRU miss path and the pinned tier are
+                // orthogonal, see `insert_or_pin`), in which case `mlock`ing its mapped pages is
+                // still the correct thing to do: it faults them in and keeps them resident,
+                // exactly the guarantee pinning is supposed to provide regardless of how the
+                // bytes were originally acquired.
+                let data = data.as_slice();
+                let block_scale = block_scale.as_slice();
                 vec![(data.as_ptr(), data.len()), (block_scale.as_ptr(), block_scale.len())]
             }
         };
@@ -1405,7 +1533,7 @@ mod tests {
             let mut t = QT::alloc_mxfp4(rows, cols);
             t.fill(&w);
             match t.kind {
-                QTKind::MxFp4 { data, block_scale } => (data, block_scale),
+                QTKind::MxFp4 { data, block_scale } => (data.as_slice().to_vec(), block_scale.as_slice().to_vec()),
                 _ => unreachable!(),
             }
         };
@@ -1449,7 +1577,7 @@ mod tests {
             let mut t = QT::alloc_mxfp4(rows, cols);
             t.fill(&w);
             match t.kind {
-                QTKind::MxFp4 { data, block_scale } => (data, block_scale),
+                QTKind::MxFp4 { data, block_scale } => (data.as_slice().to_vec(), block_scale.as_slice().to_vec()),
                 _ => unreachable!(),
             }
         };
@@ -1778,6 +1906,55 @@ mod tests {
             assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} w3/up");
             assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} w2/down");
         }
+    }
+
+    /// `--mmap-experts`'s whole point: `mmap_load::load_batch` (`ExpertCache::begin_loading`'s
+    /// new branch) must decode to the EXACT SAME `QTKind::MxFp4` values as the existing
+    /// `io_uring`/sequential paths do for the identical on-disk bytes — this is that proof, one
+    /// level up from `quant.rs`'s own `mxfp4_mapped_byte_store_matches_owned_row_f32` (which only
+    /// checks `ByteStore::Mapped` in isolation, not the real `Shards`/`ExpertCache` wiring this
+    /// test goes through).
+    #[test]
+    fn mmap_experts_matches_sequential_get_or_load_values_for_mxfp4() {
+        let (n_experts, moe_inter, hidden) = (4, 4, 40); // hidden>32: w1/w3 span 2 blocks/row
+        let fixture = build_k3_mxfp4_multi_experts_fixture("rabbit_test_ecache_mxfp4_mmap", n_experts, moe_inter, hidden);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(n_experts as i32, moe_inter as i32, hidden as i32);
+        let eids: Vec<usize> = (0..n_experts).collect();
+
+        let mut mmap_cache = ExpertCache::for_family_with_io_batch_mmap(8, 8, ExpertNaming::KimiK3Mxfp4, true);
+        mmap_cache.ensure_loaded(&shards, &cfg, 0, &eids, 4).unwrap();
+
+        let mut sequential_cache = ExpertCache::for_family(8, ExpertNaming::KimiK3Mxfp4);
+        for &eid in &eids {
+            sequential_cache.get_or_load(&shards, &cfg, 0, eid, 4).unwrap();
+        }
+
+        for &eid in &eids {
+            let a = mmap_cache.get(eid).unwrap();
+            let b = sequential_cache.get(eid).unwrap();
+            assert!(matches!(a.gate().kind, QTKind::MxFp4 { .. }), "expert {eid}: --mmap-experts path should still produce QTKind::MxFp4");
+            assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} w1/gate");
+            assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} w3/up");
+            assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} w2/down");
+        }
+    }
+
+    /// `mmap_experts: false` (the default `for_family`/`for_family_with_io_batch` constructors
+    /// always set) must NOT change behavior for a `KimiK3Mxfp4` checkpoint — proves
+    /// `begin_loading`'s new mmap branch is genuinely gated (opt-in), not accidentally always-on
+    /// or inverted.
+    #[test]
+    fn mmap_experts_false_still_uses_the_existing_load_path_for_mxfp4() {
+        let (moe_inter, hidden) = (4, 40);
+        let fixture = build_k3_mxfp4_experts_fixture("rabbit_test_ecache_mxfp4_mmap_off", moe_inter, hidden);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(1, moe_inter as i32, hidden as i32);
+
+        let mut cache = ExpertCache::for_family_with_io_batch_mmap(8, 8, ExpertNaming::KimiK3Mxfp4, false);
+        let slot = cache.get_or_load(&shards, &cfg, 0, 0, 4).unwrap();
+        let gate_row0 = slot.gate().row_f32(0);
+        assert_eq!(&gate_row0[0..4], &[1.0, -1.5, 6.0, -0.0], "hand-encoded w1 row 0's first 4 codes, same as the mmap-unaware test");
     }
 
     /// `begin_loading` + `finish_loading` (the split that lets `moe.rs` overlap a chunk's disk

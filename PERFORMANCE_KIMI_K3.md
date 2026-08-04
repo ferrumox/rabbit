@@ -636,6 +636,46 @@ just assumed — the same "verify the indirect signal directly before acting on 
 in both directions: sometimes indirect evidence hides a real bug (this session's `powi` find),
 sometimes it manufactures a fake one (this one). v0.28.0's fix remains the one confirmed win here.
 
+## v0.28.2: an opt-in `--mmap-experts` path — built and proven correct, NOT yet measured
+
+The compute investigation above closed off the disk side ("genuinely spent") and the kernel side
+("demonstrably fast when warm"), but left one structural question untouched: **rabbit holds its own
+resident `Vec<u8>` for every cached expert, on top of whatever the OS page cache is already keeping
+for the exact same physical shard bytes.** If that double-caching is real, then part of what looks
+like a cache-capacity limit (`safe_mxfp4_capacity` auto-clamping to 7 on this machine) is really
+rabbit paying twice for the same bytes, and letting the kernel own the single copy would raise the
+effective working set at no RAM cost.
+
+`--mmap-experts` (off by default) makes that testable: the ordinary LRU miss path builds its
+`QTKind::MxFp4` weights directly over `mmap`'d byte ranges (`ByteStore::Mapped`) instead of
+`pread`/`io_uring` into owned buffers, with a best-effort `MADV_WILLNEED` standing in for the
+`io_uring` submit. MXFP4 only — the other four quant kinds keep plain owned `Vec<u8>`.
+
+**What is actually established as of this version:**
+
+- It decodes to bit-identical values. Asserted twice, at two levels: `ByteStore::Mapped` vs.
+  `Owned` over the same bytes at the `quant.rs` level, and the mmap path's cache contents vs. the
+  sequential path's, expert by expert, through the real `Shards`/`ExpertCache` wiring.
+- It is genuinely opt-in — a test pins `mmap_experts: false` to unchanged behavior, so the branch
+  can't be silently always-on or inverted.
+- It cannot cause the OOM that `safe_mxfp4_capacity` exists to prevent: that math is deliberately
+  left unchanged, which under mmap makes it a conservative upper bound (may clamp lower than mmap
+  could safely support; can never clamp too high).
+
+**What is NOT established: whether it is any faster.** No real-checkpoint A/B has been run, so
+there is deliberately no row for it in either speed table above and no claimed change to the
+0.169 tok/s figure — which is exactly why this ships as a patch (v0.28.2, kept-but-neutral) and
+not a minor version. The measurement to run is the standard one, twice, with and without the flag:
+`--prompt "What is the capital of France?" --max-tokens 40` on the real checkpoint at the default
+auto capacity. Two outcomes are worth writing down when it happens: the end-to-end time, and
+whether `MemAvailable` behaves differently enough to justify teaching `safe_mxfp4_capacity` real
+mmap-aware accounting (the follow-up its doc comment already describes).
+
+The honest prior, given this page's own track record: the cold-cache finding above says a
+freshly-streamed expert's bytes are cold in cache either way, and mmap doesn't change how many
+bytes cross the memory bus — so the plausible win is in RAM headroom (a bigger effective cache for
+the same `MemAvailable`), not in the per-call cost. That is a hypothesis, not a result.
+
 ## Reproducing these numbers
 
 **End-to-end table**: `cargo build --release --bin rabbit`, then `./target/release/rabbit --model

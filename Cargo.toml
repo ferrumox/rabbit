@@ -1,6 +1,6 @@
 [package]
 name = "rabbit"
-version = "0.28.1"
+version = "0.28.2"
 edition = "2024"
 description = "A Rust inference engine for GLM-5.2, Kimi Linear, and Kimi K3 (2.8T-parameter MoE), streaming routed experts from disk on demand"
 repository = "https://github.com/ferrumox/rabbit"
@@ -21,6 +21,11 @@ fancy-regex = "0.13"
 # tiktoken.model's on-disk format is `<base64-encoded-bytes> <rank>` per line.
 base64 = "0.22"
 ureq = { version = "3.3.0", features = ["json"] }
+# Backs the opt-in `--mmap-experts` alternative expert-load path (see `safetensors.rs`'s
+# `Shards::mmap_shard`/`quant.rs`'s `ByteStore`): a thin, safe-by-construction wrapper around
+# raw `mmap(2)`, used only when that flag is passed. Off by default -- see `safetensors.rs`'s
+# module doc for why the DEFAULT path deliberately avoids mmap.
+memmap2 = "0.9"
 
 # io_uring is Linux-only; the expert-loading fallback path (sequential pread via
 # safetensors.rs) covers every other target, so this dependency is never required elsewhere.

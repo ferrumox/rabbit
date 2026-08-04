@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] \
-[--io-batch-size N] [--think] \
+[--io-batch-size N] [--think] [--mmap-experts] \
 [--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K] \
 [--shard-dirs <dir1,dir2,...>]";
 
@@ -37,6 +37,8 @@ struct Args {
     /// `None` = match `cache_capacity` (today's original coupled behavior — see
     /// `LoadArgs::io_batch_size`'s doc). `--io-batch-size N` sets it independently.
     io_batch_size: Option<usize>,
+    /// Opt-in `--mmap-experts` experiment (default `false`) — see `LoadArgs::mmap_experts`'s doc.
+    mmap_experts: bool,
     session: Option<PathBuf>,
     no_usage_cache: bool,
     cache_route: bool,
@@ -63,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
     let mut ebits = 4u8;
     let mut cache_capacity = None;
     let mut io_batch_size = None;
+    let mut mmap_experts = false;
     let mut session = None;
     let mut no_usage_cache = false;
     let mut cache_route = false;
@@ -89,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
             "--ebits" => ebits = next("--ebits")?.parse().map_err(|e| format!("--ebits: {e}"))?,
             "--expert-cache" => cache_capacity = Some(next("--expert-cache")?.parse().map_err(|e| format!("--expert-cache: {e}"))?),
             "--io-batch-size" => io_batch_size = Some(next("--io-batch-size")?.parse().map_err(|e| format!("--io-batch-size: {e}"))?),
+            "--mmap-experts" => mmap_experts = true,
             "--session" => session = Some(PathBuf::from(next("--session")?)),
             "--no-usage-cache" => no_usage_cache = true,
             "--cache-route" => cache_route = true,
@@ -123,6 +127,7 @@ fn parse_args() -> Result<Args, String> {
         ebits,
         cache_capacity,
         io_batch_size,
+        mmap_experts,
         session,
         no_usage_cache,
         cache_route,
@@ -145,6 +150,7 @@ fn load_args(args: &Args) -> LoadArgs {
         ebits: args.ebits,
         cache_capacity: args.cache_capacity,
         io_batch_size: args.io_batch_size,
+        mmap_experts: args.mmap_experts,
         no_usage_cache: args.no_usage_cache,
         cache_route: args.cache_route,
     }

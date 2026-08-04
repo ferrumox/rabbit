@@ -85,27 +85,19 @@ work the same way across the three.
   `/v1/chat/completions`, `/v1/models`, plus `/profile`, a rolling per-turn phase-timing window.
 - **Multi-turn chat** (`--chat`) with each model's own real chat template.
 
-Not yet built: `io_uring`-batched MXFP4 expert loading, a SIMD tier for the MXFP4 matmul kernel
-(scalar only today), live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
+Not yet built: live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
 grammar-constrained decoding, and a web UI (`/profile` is a JSON endpoint, no page serves it yet;
 see `DASHBOARD_BRIEF.md`).
 
-## Honest numbers (Ryzen AI 9 HX 370, 12 cores/24 threads)
+## Honest numbers (Ryzen AI 9 HX 370, 12 cores/24 threads, 123GB RAM, NVMe SSD)
 
-### Kimi K3 (real 96-shard, 1.56TB checkpoint, first measurement, 2026-07-28)
+| Model | RAM (GB) | Decode |
+|---|---|---|
+| Kimi K3 (2.78T MXFP4 MoE, `--expert-cache` auto=7) | 46 | 0.169 tok/s |
+| GLM-5.2 (744B FP8 MoE, `--expert-cache 64`) | — | 1.02 words/s |
+| Kimi Linear 48B | — | — |
 
-| metric | value |
-|---|---|
-| model load | 610.0s (93 layers, 896 experts/layer) |
-| prefill (7 tokens) | 412.8s |
-| decode, steady state | 50-70s/token |
-| decode I/O share | 30-40% disk I/O, 60-70% compute |
-| expert-cache hit rate (40-token run, `--expert-cache 64`) | grows to ~52% cumulative, still ~43% miss rate late in the run |
-
-This is the correctness-first floor, not a tuned number. Same starting point GLM-5.2 was at
-before its own eight versions of `rayon`/SIMD/`io_uring` work. The single biggest known lever:
-the MXFP4 matmul kernel is scalar only, and compute, not disk, is most of each token's time
-here, the opposite of GLM-5.2's I/O-bound steady state below.
+Full logs: `PERFORMANCE_KIMI_K3.md`, `PERFORMANCE.md`.
 
 ### GLM-5.2
 

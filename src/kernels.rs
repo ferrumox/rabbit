@@ -1118,7 +1118,7 @@ pub fn matmul_qt(y: &mut [f32], x: &[f32], w: &QT, s: usize) {
         }
         QTKind::I2 { data, scale } => matmul_i2(y, x, data, scale, s, w.cols, w.rows),
         QTKind::I4Grouped { data, scale, group_size } => matmul_i4_grouped(y, x, data, scale, *group_size, s, w.cols, w.rows),
-        QTKind::MxFp4 { data, block_scale } => matmul_mxfp4(y, x, data, block_scale, s, w.cols, w.rows),
+        QTKind::MxFp4 { data, block_scale } => matmul_mxfp4(y, x, data.as_slice(), block_scale.as_slice(), s, w.cols, w.rows),
     }
 }
 
@@ -1211,6 +1211,8 @@ pub fn qt_addrow(w: &QT, row: usize, coef: f32, acc: &mut [f32]) {
             }
         }
         QTKind::MxFp4 { data, block_scale } => {
+            let data = data.as_slice();
+            let block_scale = block_scale.as_slice();
             let rb = i.div_ceil(2);
             let bpr = i.div_ceil(32);
             let wr = &data[row * rb..(row + 1) * rb];
@@ -1283,6 +1285,8 @@ pub fn qt_matvec_rows(w: &QT, r0: usize, n: usize, x: &[f32], y: &mut [f32]) {
                 acc
             }
             QTKind::MxFp4 { data, block_scale } => {
+                let data = data.as_slice();
+                let block_scale = block_scale.as_slice();
                 let rb = i.div_ceil(2);
                 let bpr = i.div_ceil(32);
                 let wr = &data[row * rb..(row + 1) * rb];
@@ -1904,7 +1908,7 @@ mod tests {
         let mut t = QT::alloc_mxfp4(rows, cols);
         t.fill(&w);
         match &t.kind {
-            QTKind::MxFp4 { data, block_scale } => (data.clone(), block_scale.clone()),
+            QTKind::MxFp4 { data, block_scale } => (data.as_slice().to_vec(), block_scale.as_slice().to_vec()),
             _ => panic!("expected MxFp4"),
         }
     }

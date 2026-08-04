@@ -141,6 +141,21 @@ impl ExpertCaches {
         ExpertCaches(v)
     }
 
+    /// Like `new_with_io_batch`, but also sets the opt-in `--mmap-experts` flag — see
+    /// `crate::generate::ExpertCaches::new_with_io_batch_mmap`'s doc for the sibling-constructor
+    /// pattern this follows. This is the family the flag actually matters for in practice: a real
+    /// K3 checkpoint's `mxfp4_experts=true` picks `ExpertNaming::KimiK3Mxfp4`, the only naming
+    /// `ExpertCache::begin_loading`'s mmap branch (`naming.is_mxfp4()`) currently acts on.
+    pub fn new_with_io_batch_mmap(model: &Model, capacity: usize, io_batch_size: usize, mmap_experts: bool) -> ExpertCaches {
+        let naming = if model.cfg.mxfp4_experts { ExpertNaming::KimiK3Mxfp4 } else { ExpertNaming::KimiK3 };
+        let v = model
+            .layers
+            .iter()
+            .map(|l| if matches!(l.ffn, Ffn::Moe(_)) { Some(ExpertCache::for_family_with_io_batch_mmap(capacity, io_batch_size, naming, mmap_experts)) } else { None })
+            .collect();
+        ExpertCaches(v)
+    }
+
     pub fn hit_miss_totals(&self) -> (u64, u64, u64) {
         self.0.iter().flatten().fold((0, 0, 0), |(h, m, n), c| (h + c.hits, m + c.misses, n + c.load_nanos))
     }

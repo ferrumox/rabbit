@@ -258,6 +258,20 @@ impl ExpertCaches {
         }
     }
 
+    /// Like `new_with_io_batch`, but also sets the opt-in `--mmap-experts` flag on whichever
+    /// family's `ExpertCache`s get built — see each family's own `new_with_io_batch_mmap` doc.
+    /// The one call site that matters is `chat.rs::load_session`, which reads the real
+    /// `--mmap-experts` CLI flag (`LoadArgs::mmap_experts`) and passes it straight through here.
+    pub fn new_with_io_batch_mmap(model: &Model, capacity: usize, io_batch_size: usize, mmap_experts: bool) -> ExpertCaches {
+        match model {
+            Model::Glm52(m) => ExpertCaches::Glm52(crate::generate::ExpertCaches::new_with_io_batch_mmap(m, capacity, io_batch_size, mmap_experts)),
+            Model::KimiLinear(m) => {
+                ExpertCaches::KimiLinear(crate::kimi_linear::generate::ExpertCaches::new_with_io_batch_mmap(m, capacity, io_batch_size, mmap_experts))
+            }
+            Model::KimiK3(m) => ExpertCaches::KimiK3(crate::kimi_k3::generate::ExpertCaches::new_with_io_batch_mmap(m, capacity, io_batch_size, mmap_experts)),
+        }
+    }
+
     pub fn hit_miss_totals(&self) -> (u64, u64, u64) {
         match self {
             ExpertCaches::Glm52(c) => c.hit_miss_totals(),
