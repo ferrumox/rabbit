@@ -23,18 +23,21 @@ pub enum Model {
     Glm52(crate::glm52::model::Model),
     KimiLinear(crate::kimi_linear::model::Model),
     KimiK3(crate::kimi_k3::model::Model),
+    Qwen38(crate::qwen38::model::Model),
 }
 
 pub enum KvState {
     Glm52(crate::generate::KvState),
     KimiLinear(crate::kimi_linear::generate::KvState),
     KimiK3(crate::kimi_k3::generate::KvState),
+    Qwen38(crate::qwen38::generate::KvState),
 }
 
 pub enum ExpertCaches {
     Glm52(crate::generate::ExpertCaches),
     KimiLinear(crate::kimi_linear::generate::ExpertCaches),
     KimiK3(crate::kimi_k3::generate::ExpertCaches),
+    Qwen38(crate::qwen38::generate::ExpertCaches),
 }
 
 #[derive(Debug)]
@@ -42,6 +45,7 @@ pub enum ModelError {
     Glm52(crate::glm52::model::ModelError),
     KimiLinear(KimiModelError),
     KimiK3(crate::kimi_k3::model::ModelError),
+    Qwen38(crate::qwen38::model::ModelError),
     Io(std::io::Error),
     Json(serde_json::Error),
     /// `config.json`'s `model_type` was missing or matched none of `glm52`'s/`kimi_linear`'s/
@@ -55,6 +59,7 @@ impl fmt::Display for ModelError {
             ModelError::Glm52(e) => write!(f, "{e}"),
             ModelError::KimiLinear(e) => write!(f, "{e}"),
             ModelError::KimiK3(e) => write!(f, "{e}"),
+            ModelError::Qwen38(e) => write!(f, "{e}"),
             ModelError::Io(e) => write!(f, "config.json: {e}"),
             ModelError::Json(e) => write!(f, "config.json: {e}"),
             ModelError::UnknownArchitecture { found: Some(m) } => {
@@ -82,6 +87,12 @@ impl From<KimiModelError> for ModelError {
 impl From<crate::kimi_k3::model::ModelError> for ModelError {
     fn from(e: crate::kimi_k3::model::ModelError) -> Self {
         ModelError::KimiK3(e)
+    }
+}
+
+impl From<crate::qwen38::model::ModelError> for ModelError {
+    fn from(e: crate::qwen38::model::ModelError) -> Self {
+        ModelError::Qwen38(e)
     }
 }
 
@@ -121,6 +132,10 @@ impl Model {
             Some("glm_moe_dsa") => Ok(Model::Glm52(crate::glm52::model::Model::load_multi(dirs, dbits, ebits)?)),
             Some("kimi_linear") => Ok(Model::KimiLinear(crate::kimi_linear::model::Model::load_multi(dirs, dbits, ebits)?)),
             Some("kimi_k3") => Ok(Model::KimiK3(crate::kimi_k3::model::Model::load_multi(dirs, dbits, ebits)?)),
+            // Both spellings: `qwen3_5_moe_text` is Qwen3.8-Max's own flat, text-only form and
+            // `qwen3_5_moe` the multimodal wrapper whose text fields nest under `text_config`
+            // (Qwen3.6-35B-A3B and friends) -- `qwen38::config::Cfg::from_root` reads either.
+            Some("qwen3_5_moe_text") | Some("qwen3_5_moe") => Ok(Model::Qwen38(crate::qwen38::model::Model::load_multi(dirs, dbits, ebits)?)),
             found => Err(ModelError::UnknownArchitecture { found: found.map(String::from) }),
         }
     }
@@ -132,6 +147,7 @@ impl Model {
             Model::Glm52(m) => m.layers.len(),
             Model::KimiLinear(m) => m.layers.len(),
             Model::KimiK3(m) => m.layers.len(),
+            Model::Qwen38(m) => m.layers.len(),
         }
     }
 
@@ -143,6 +159,9 @@ impl Model {
             Model::Glm52(m) => m.cfg.stop_ids.iter().map(|&id| id as usize).collect(),
             Model::KimiLinear(m) => m.cfg.stop_ids.iter().map(|&id| id as usize).collect(),
             Model::KimiK3(m) => m.cfg.base.stop_ids.iter().map(|&id| id as usize).collect(),
+            // Qwen's list is the UNION of config.json's and generation_config.json's -- see
+            // `qwen38::config`'s module doc: `<|im_end|>` only appears in the latter.
+            Model::Qwen38(m) => m.cfg.stop_ids.iter().map(|&id| id as usize).collect(),
         }
     }
 
@@ -155,18 +174,23 @@ impl Model {
             Model::Glm52(m) => m.route_cfg.cache_route = on,
             Model::KimiLinear(m) => m.route_cfg.cache_route = on,
             Model::KimiK3(m) => m.route_cfg.cache_route = on,
+            // Qwen 3.8 routes through `qwen38::moe::route` (plain softmax top-k), not
+            // `glm52::moe::route_cache_aware`, so it has no CACHE_ROUTE knob to set: the flag is
+            // accepted and ignored for this family rather than silently pretending to apply.
+            Model::Qwen38(_) => {}
         }
     }
 }
 
-/// `--chat --session <path>` persistence error — dispatches to `kv_session.rs`'s real
-/// `LoadError` for GLM-5.2, `kimi_linear::kv_session::LoadError` for Kimi Linear (a genuinely
-/// different on-disk format for each — see that module's doc for why).
+/// `--chat --session <path>` persistence error — dispatches to each family's own `LoadError`
+/// (`kv_session.rs` for GLM-5.2, `kimi_linear`/`kimi_k3`/`qwen38::kv_session` for the others: a
+/// genuinely different on-disk format per family — see those modules' docs for why).
 #[derive(Debug)]
 pub enum KvSessionError {
     Glm52Load(crate::kv_session::LoadError),
     KimiLinearLoad(crate::kimi_linear::kv_session::LoadError),
     KimiK3Load(crate::kimi_k3::kv_session::LoadError),
+    Qwen38Load(crate::qwen38::kv_session::LoadError),
     Io(std::io::Error),
 }
 
@@ -176,6 +200,7 @@ impl fmt::Display for KvSessionError {
             KvSessionError::Glm52Load(e) => write!(f, "{e}"),
             KvSessionError::KimiLinearLoad(e) => write!(f, "{e}"),
             KvSessionError::KimiK3Load(e) => write!(f, "{e}"),
+            KvSessionError::Qwen38Load(e) => write!(f, "{e}"),
             KvSessionError::Io(e) => write!(f, "session file: {e}"),
         }
     }
@@ -189,6 +214,7 @@ impl KvState {
             Model::Glm52(m) => KvState::Glm52(crate::generate::KvState::new(m)),
             Model::KimiLinear(m) => KvState::KimiLinear(crate::kimi_linear::generate::KvState::new(m)),
             Model::KimiK3(m) => KvState::KimiK3(crate::kimi_k3::generate::KvState::new(m)),
+            Model::Qwen38(m) => KvState::Qwen38(crate::qwen38::generate::KvState::new(m)),
         }
     }
 
@@ -201,6 +227,7 @@ impl KvState {
             KvState::Glm52(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
             KvState::KimiLinear(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
             KvState::KimiK3(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
+            KvState::Qwen38(kv) => kv.save(from_pos, to_pos, path).map_err(KvSessionError::Io),
         }
     }
 
@@ -220,6 +247,10 @@ impl KvState {
                 let (kv, pos) = crate::kimi_k3::generate::KvState::load(path, m).map_err(KvSessionError::KimiK3Load)?;
                 Ok((KvState::KimiK3(kv), pos))
             }
+            Model::Qwen38(m) => {
+                let (kv, pos) = crate::qwen38::generate::KvState::load(path, m).map_err(KvSessionError::Qwen38Load)?;
+                Ok((KvState::Qwen38(kv), pos))
+            }
         }
     }
 }
@@ -233,6 +264,15 @@ impl KvState {
 pub fn safe_default_expert_cache_capacity(model: &Model) -> usize {
     const DEFAULT: usize = 64;
     match model {
+        // Every Qwen 3.8 layer is a routed-MoE layer (no dense prefix), and the real checkpoint's
+        // experts are MXFP4 at 8192x2048 -- 28 MB per expert, so the flat 64 default would ask for
+        // far more RAM than this machine has. Same clamp K3's own crash produced.
+        Model::Qwen38(m) if m.cfg.mxfp4_experts => crate::expert_cache::safe_mxfp4_capacity(
+            DEFAULT,
+            m.layers.len(),
+            m.cfg.moe_inter as usize,
+            m.cfg.hidden as usize,
+        ),
         Model::KimiK3(m) if m.cfg.mxfp4_experts => {
             let n_moe_layers = m.layers.iter().filter(|l| matches!(l.ffn, crate::kimi_k3::model::Ffn::Moe(_))).count();
             crate::expert_cache::safe_mxfp4_capacity(DEFAULT, n_moe_layers, m.cfg.base.moe_inter as usize, m.cfg.base.hidden as usize)
@@ -255,6 +295,7 @@ impl ExpertCaches {
             Model::Glm52(m) => ExpertCaches::Glm52(crate::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
             Model::KimiLinear(m) => ExpertCaches::KimiLinear(crate::kimi_linear::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
             Model::KimiK3(m) => ExpertCaches::KimiK3(crate::kimi_k3::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
+            Model::Qwen38(m) => ExpertCaches::Qwen38(crate::qwen38::generate::ExpertCaches::new_with_io_batch(m, capacity, io_batch_size)),
         }
     }
 
@@ -269,6 +310,7 @@ impl ExpertCaches {
                 ExpertCaches::KimiLinear(crate::kimi_linear::generate::ExpertCaches::new_with_io_batch_mmap(m, capacity, io_batch_size, mmap_experts))
             }
             Model::KimiK3(m) => ExpertCaches::KimiK3(crate::kimi_k3::generate::ExpertCaches::new_with_io_batch_mmap(m, capacity, io_batch_size, mmap_experts)),
+            Model::Qwen38(m) => ExpertCaches::Qwen38(crate::qwen38::generate::ExpertCaches::new_with_io_batch_mmap(m, capacity, io_batch_size, mmap_experts)),
         }
     }
 
@@ -277,6 +319,7 @@ impl ExpertCaches {
             ExpertCaches::Glm52(c) => c.hit_miss_totals(),
             ExpertCaches::KimiLinear(c) => c.hit_miss_totals(),
             ExpertCaches::KimiK3(c) => c.hit_miss_totals(),
+            ExpertCaches::Qwen38(c) => c.hit_miss_totals(),
         }
     }
 
@@ -285,6 +328,7 @@ impl ExpertCaches {
             ExpertCaches::Glm52(c) => c.io_wait_nanos_total(),
             ExpertCaches::KimiLinear(c) => c.io_wait_nanos_total(),
             ExpertCaches::KimiK3(c) => c.io_wait_nanos_total(),
+            ExpertCaches::Qwen38(c) => c.io_wait_nanos_total(),
         }
     }
 
@@ -293,6 +337,7 @@ impl ExpertCaches {
             ExpertCaches::Glm52(c) => c.warm_start(model_dir, cache_capacity),
             ExpertCaches::KimiLinear(c) => c.warm_start(model_dir, cache_capacity),
             ExpertCaches::KimiK3(c) => c.warm_start(model_dir, cache_capacity),
+            ExpertCaches::Qwen38(c) => c.warm_start(model_dir, cache_capacity),
         }
     }
 
@@ -301,6 +346,7 @@ impl ExpertCaches {
             ExpertCaches::Glm52(c) => c.save_usage(model_dir),
             ExpertCaches::KimiLinear(c) => c.save_usage(model_dir),
             ExpertCaches::KimiK3(c) => c.save_usage(model_dir),
+            ExpertCaches::Qwen38(c) => c.save_usage(model_dir),
         }
     }
 }
@@ -316,6 +362,7 @@ pub fn step(model: &Model, shards: &crate::safetensors::Shards, caches: &mut Exp
         (Model::Glm52(m), ExpertCaches::Glm52(c), KvState::Glm52(k)) => Ok(crate::generate::step(m, shards, c, k, ids, pos_base)?),
         (Model::KimiLinear(m), ExpertCaches::KimiLinear(c), KvState::KimiLinear(k)) => Ok(crate::kimi_linear::generate::step(m, shards, c, k, ids, pos_base)?),
         (Model::KimiK3(m), ExpertCaches::KimiK3(c), KvState::KimiK3(k)) => Ok(crate::kimi_k3::generate::step(m, shards, c, k, ids, pos_base)?),
+        (Model::Qwen38(m), ExpertCaches::Qwen38(c), KvState::Qwen38(k)) => Ok(crate::qwen38::generate::step(m, shards, c, k, ids, pos_base)?),
         _ => unreachable!("Model/ExpertCaches/KvState family mismatch -- always construct KvState/ExpertCaches from the same Model"),
     }
 }
@@ -327,6 +374,7 @@ pub fn step_all(model: &Model, shards: &crate::safetensors::Shards, caches: &mut
         (Model::Glm52(m), ExpertCaches::Glm52(c), KvState::Glm52(k)) => Ok(crate::generate::step_all(m, shards, c, k, ids, pos_base)?),
         (Model::KimiLinear(m), ExpertCaches::KimiLinear(c), KvState::KimiLinear(k)) => Ok(crate::kimi_linear::generate::step_all(m, shards, c, k, ids, pos_base)?),
         (Model::KimiK3(m), ExpertCaches::KimiK3(c), KvState::KimiK3(k)) => Ok(crate::kimi_k3::generate::step_all(m, shards, c, k, ids, pos_base)?),
+        (Model::Qwen38(m), ExpertCaches::Qwen38(c), KvState::Qwen38(k)) => Ok(crate::qwen38::generate::step_all(m, shards, c, k, ids, pos_base)?),
         _ => unreachable!("Model/ExpertCaches/KvState family mismatch -- always construct KvState/ExpertCaches from the same Model"),
     }
 }
@@ -346,6 +394,7 @@ pub fn step_profiled(
         (Model::Glm52(m), ExpertCaches::Glm52(c), KvState::Glm52(k)) => Ok(crate::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
         (Model::KimiLinear(m), ExpertCaches::KimiLinear(c), KvState::KimiLinear(k)) => Ok(crate::kimi_linear::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
         (Model::KimiK3(m), ExpertCaches::KimiK3(c), KvState::KimiK3(k)) => Ok(crate::kimi_k3::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
+        (Model::Qwen38(m), ExpertCaches::Qwen38(c), KvState::Qwen38(k)) => Ok(crate::qwen38::generate::step_profiled(m, shards, c, k, ids, pos_base)?),
         _ => unreachable!("Model/ExpertCaches/KvState family mismatch -- always construct KvState/ExpertCaches from the same Model"),
     }
 }
@@ -354,6 +403,11 @@ pub enum Tokenizer {
     Glm52(Box<crate::tokenizer::Tokenizer>),
     KimiLinear(Box<crate::kimi_linear::tokenizer::Tokenizer>),
     KimiK3(Box<crate::kimi_k3::tokenizer::Tokenizer>),
+    /// The SAME `crate::tokenizer::Tokenizer` type GLM-5.2 uses (both are byte-level BPE from a
+    /// `tokenizer.json`); a separate variant only because it's loaded through
+    /// `qwen38::tokenizer::load`, which verifies the file declares the pre-tokenizer and
+    /// `ignore_merges` this port was written against.
+    Qwen38(Box<crate::tokenizer::Tokenizer>),
 }
 
 #[derive(Debug)]
@@ -361,6 +415,7 @@ pub enum TokenizerError {
     Glm52(crate::tokenizer::TokenizerError),
     KimiLinear(crate::kimi_linear::tokenizer::TokenizerError),
     KimiK3(crate::kimi_k3::tokenizer::TokenizerError),
+    Qwen38(crate::qwen38::tokenizer::LoadError),
 }
 
 impl fmt::Display for TokenizerError {
@@ -369,6 +424,7 @@ impl fmt::Display for TokenizerError {
             TokenizerError::Glm52(e) => write!(f, "{e}"),
             TokenizerError::KimiLinear(e) => write!(f, "{e}"),
             TokenizerError::KimiK3(e) => write!(f, "{e}"),
+            TokenizerError::Qwen38(e) => write!(f, "{e}"),
         }
     }
 }
@@ -393,6 +449,7 @@ impl Tokenizer {
                 Ok(Tokenizer::KimiLinear(Box::new(crate::kimi_linear::tokenizer::Tokenizer::load(dir).map_err(TokenizerError::KimiLinear)?)))
             }
             Model::KimiK3(_) => Ok(Tokenizer::KimiK3(Box::new(crate::kimi_k3::tokenizer::Tokenizer::load(dir).map_err(TokenizerError::KimiK3)?))),
+            Model::Qwen38(_) => Ok(Tokenizer::Qwen38(Box::new(crate::qwen38::tokenizer::load(dir).map_err(TokenizerError::Qwen38)?))),
         }
     }
 
@@ -401,6 +458,7 @@ impl Tokenizer {
             Tokenizer::Glm52(t) => t.encode(text),
             Tokenizer::KimiLinear(t) => t.encode(text),
             Tokenizer::KimiK3(t) => t.encode(text),
+            Tokenizer::Qwen38(t) => t.encode(text),
         }
     }
 
@@ -409,6 +467,7 @@ impl Tokenizer {
             Tokenizer::Glm52(t) => t.decode(ids),
             Tokenizer::KimiLinear(t) => t.decode(ids),
             Tokenizer::KimiK3(t) => t.decode(ids),
+            Tokenizer::Qwen38(t) => t.decode(ids),
         }
     }
 }
@@ -663,6 +722,81 @@ mod tests {
         fs::write(dir.0.join("config.json"), cfg_json.to_string()).unwrap();
         write_safetensors(&dir.0, header, data);
         dir
+    }
+
+    /// The Qwen 3.8 arm of every dispatch point at once: `model_type` recognition, `step` through the
+    /// shared entry point, `stop_ids` coming from BOTH config files, the MoE-aware `--expert-cache`
+    /// clamp, the chat template, and the tokenizer's own validating loader. Reuses
+    /// `qwen38::model`'s tiny fixture rather than hand-building a second one.
+    #[test]
+    fn load_and_step_dispatch_correctly_for_a_qwen38_checkpoint() {
+        let fixture = crate::qwen38::model::tests::TempDir::new("rabbit_test_model_dispatch_qwen38");
+        crate::qwen38::model::tests::write_tiny_checkpoint(&fixture.0);
+
+        let model = Model::load(&fixture.0, 16, 4).unwrap();
+        assert!(matches!(model, Model::Qwen38(_)), "config.json's qwen3_5_moe_text must route here");
+        assert_eq!(model.n_layers(), 4);
+
+        let shards = crate::safetensors::Shards::open(&fixture.0).unwrap();
+        let mut caches = ExpertCaches::new(&model, 4);
+        let mut kv = KvState::new(&model);
+        let logits = step(&model, &shards, &mut caches, &mut kv, &[1, 2], 0).unwrap();
+        assert_eq!(logits.len(), 10); // vocab
+        assert!(logits.iter().all(|x| x.is_finite()));
+
+        // step_all goes through the same dispatch and returns one row per position
+        let mut kv2 = KvState::new(&model);
+        let all = step_all(&model, &shards, &mut caches, &mut kv2, &[1, 2], 0).unwrap();
+        assert_eq!(all.len(), 2 * 10);
+
+        // the fixture's config.json has eos 7 and no generation_config.json
+        assert_eq!(model.stop_ids(), vec![7]);
+
+        // ChatML, through the family dispatch
+        let rendered = crate::chat::render_turn(&model, "hola", true, true, None);
+        assert!(rendered.starts_with("<|im_start|>system\n"), "got {rendered:?}");
+        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"), "got {rendered:?}");
+
+        // `--session` round-trips through the dispatch too (the format itself is covered in
+        // `qwen38::kv_session`'s own tests)
+        let session_path = fixture.0.join("session.bin");
+        kv.save(0, 2, &session_path).unwrap();
+        let (_restored, pos) = KvState::load(&session_path, &model).unwrap();
+        assert_eq!(pos, 2);
+
+        // no tokenizer.json in this fixture -> the Qwen-specific loader's error, not a panic
+        assert!(matches!(Tokenizer::load(&fixture.0, &model), Err(TokenizerError::Qwen38(_))));
+    }
+
+    /// The auto `--expert-cache` clamp must be REACHED for a Qwen checkpoint whose experts are MXFP4,
+    /// with the right arguments: every layer counts as a routed-MoE layer (Qwen has no dense prefix).
+    /// The clamp itself is RAM-aware (see `expert_cache::safe_mxfp4_capacity`), so a 4-layer fixture
+    /// genuinely fits and is NOT clamped — the real 92-layer consequence is pinned separately below,
+    /// by calling that helper directly, rather than by pretending the fixture is huge.
+    #[test]
+    fn expert_cache_default_routes_qwen38_mxfp4_through_the_ram_aware_clamp() {
+        let fixture = crate::qwen38::model::tests::TempDir::new("rabbit_test_model_dispatch_qwen38_clamp");
+        crate::qwen38::model::tests::write_tiny_checkpoint(&fixture.0);
+        let model = Model::load(&fixture.0, 16, 4).unwrap();
+        assert_eq!(safe_default_expert_cache_capacity(&model), 64, "a non-MXFP4 checkpoint keeps the flat default");
+
+        let Model::Qwen38(mut m) = model else { panic!("expected the Qwen arm") };
+        m.cfg.mxfp4_experts = true;
+        m.cfg.hidden = 8192;
+        m.cfg.moe_inter = 2048;
+        let (layers, moe_inter, hidden) = (m.layers.len(), m.cfg.moe_inter as usize, m.cfg.hidden as usize);
+        let got = safe_default_expert_cache_capacity(&Model::Qwen38(m));
+        assert_eq!(
+            got,
+            crate::expert_cache::safe_mxfp4_capacity(64, layers, moe_inter, hidden),
+            "the Qwen arm must pass ALL its layers as MoE layers, plus the real expert dimensions"
+        );
+
+        // ...and at the real model's 92 layers (92 x 64 x 28 MB = ~165 GB of experts) that helper
+        // really does clamp, which is the whole reason this arm exists.
+        let real = crate::expert_cache::safe_mxfp4_capacity(64, 92, 2048, 8192);
+        assert!(real < 64, "92 MXFP4 layers must clamp below the flat default, got {real}");
+        assert!(real >= 1, "...but never to zero");
     }
 
     #[test]

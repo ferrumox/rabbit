@@ -3,9 +3,10 @@ __pycache__/
 
 # fixtures generados localmente (oráculo tiny, tokenizer real) — se regeneran con
 # tests/oracle/make_glm_oracle.py, tests/oracle/make_kimi_oracle.py,
-# tests/oracle/make_k3_oracle.py, y tools/fetch_tokenizer_fixture.py
+# tests/oracle/make_k3_oracle.py, tests/oracle/make_qwen38_oracle.py, y tools/fetch_tokenizer_fixture.py
 tests/oracle/glm_tiny/
 tests/oracle/kimi_tiny/
 tests/oracle/k3_tiny/
+tests/oracle/qwen38_tiny/
 tests/fixtures/
 *.safetensors

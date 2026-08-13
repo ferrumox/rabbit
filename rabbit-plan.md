@@ -1,8 +1,8 @@
-# rabbit — Rust port of colibrì
+# rabbit — a hand-written Rust MoE inference engine
 
 ## Context
 
-[colibrì](../laboratory/colibri) is a pure C inference engine (2,574 lines in `c/glm.c` plus a
+The C reference implementation is a pure C inference engine (2,574 lines in `c/glm.c` plus a
 few small headers) that runs GLM-5.2 (a 744B-parameter MoE model) on a 25GB-RAM laptop by
 streaming routed "experts" from disk on demand. The user wanted a Rust reimplementation, called
 **rabbit**, living at `~/Documents/ferrumox/rabbit` (a sibling of their other Rust project,
@@ -10,7 +10,7 @@ streaming routed "experts" from disk on demand. The user wanted a Rust reimpleme
 
 Scope agreed for this first stage: **the complete engine** (safetensors, BPE tokenizer, config,
 quantization, MLA+DSA attention, MoE with expert streaming, basic decoding) — **no CLI, no
-`serve`, no CUDA backend yet**. Validated against the synthetic "tiny" model colibrì itself uses
+`serve`, no CUDA backend yet**. Validated against the synthetic "tiny" model the reference implementation itself uses
 for its self-test (not against the real 370GB GLM-5.2). Dependency philosophy: minimal and
 idiomatic — a few well-chosen crates instead of a religious zero-dependency stance, but without
 dragging in the whole Rust ML ecosystem.
@@ -31,14 +31,14 @@ order:
   direct `qt_load`).
 - **Real CLI** (`src/main.rs`, previously a placeholder): `--model`/`--prompt`/`--max-tokens`/etc.,
   per-token progress on stderr, expert-cache hit/miss/I/O-time reporting.
-- **End-to-end validation against colibrì's real checkpoint** (378GB,
-  `jlnsrk/GLM-5.2-colibri-int4`, downloaded to `~/Documents/ferrumox/models/`): generates
+- **End-to-end validation against the reference implementation's real checkpoint** (378GB,
+  `GLM-5.2-int4`, downloaded to `~/Documents/ferrumox/models/`): generates
   coherent, correct text ("The capital of France is" -> " Paris. It is located").
 - Found and fixed a real bug the synthetic oracle never triggered: `moe()` assumed a forward
   pass's whole batch of unique experts always fit in the expert cache; it now dispatches in
   chunks sized to capacity (`b203fb6`).
 - **`rayon` parallelization** of every matmul kernel (previously single-core SIMD only,
-  ~10-20x slower than colibrì in practice) — **a measured 3.5x against the real checkpoint**,
+  ~10-20x slower than the reference implementation in practice) — **a measured 3.5x against the real checkpoint**,
   bit-exact same output (`ab8cec2`).
 - Diagnosed where the time goes: prefill ~75% disk I/O (cold cache), steady-state decode
   ~65-70% compute / 30-35% I/O — for long generations compute already dominates, and it's
@@ -51,7 +51,7 @@ the full reasoning.
 
 ## Dependency mapping: philosophy revised after reading the code
 
-Reading `c/st.h` closely: colibrì **deliberately avoids mmap**. It uses `pread` +
+Reading `c/st.h` closely: the reference implementation **deliberately avoids mmap**. It uses `pread` +
 `posix_fadvise(DONTNEED)` because mmap leaves pages resident that corrupt peak-RSS measurement
 (see the comment in `st.h`'s header — an "RSS bug"). This is central to the streaming
 architecture (the engine needs to know exactly how much RAM it's using to avoid triggering the
@@ -65,7 +65,7 @@ Proposed dependencies (each justified 1:1 against a real need from the original)
 |---|---|---|
 | `serde` + `serde_json` | `json.h` (149 lines, hand-rolled JSON parser) | The original admits it's incomplete ("no full \uXXXX unicode support"). For config/safetensors-header/tokenizer.json files, a robust, battle-tested parser removes a whole class of subtle bugs at no real cost — it's not a performance-critical component. |
 | `libc` | `pread`, `posix_fadvise`, `O_DIRECT`, `getrusage` (RSS) | Without this there's no way to replicate the fine-grained page control that's the engine's whole point. |
-| `rayon` (from Phase 4 on) | `#pragma omp parallel for` (attention, DSA top-k, expert application) | An idiomatic 1:1 mapping of OpenMP. Deferred until Phase 3 (single-thread correctness) is validated — the same order colibrì itself built in: correctness first, parallelism measured after. |
+| `rayon` (from Phase 4 on) | `#pragma omp parallel for` (attention, DSA top-k, expert application) | An idiomatic 1:1 mapping of OpenMP. Deferred until Phase 3 (single-thread correctness) is validated — the same order the reference implementation itself built in: correctness first, parallelism measured after. |
 | `io-uring` (from Phase 8) | N threads blocked on `pread` for expert streaming | See Phase 8. Replaces the thread-per-read pattern with asynchronously queued O_DIRECT reads — more natural in Rust than in portable C. |
 
 Everything else (BPE tokenizer, quantization containers, AVX2 kernels, MLA, DSA, MoE router,
@@ -79,7 +79,7 @@ validation against the oracle.
 ferrumox/rabbit/
 ├── Cargo.toml                  # single-crate workspace for now (bin + lib)
 ├── .gitignore
-├── README.md                   # vision + status, mirroring colibri's own
+├── README.md                   # vision + status, mirroring the reference implementation's own
 ├── src/
 │   ├── lib.rs
 │   ├── json.rs                 # re-exports/wraps serde_json where its own types are needed
@@ -96,7 +96,7 @@ ferrumox/rabbit/
 │   └── generate.rs             # ~ step/step_all/layers_forward: forward loop, greedy/temp sampling
 ├── tests/
 │   ├── oracle/
-│   │   └── make_glm_oracle.py  # adapted from colibri/c/tools/make_glm_oracle.py (self-contained)
+│   │   └── make_glm_oracle.py  # adapted from the C reference's tools/make_glm_oracle.py (self-contained)
 │   └── teacher_forcing.rs      # integration test: 32/32 positions against ref_glm.json
 └── tools/
     └── fetch_tokenizer_fixture.py  # downloads ONLY tokenizer.json+config.json from the real HF repo (~MBs)
@@ -144,20 +144,20 @@ bytes.
 Validation: `tools/fetch_tokenizer_fixture.py` downloads **only** `tokenizer.json` (a few MB, no
 weights) from GLM-5.2's HF repo, and a Python script using HF's `tokenizers` crate generates
 `text -> ids` cases (equivalent to `tests/test_tok.c`'s flow, which also doesn't run in
-colibri's default `test-c` — it's manual validation against the real tokenizer). Encode/decode
+the reference implementation's default `test-c` — it's manual validation against the real tokenizer). Encode/decode
 round-trip is also checked.
 
 **Phase 3 — Quantization + kernels (scalar first)**
 `quant.rs` + `kernels.rs` with a pure scalar implementation (no AVX2 yet). Unit tests:
-`pack_int4`/`pack_int2` bit-identical against their own dequantization, the same way colibri
+`pack_int4`/`pack_int2` bit-identical against their own dequantization, the same way the reference implementation
 validates it ("Packing validated bit-identical to the int8 container").
 
 **Phase 4 — Dense model + MLA/DSA attention**
 `model.rs` (dense tensor loading) + `attention.rs`. This is where `rayon` enters, for the
 `collapse(2)` head/position loops. Verification: generate the tiny model with
 `tests/oracle/make_glm_oracle.py` (requires `pip install torch transformers safetensors
-huggingface_hub numpy` once — a dev-only dependency, never at runtime, same as colibri) and run
-**teacher-forcing** over `full_ids` against `tf_pred` in `ref_glm.json` (already in colibri's
+huggingface_hub numpy` once — a dev-only dependency, never at runtime, same as the reference implementation) and run
+**teacher-forcing** over `full_ids` against `tf_pred` in `ref_glm.json` (already in the reference implementation's
 repo, 32 positions). Since the tiny oracle has `index_topk=4096 >> seq_len`, DSA selects the
 entire context — this test validates MLA plus DSA-as-a-no-op without needing the real selection
 path implemented yet.
@@ -171,7 +171,7 @@ teacher-forcing test as Phase 4, now over the full forward pass (dense + MoE).
 **Phase 6 — Generation**
 `generate.rs`: a simple autoregressive loop (greedy + temperature/nucleus), KV-cache.
 Verification: greedy generation from `prompt_ids` must reproduce `full_ids[len(prompt_ids):]`
-from `ref_glm.json` (the same "32/32" criterion colibri's `setup.sh` uses).
+from `ref_glm.json` (the same "32/32" criterion the reference implementation's `setup.sh` uses).
 
 **Phase 7 — Vectorized kernels (AVX2 + AVX-512/VNNI)**
 Back to `kernels.rs`, in two steps over the Phase 3 scalar baseline:
@@ -181,7 +181,7 @@ Back to `kernels.rs`, in two steps over the Phase 3 scalar baseline:
   machine (Ryzen AI 9 HX 370): `_mm512_dpbusd_epi32` (int8 VNNI dot product) and
   `_mm512_dpbf16_ps` (BF16) **compile on stable Rust** (no nightly needed) and the CPU exposes
   them at runtime (`is_x86_feature_detected!("avx512vnni")` -> true). This is exactly the next
-  performance jump colibrì identifies as unexploited in its own C engine (AVX2 only) — rabbit
+  performance jump the reference implementation identifies as unexploited in its own C engine (AVX2 only) — rabbit
   adds it from this phase instead of deferring it.
 
 Runtime kernel selection: `avx512vnni` > `avx2` > scalar, the same idea as the original's
@@ -231,26 +231,26 @@ remain hypotheses to test later, once the base engine works:
 2. `python3 tests/oracle/make_glm_oracle.py` generates `tests/oracle/glm_tiny/` and confirms
    `ref_glm.json`.
 3. `cargo test --test teacher_forcing` loads `glm_tiny`, runs a teacher-forced forward pass, and
-   requires an exact match across all 32 positions — the same threshold colibri's `setup.sh`
+   requires an exact match across all 32 positions — the same threshold the reference implementation's `setup.sh`
    uses as its architecture self-test.
 4. Greedy generation from `prompt_ids` reproduces the rest of `full_ids`.
 5. (Phase 2) Tokenizer: cases generated against the real tokenizer.json, not the tiny one.
 
 ## Stage 2 — next steps
 
-Feature-by-feature against colibrì (2026-07-12): the inference engine is at parity (same
+Feature-by-feature against the reference implementation (2026-07-12): the inference engine is at parity (same
 capabilities, now validated against the real checkpoint), but rabbit is still a single-turn,
 single-prompt binary today — it's missing the whole "product" layer (chat, server, tooling)
-colibrì already has. Proposed phases, ordered by practical value / effort:
+the reference implementation already has. Proposed phases, ordered by practical value / effort:
 
 **Phase 9 — Real chat (template + multi-turn loop): complete (2026-07-12, `e036737`).**
 The downloaded checkpoint doesn't ship `chat_template.jinja` (only `tokenizer_config.json`, no
 embedded template) — GLM-5.2's official template (`[gMASK]<sop><|user|>...<|assistant|>
-<think></think>`, no newline between roles) was taken from colibrì (`c/glm.c`), which already
+<think></think>`, no newline between roles) was taken from the reference implementation (`c/glm.c`), which already
 has it validated against this same checkpoint. `rabbit --chat` keeps `KvState`/`ExpertCaches` in
 memory across turns (real continuation via `pos_base`, never reprocessing the whole conversation
 each time), supports `:reset`/`:quit`, and `--think` for the reasoning block (nothink by
-default, as colibrì warns: the wrong template makes the model never emit the stop token).
+default, as the reference implementation warns: the wrong template makes the model never emit the stop token).
 Validated with a real two-turn conversation where the second turn ("What is its population?")
 depends on the first without repeating "Paris" — confirms real context continuation, not just
 absence of a crash. **Not implemented in this pass** (system prompt was resolved in Phase 11, KV
@@ -302,22 +302,22 @@ having reprocessed it.
 
 **Phase 14 — Persistent expert usage learning cache (`.rabbit_usage`, equivalent to
 `.coli_usage`): complete (2026-07-12).** The user explicitly requested this ahead of the `.qs`
-converter, MTP, and GBNF. Automatic (no flag, like colibrì) across all 3 modes
+converter, MTP, and GBNF. Automatic (no flag, like the reference implementation) across all 3 modes
 (`--prompt`/`--chat`/`--serve`): `<model_dir>/.rabbit_usage`, plain text
 `"{layer} {eid} {count}\n"` (unlike `kv_session.rs`'s binary format — here the file is small,
 written once per turn, and plain text is trivially inspectable), atomic writes via
 temp-file-plus-rename. Each `ExpertCache` layer gains a `pinned` tier separate from the LRU
 (checked first in `get`/`get_or_load`/`begin_loading`, never touched by eviction) and a
 per-expert `usage` counter, bumped in `moe.rs` right after the router's top-k (the same point as
-colibrì's `eusage[layer][eid]++`). On startup (`ExpertCaches::warm_start`, called from
+the reference implementation's `eusage[layer][eid]++`). On startup (`ExpertCaches::warm_start`, called from
 `chat::load_session`), if accumulated history exceeds 5000 selections, it marks up to
 `floor(cache_capacity * 0.5 * confidence)` experts per layer as pin **candidates**
-(`confidence = min(1, hist/200_000)`) — the same thresholds as colibrì, with the budget expressed
+(`confidence = min(1, hist/200_000)`) — the same thresholds as the reference implementation, with the budget expressed
 in expert count (the `--expert-cache` unit) instead of GB (rabbit has no `cap_for_ram`/`RAM_GB`,
 and building one is out of scope). `--no-usage-cache` disables all of it. Out of scope (an
 explicit decision): live re-pinning (`REPIN`/`eheat`) and VRAM/CUDA promotion.
 
-**A deliberate deviation from colibrì, found by real measurement, not analysis**: colibrì's
+**A deliberate deviation from the reference implementation, found by real measurement, not analysis**: the reference implementation's
 `pin_load` loads its candidates EAGERLY (synchronously, at startup). A real A/B against the
 checkpoint (`--prompt`, one process per invocation) showed that replicating this makes total
 wall-clock worse, not better: 108.5s with 975 experts preloaded vs 104.3s with no cache (same OS
@@ -368,7 +368,7 @@ the growing trend in this range already confirms the direction — left as futur
 exact number at large `nt` is needed.
 
 **Phase 16 — Per-turn profiling endpoint (`GET /profile`): complete (2026-07-18).** Prompted
-by reviewing colibrì's own (unmerged `dev`-branch) profiling page,
+by reviewing the reference implementation's own (unmerged `dev`-branch) profiling page,
 which streams a per-turn phase-timing breakdown (disk service, I/O wait, expert matmul,
 attention, lm_head) to a React dashboard. Rabbit had most of the raw data already:
 `chat.rs`'s `generate_reply` was already reporting wall time, hits/misses, and `io_seconds`/
@@ -387,7 +387,7 @@ tokens, hits/misses, the four phases, forward-pass count) for every caller. `Ses
 120-turn rolling `VecDeque<TurnProfile>`, pushed by `server.rs`'s two chat-completion handlers
 (not by `generate_reply` itself — CLI callers just ignore the returned profile) and served at
 `GET /profile` as JSON. No page serves it (yet): a hand-rolled `assets/dashboard.html`
-(vanilla HTML/CSS/JS, no build step, styled after colibrì's real dashboard tokens/components)
+(vanilla HTML/CSS/JS, no build step, styled after the reference implementation's real dashboard tokens/components)
 went through several rounds and was ultimately pulled back out — verified working end to end
 against the real checkpoint, but not judged good enough to keep, and the user decided a web UI
 for this (and possibly other projects) deserves its own separate repo rather than living inside
@@ -401,19 +401,19 @@ checked that the phase totals stay under the turn's wall time).
 
 Deliberately out of scope here (see `DASHBOARD_BRIEF.md` for the full discussion): a
 "Brain"-style expert routing heatmap and a `/health`-style runtime/hardware overview —
-rabbit has no GPU/VRAM tier and no request scheduler/KV-slots the way colibrì does, so both
+rabbit has no GPU/VRAM tier and no request scheduler/KV-slots the way the reference implementation does, so both
 need real adaptation, not a straight port; left for whatever picks up `DASHBOARD_BRIEF.md`.
 
 **Phase 12 — Performance, round 2 (the rest, not tackled)**
 - Fusing a layer's active experts' matmuls into fewer parallel calls (today 8 experts x 3
   matmuls = 24 separate dispatches per layer) — estimated modest gain (~5-15%), requires being
   able to concatenate heterogeneous `QTKind`/scales across experts.
-- Speculative cross-layer expert prefetch (colibrì's "pilot" thread, ~71.6% hit rate) — the
+- Speculative cross-layer expert prefetch (the reference implementation's "pilot" thread, ~71.6% hit rate) — the
   hardest one: you don't know which experts the next layer will need until the current one
   finishes, so it needs prediction with a correct fallback on a miss.
 - Live re-pinning (`REPIN`/`eheat`, `tier.h`'s decay+swap between turns) — the half of Phase 14
   NOT ported (that phase ported `eusage`/persistent auto-pin; `eheat` remains pending, and
-  colibrì itself ships it off by default too).
+  the reference implementation itself ships it off by default too).
 
 **Undated backlog (evaluate if worth it when we get there)**
 - Native MTP / speculative decoding (`DRAFT=n`/`MTP=1`) — **correction, 2026-07-17: the `jlnsrk`
@@ -421,7 +421,7 @@ need real adaptation, not a straight port; left for whatever picks up `DASHBOARD
   `model.layers.78`, ~5GB across the `out-mtp-*` shards, `eh_proj`/`enorm`/`hnorm` + its own
   experts — this line previously claimed otherwise). See `ROADMAP.md` for the current thinking on
   this idea.
-- GPU/CUDA backend — colibrì itself notes there's no proven end-to-end speedup there yet, so
+- GPU/CUDA backend — the reference implementation itself notes there's no proven end-to-end speedup there yet, so
   it's not an obvious performance win, more a different deployment path.
 - ARM NEON (rabbit is x86_64-only today).
 - Grammar-constrained decoding (GBNF).

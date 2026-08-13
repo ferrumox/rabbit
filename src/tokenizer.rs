@@ -23,6 +23,9 @@ pub enum TokenizerError {
     BadVocabEntry(String),
     BadMergeEntry(usize),
     BadAddedToken,
+    /// `pre_tokenizer` declared a `Split` regex the engine can't compile — better to fail loudly
+    /// than to silently fall back to cl100k's pattern and mis-tokenize every prompt.
+    UnsupportedPreTokenizer { pattern: String, detail: String },
 }
 
 impl fmt::Display for TokenizerError {
@@ -34,6 +37,9 @@ impl fmt::Display for TokenizerError {
             TokenizerError::BadVocabEntry(k) => write!(f, "tokenizer.json: bad vocab entry {k:?}"),
             TokenizerError::BadMergeEntry(i) => write!(f, "tokenizer.json: bad merges[{i}]"),
             TokenizerError::BadAddedToken => write!(f, "tokenizer.json: bad added_tokens entry"),
+            TokenizerError::UnsupportedPreTokenizer { pattern, detail } => {
+                write!(f, "tokenizer.json: can't compile pre_tokenizer Split regex {pattern:?}: {detail}")
+            }
         }
     }
 }
@@ -57,6 +63,30 @@ struct Special {
     id: i32,
 }
 
+/// How a checkpoint's `pre_tokenizer` splits text before BPE runs.
+///
+/// Two real patterns exist across the checkpoints rabbit reads, and they are NOT
+/// interchangeable — see [`CL100K_PATTERN`] and [`Tokenizer::load`]'s selection logic.
+enum Pretok {
+    /// GLM-5.2's cl100k pattern, run by [`pretok_pieces`]'s hand-rolled state machine (a literal
+    /// port of the reference C implementation). Kept as its own variant rather than routed through
+    /// the regex engine so GLM's tokenization stays byte-for-byte what it has always been.
+    Cl100k,
+    /// Any other declared `Split` regex, compiled and run with `fancy_regex` (needed for the
+    /// `(?!\S)` lookahead these patterns all use). Qwen 3.8's pattern lands here: it differs from
+    /// cl100k in three ways that all change real output — `[\p{L}\p{M}]+` instead of `\p{L}+`
+    /// (combining marks group WITH their base letter), `\p{N}` instead of `\p{N}{1,3}` (every
+    /// digit is its own piece, so "2024" is four pieces, not one), and `\p{M}` also excluded from
+    /// the punctuation run.
+    Regex(Box<fancy_regex::Regex>),
+}
+
+/// GLM-5.2's `tokenizer.json`'s own `pre_tokenizer.Split.pattern.Regex`, verbatim (checked against
+/// `tests/fixtures/tokenizer.json`, the real downloaded file). A checkpoint declaring exactly this
+/// gets the hand-rolled [`pretok_pieces`] path; anything else gets compiled by `fancy_regex`.
+const CL100K_PATTERN: &str =
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 pub struct Tokenizer {
     /// byte-level string -> id.
     vocab: HashMap<String, i32>,
@@ -72,6 +102,23 @@ pub struct Tokenizer {
     byte2str: Vec<Vec<u8>>,
     /// codepoint -> original byte, for codepoints < 1024 (covers the whole byte-level map).
     cp2byte: [Option<u8>; 1024],
+    /// Which pre-tokenizer this checkpoint declared — see [`Pretok`].
+    pretok: Pretok,
+    /// The `Split` regex string exactly as the file declared it (`None` if it declared none) —
+    /// kept so a per-architecture loader can VERIFY it is the pattern that architecture's port was
+    /// written against, instead of trusting that whatever shipped is what it expects. See
+    /// `qwen38::tokenizer::load`.
+    declared_pattern: Option<String>,
+    /// `model.ignore_merges`: when true, a piece that is itself a vocab entry is emitted as that
+    /// single id without consulting the merge table at all. **`true` on GLM-5.2's real
+    /// `tokenizer.json`, `false` on Qwen 3.8's** — with it wrongly on, any Qwen piece that happens
+    /// to exist in the vocab skips merge-rank ordering and can produce a different (still
+    /// decodable, so silently wrong) id sequence than the reference tokenizer.
+    ///
+    /// Defaults to `true` when the key is absent, which is what this port did unconditionally
+    /// before this field existed — not HF's own default (`false`), but every checkpoint rabbit
+    /// reads states the key explicitly, so the default only affects synthetic fixtures.
+    ignore_merges: bool,
 }
 
 /// GPT-2/ByteLevel byte<->unicode map: printable ASCII/Latin-1 bytes map to themselves;
@@ -177,8 +224,57 @@ fn parse_merge_entry(v: &Value) -> Option<(String, String)> {
     None
 }
 
+/// Digs the declared `Split` regex out of `pre_tokenizer`, whether it sits there directly or (as on
+/// every real checkpoint) inside a `Sequence` alongside a `ByteLevel` step. `None` when there's no
+/// `pre_tokenizer`, it isn't a `Split`/`Sequence`, or the `Split` carries a non-`Regex` pattern
+/// (a plain string delimiter — no real checkpoint here uses one, and guessing a regex from it would
+/// be worse than falling back).
+fn split_pattern(root: &Value) -> Option<&str> {
+    fn as_split_regex(v: &Value) -> Option<&str> {
+        if v.get("type").and_then(Value::as_str) != Some("Split") {
+            return None;
+        }
+        v.get("pattern").and_then(|p| p.get("Regex")).and_then(Value::as_str)
+    }
+    let pt = root.get("pre_tokenizer")?;
+    as_split_regex(pt).or_else(|| pt.get("pretokenizers").and_then(Value::as_array)?.iter().find_map(as_split_regex))
+}
+
 const ISNL: fn(u32) -> bool = |c| c == b'\r' as u32 || c == b'\n' as u32;
 const LOW: fn(u32) -> u32 = |c| if (b'A' as u32..=b'Z' as u32).contains(&c) { c + 32 } else { c };
+
+/// Pre-tokenizer pieces for a declared `Split` regex, the counterpart of [`pretok_pieces`] for
+/// [`Pretok::Regex`]: byte ranges into `s`, covering it completely.
+///
+/// Both the matches AND the gaps between them become pieces, matching HF `tokenizers`' `Split`
+/// with `behavior: "Isolated"` (which keeps the delimiters as their own tokens rather than
+/// dropping them). In practice these patterns match everything — the final `\s+` alternative plus
+/// the `[^\s\p{L}\p{M}\p{N}]+` one leave no gaps for real text — but emitting the gaps anyway means
+/// an unmatched byte is tokenized rather than silently deleted, which is the same choice
+/// `pretok_pieces`' own "safety net" branch makes.
+///
+/// Empty matches are skipped (a zero-width match would otherwise emit an empty piece);
+/// `fancy_regex`'s own iterator advances past them, so this can't loop.
+fn regex_pieces(re: &fancy_regex::Regex, s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    for m in re.find_iter(s) {
+        // A regex-engine error mid-iteration (backtrack limit) leaves the REST of the chunk
+        // unsplit rather than dropped: `bpe_piece` still encodes it, just as one piece.
+        let Ok(m) = m else { break };
+        if m.start() > last {
+            out.push((last, m.start()));
+        }
+        if m.end() > m.start() {
+            out.push((m.start(), m.end()));
+        }
+        last = last.max(m.end());
+    }
+    if last < s.len() {
+        out.push((last, s.len()));
+    }
+    out
+}
 
 /// Splits `p[a..b)` into pre-tokenizer pieces (byte ranges), applying the cl100k pattern's
 /// alternatives in order — literal port of `pretok_chunk`'s regex-by-hand state machine.
@@ -388,15 +484,55 @@ impl Tokenizer {
 
         let (byte2str, cp2byte) = build_bytemap();
 
-        Ok(Tokenizer { vocab, merges, id2str, id_added, specials, byte2str, cp2byte })
+        // A checkpoint declaring exactly GLM's cl100k pattern (or declaring no `Split` at all,
+        // which is what this crate's own minimal test fixtures do) keeps the hand-rolled path;
+        // anything else is compiled and run as written, so a pattern rabbit has never seen still
+        // tokenizes per the checkpoint rather than per GLM's assumptions.
+        let declared = split_pattern(&root);
+        let pretok = match declared {
+            None => Pretok::Cl100k,
+            Some(p) if p == CL100K_PATTERN => Pretok::Cl100k,
+            Some(p) => Pretok::Regex(Box::new(fancy_regex::Regex::new(p).map_err(|e| {
+                TokenizerError::UnsupportedPreTokenizer { pattern: p.to_string(), detail: e.to_string() }
+            })?)),
+        };
+        let declared_pattern = declared.map(str::to_string);
+        let ignore_merges = model.get("ignore_merges").and_then(Value::as_bool).unwrap_or(true);
+
+        Ok(Tokenizer {
+            vocab,
+            merges,
+            id2str,
+            id_added,
+            specials,
+            byte2str,
+            cp2byte,
+            pretok,
+            declared_pattern,
+            ignore_merges,
+        })
+    }
+
+    /// The `pre_tokenizer.Split` regex the loaded file declared, if any — for a per-architecture
+    /// loader to check against the pattern it was written against (see `declared_pattern`'s doc).
+    pub fn declared_pretok_pattern(&self) -> Option<&str> {
+        self.declared_pattern.as_deref()
+    }
+
+    /// The loaded file's `model.ignore_merges` (defaulted per that field's doc).
+    pub fn ignore_merges(&self) -> bool {
+        self.ignore_merges
     }
 
     /// BPE-encodes one pre-tokenized piece (raw bytes) and appends resulting ids to `out`.
     fn bpe_piece(&self, bytes: &[u8], out: &mut Vec<i32>) {
         let s = byte_level_encode(&self.byte2str, bytes);
 
-        // ignore_merges: if the whole piece is itself a vocab entry, emit it directly.
-        if let Some(&id) = self.vocab.get(s.as_str()) {
+        // ignore_merges: if the whole piece is itself a vocab entry, emit it directly. Gated on the
+        // checkpoint's own flag — see `Tokenizer::ignore_merges`; Qwen 3.8 sets it false.
+        if self.ignore_merges
+            && let Some(&id) = self.vocab.get(s.as_str())
+        {
             out.push(id);
             return;
         }
@@ -434,8 +570,24 @@ impl Tokenizer {
     }
 
     fn pretok_chunk(&self, p: &[u8], a: usize, b: usize, out: &mut Vec<i32>) {
-        for (s, e) in pretok_pieces(p, a, b) {
-            self.bpe_piece(&p[s..e], out);
+        match &self.pretok {
+            Pretok::Cl100k => {
+                for (s, e) in pretok_pieces(p, a, b) {
+                    self.bpe_piece(&p[s..e], out);
+                }
+            }
+            Pretok::Regex(re) => {
+                // `encode` only ever hands over slices cut at added-token boundaries of a `&str`,
+                // so this is valid UTF-8 in practice; a malformed slice is encoded whole rather
+                // than dropped.
+                let Ok(chunk) = std::str::from_utf8(&p[a..b]) else {
+                    self.bpe_piece(&p[a..b], out);
+                    return;
+                };
+                for (s, e) in regex_pieces(re, chunk) {
+                    self.bpe_piece(&chunk.as_bytes()[s..e], out);
+                }
+            }
         }
     }
 
@@ -628,6 +780,142 @@ mod tests {
         fs::remove_file(&path).ok();
 
         assert_eq!(tok.encode("ab"), vec![2]);
+    }
+
+    /// Same fixture shape as `minimal_tokenizer_json`, plus the two fields that decide
+    /// pre-tokenization: a declared `Split` regex and `model.ignore_merges`.
+    fn tokenizer_json_with(vocab: &[(String, i32)], pattern: Option<&str>, ignore_merges: Option<bool>) -> String {
+        let vocab_json: Vec<String> = vocab.iter().map(|(k, v)| format!("{:?}:{v}", k)).collect();
+        let pre = pattern
+            .map(|p| {
+                format!(
+                    r#""pre_tokenizer":{{"type":"Sequence","pretokenizers":[{{"type":"Split","pattern":{{"Regex":{p:?}}},"behavior":"Isolated"}},{{"type":"ByteLevel","use_regex":false}}]}},"#
+                )
+            })
+            .unwrap_or_default();
+        let im = ignore_merges.map(|v| format!(r#""ignore_merges":{v},"#)).unwrap_or_default();
+        format!(r#"{{{pre}"model":{{"type":"BPE",{im}"vocab":{{{}}},"merges":[]}}}}"#, vocab_json.join(","))
+    }
+
+    fn ascii_vocab() -> Vec<(String, i32)> {
+        let (byte2str, _) = build_bytemap();
+        let mut v = Vec::new();
+        for b in 32u8..=126 {
+            v.push((byte_level_encode(&byte2str, &[b]), (b as i32) - 32));
+        }
+        // "é" decomposed is 'e' + U+0301 (0xCC 0x81); byte-level maps those two bytes to their own
+        // codepoints, so give both an id to keep the mark test's pieces encodable.
+        for (i, b) in [0xCCu8, 0x81].into_iter().enumerate() {
+            v.push((byte_level_encode(&byte2str, &[b]), 200 + i as i32));
+        }
+        v
+    }
+
+    /// The whole point of `Pretok`: GLM's exact pattern keeps the hand-rolled state machine, and
+    /// anything else (here Qwen 3.8's) is compiled and run as declared.
+    #[test]
+    fn declared_pattern_picks_the_hand_rolled_path_only_for_cl100k() {
+        let v = ascii_vocab();
+
+        let glm = write_fixture("flavor_cl100k", &tokenizer_json_with(&v, Some(CL100K_PATTERN), Some(true)));
+        let tok = Tokenizer::load(&glm).unwrap();
+        fs::remove_file(&glm).ok();
+        assert!(matches!(tok.pretok, Pretok::Cl100k));
+        assert_eq!(tok.declared_pretok_pattern(), Some(CL100K_PATTERN));
+
+        let qwen_pattern = crate::qwen38::tokenizer::QWEN38_PRETOK_PATTERN;
+        let qwen = write_fixture("flavor_qwen", &tokenizer_json_with(&v, Some(qwen_pattern), Some(false)));
+        let tok = Tokenizer::load(&qwen).unwrap();
+        fs::remove_file(&qwen).ok();
+        assert!(matches!(tok.pretok, Pretok::Regex(_)));
+
+        // no `pre_tokenizer` at all (this module's older fixtures) -> unchanged behavior
+        let bare = write_fixture("flavor_none", &tokenizer_json_with(&v, None, None));
+        let tok = Tokenizer::load(&bare).unwrap();
+        fs::remove_file(&bare).ok();
+        assert!(matches!(tok.pretok, Pretok::Cl100k));
+        assert!(tok.ignore_merges(), "absent ignore_merges keeps this port's original behavior");
+    }
+
+    /// The three real differences between Qwen's declared pattern and cl100k's, checked as PIECES
+    /// (not ids, which depend on a vocab): digits split one by one, and a combining mark stays with
+    /// its base letter instead of being cut off into the punctuation run.
+    #[test]
+    fn qwen_pattern_isolates_digits_and_keeps_marks_with_letters() {
+        let re = fancy_regex::Regex::new(crate::qwen38::tokenizer::QWEN38_PRETOK_PATTERN).unwrap();
+        let piece_strs = |s: &str| -> Vec<String> {
+            regex_pieces(&re, s).into_iter().map(|(a, b)| s[a..b].to_string()).collect()
+        };
+
+        // Neither pattern gives the digit run a ` ?` prefix (only the letter and punctuation
+        // alternatives have one), so the space before a number is always its own piece; what
+        // differs is how the digits themselves are grouped.
+        assert_eq!(piece_strs("In 2024 we"), vec!["In", " ", "2", "0", "2", "4", " we"]);
+        let cl100k: Vec<&str> = pretok_pieces(b"In 2024 we", 0, 10)
+            .into_iter()
+            .map(|(a, b)| std::str::from_utf8(&b"In 2024 we"[a..b]).unwrap())
+            .collect();
+        assert_eq!(cl100k, vec!["In", " ", "202", "4", " we"], "cl100k takes up to 3 digits at a time");
+
+        // "cafe" + U+0301 (combining acute): one piece under Qwen's `[\p{L}\p{M}]+`...
+        let decomposed = "cafe\u{301} x";
+        assert_eq!(piece_strs(decomposed), vec!["cafe\u{301}", " x"]);
+        // ...but two under cl100k's `\p{L}+`, where the mark falls into `[^\s\p{L}\p{N}]+`.
+        let db = decomposed.as_bytes();
+        let split: Vec<&str> = pretok_pieces(db, 0, db.len())
+            .into_iter()
+            .map(|(a, b)| std::str::from_utf8(&db[a..b]).unwrap())
+            .collect();
+        assert_eq!(split, vec!["cafe", "\u{301}", " x"]);
+    }
+
+    /// Pieces must tile the input exactly — no dropped bytes even for input the pattern's
+    /// alternatives don't cover, which is what `regex_pieces`' gap handling is for.
+    #[test]
+    fn regex_pieces_cover_the_whole_input() {
+        let re = fancy_regex::Regex::new(crate::qwen38::tokenizer::QWEN38_PRETOK_PATTERN).unwrap();
+        for s in ["", "a", "  ", "hola, ¿qué tal?\n\n42 🎉", "\u{0}\u{1}raro"] {
+            let pieces = regex_pieces(&re, s);
+            let rebuilt: String = pieces.iter().map(|&(a, b)| &s[a..b]).collect();
+            assert_eq!(rebuilt, s, "pieces must tile {s:?}");
+            for w in pieces.windows(2) {
+                assert_eq!(w[0].1, w[1].0, "no gaps/overlaps in {s:?}");
+            }
+        }
+    }
+
+    /// With `ignore_merges: false` (Qwen's setting) a piece that IS a vocab entry must still go
+    /// through the merge table — the mirror image of `ignore_merges_shortcut_bypasses_rank_ordering`.
+    #[test]
+    fn ignore_merges_false_does_not_shortcut_whole_pieces() {
+        let (byte2str, _) = build_bytemap();
+        let bl = |s: &str| byte_level_encode(&byte2str, s.as_bytes());
+        let vocab = [(bl("a"), 0), (bl("b"), 1), (bl("ab"), 2)];
+
+        let on = write_fixture("im_on", &tokenizer_json_with(&vocab, None, Some(true)));
+        let tok_on = Tokenizer::load(&on).unwrap();
+        fs::remove_file(&on).ok();
+        assert_eq!(tok_on.encode("ab"), vec![2], "shortcut ON: whole piece emitted directly");
+
+        let off = write_fixture("im_off", &tokenizer_json_with(&vocab, None, Some(false)));
+        let tok_off = Tokenizer::load(&off).unwrap();
+        fs::remove_file(&off).ok();
+        assert_eq!(tok_off.encode("ab"), vec![0, 1], "shortcut OFF: no merge exists, so two ids");
+    }
+
+    #[test]
+    fn rejects_a_split_regex_the_engine_cannot_compile() {
+        let v = ascii_vocab();
+        let path = write_fixture("bad_regex", &tokenizer_json_with(&v, Some("(unclosed[a-"), None));
+        let result = Tokenizer::load(&path);
+        fs::remove_file(&path).ok();
+        match result {
+            Err(e @ TokenizerError::UnsupportedPreTokenizer { .. }) => {
+                assert!(e.to_string().contains("unclosed"), "the error must quote the offending pattern: {e}");
+            }
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("an uncompilable Split regex must not load"),
+        }
     }
 
     #[test]

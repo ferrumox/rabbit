@@ -11,6 +11,7 @@ pub mod kimi_linear;
 pub mod kv_session;
 pub mod model;
 pub mod quant;
+pub mod qwen38;
 pub mod safetensors;
 pub mod server;
 pub mod tokenizer;

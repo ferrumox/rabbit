@@ -104,6 +104,30 @@ pub enum ExpertNaming {
     /// and matches exactly, so `qt_load_mxfp4` reads the on-disk bytes straight into
     /// `QTKind::MxFp4` with no transcoding step.
     KimiK3Mxfp4,
+    /// Qwen 3.8's routed experts as AMD published them in `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`
+    /// (`model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj`, no `language_model.` wrapper —
+    /// Qwen3.8-Max is text-only, unlike K3's multimodal checkpoint). Same OCP MXFP4 container as
+    /// [`ExpertNaming::KimiK3Mxfp4`] with ONE difference: the packed tensor is named plainly
+    /// `{name}.weight` (AMD-Quark's export convention) rather than `{name}.weight_packed`
+    /// (`compressed-tensors`'), which is what [`ExpertNaming::packed_suffix`] exists for. The
+    /// E8M0 scale sidecar keeps the same `{name}.weight_scale` name in both.
+    ///
+    /// **Bit-compatibility verified against the bf16 original, not assumed** (2026-08-13): read
+    /// three rows of `model.layers.3.mlp.experts.0.gate_proj` from this checkpoint and the same
+    /// rows of `Qwen/Qwen3.8-2.4T-A95B`'s fused bf16 `experts.gate_up_proj` (74 KB of ranged HTTP
+    /// reads, no full shard downloaded), then decoded the packed bytes three ways. Rabbit's own
+    /// order — low nibble first, `e2m1_decode * e8m0_decode(scale[col / 32])`, exactly what
+    /// `quant.rs`'s `QTKind::MxFp4` branch already does for K3 — scored **cosine 0.9933** against
+    /// the bf16 ground truth (the residual is 4-bit quantization loss, nothing else), while
+    /// high-nibble-first scored 0.025 and a reordered-halves hypothesis 0.021. Quark's
+    /// `pack_method: "reorder"` in `config.json` therefore does NOT mean a different nibble
+    /// order. Also confirmed there: the bf16 fused `[512, 4096, 8192]` tensor stacks gate in rows
+    /// `0..2047` and up in `2048..4095` (not interleaved).
+    ///
+    /// A Qwen 3.8 checkpoint whose experts are NOT MXFP4 (a synthetic F32 test fixture, a future
+    /// rabbit-side re-conversion) needs no variant of its own: its tensor names are
+    /// character-for-character [`ExpertNaming::Glm52`]'s, which already appends `.weight`.
+    Qwen38Mxfp4,
 }
 
 impl ExpertNaming {
@@ -113,7 +137,24 @@ impl ExpertNaming {
     fn tensor_count(&self) -> usize {
         match self {
             ExpertNaming::Glm52FusedGateUp => 2,
-            ExpertNaming::Glm52 | ExpertNaming::KimiLinear | ExpertNaming::KimiK3 | ExpertNaming::KimiK3Mxfp4 => 3,
+            ExpertNaming::Glm52
+            | ExpertNaming::KimiLinear
+            | ExpertNaming::KimiK3
+            | ExpertNaming::KimiK3Mxfp4
+            | ExpertNaming::Qwen38Mxfp4 => 3,
+        }
+    }
+
+    /// The suffix appended to a `tensor_specs` BASE name to reach the packed-weight tensor, for
+    /// `is_mxfp4` namings only (every other naming's `tensor_specs` already returns full names).
+    /// `compressed-tensors` (K3) writes `{name}.weight_packed`; AMD-Quark (Qwen 3.8) writes plain
+    /// `{name}.weight` — the containers are byte-identical, only the naming differs, so this is
+    /// the whole delta between the two MXFP4 namings. The scale sidecar is `{name}.weight_scale`
+    /// in both, so it needs no equivalent hook.
+    fn packed_suffix(&self) -> &'static str {
+        match self {
+            ExpertNaming::Qwen38Mxfp4 => ".weight",
+            _ => ".weight_packed",
         }
     }
 
@@ -125,7 +166,7 @@ impl ExpertNaming {
     /// synchronous path) until it was built to close the gap once disk I/O, not compute, became
     /// the dominant cost per token (see `PERFORMANCE_KIMI_K3.md`).
     fn is_mxfp4(&self) -> bool {
-        matches!(self, ExpertNaming::KimiK3Mxfp4)
+        matches!(self, ExpertNaming::KimiK3Mxfp4 | ExpertNaming::Qwen38Mxfp4)
     }
 
     /// Returns `(tensor_name, rows, cols)` in read order — every caller in this file (the
@@ -155,6 +196,15 @@ impl ExpertNaming {
                 // itself, since this naming has no single `.weight` tensor to point at.
                 let p = |suf: &str| format!("language_model.model.layers.{layer}.block_sparse_moe.experts.{eid}.{suf}");
                 vec![(p("w1"), moe_inter, hidden), (p("w3"), moe_inter, hidden), (p("w2"), hidden, moe_inter)]
+            }
+            ExpertNaming::Qwen38Mxfp4 => {
+                // BASE names again (no suffix) — `packed_suffix` appends `.weight` here, where
+                // `KimiK3Mxfp4` appends `.weight_packed`. Shapes are the real checkpoint's:
+                // `gate_proj`/`up_proj` are `[moe_inter, hidden]` = `[2048, 8192]` and `down_proj`
+                // `[hidden, moe_inter]` = `[8192, 2048]`, matching the `[2048, 4096]` U8 packed
+                // tensor + `[2048, 256]` E8M0 scale read off the real shard header this session.
+                let p = |suf: &str| format!("model.layers.{layer}.mlp.experts.{eid}.{suf}");
+                vec![(p("gate_proj"), moe_inter, hidden), (p("up_proj"), moe_inter, hidden), (p("down_proj"), hidden, moe_inter)]
             }
         }
     }
@@ -284,7 +334,7 @@ mod uring_load {
                     // unlike every other naming, there's no plain `{name}` tensor to look up at
                     // all, and the scale sidecar always exists (not a maybe-present `.qs`/FP8
                     // check like the branches below).
-                    let packed_name = format!("{name}.weight_packed");
+                    let packed_name = format!("{name}{}", naming.packed_suffix());
                     let scale_name = format!("{name}.weight_scale");
                     let loc = shards.tensor_location(&packed_name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(packed_name)))?;
                     let sloc = shards.tensor_location(&scale_name).ok_or(ModelError::Safetensors(SafetensorsError::MissingTensor(scale_name)))?;
@@ -540,9 +590,9 @@ mod mmap_load {
     /// here.
     fn load_one(shards: &Shards, layer: usize, eid: usize, moe_inter: usize, hidden: usize, used: u64, naming: ExpertNaming) -> Result<ExpertSlot, ModelError> {
         let specs = naming.tensor_specs(layer, eid, moe_inter, hidden);
-        let gate = qt_mmap_mxfp4(shards, &specs[0].0, specs[0].1, specs[0].2)?;
-        let up = qt_mmap_mxfp4(shards, &specs[1].0, specs[1].1, specs[1].2)?;
-        let down = qt_mmap_mxfp4(shards, &specs[2].0, specs[2].1, specs[2].2)?;
+        let gate = qt_mmap_mxfp4(shards, naming, &specs[0].0, specs[0].1, specs[0].2)?;
+        let up = qt_mmap_mxfp4(shards, naming, &specs[1].0, specs[1].1, specs[1].2)?;
+        let down = qt_mmap_mxfp4(shards, naming, &specs[2].0, specs[2].1, specs[2].2)?;
         Ok(ExpertSlot { eid, gate_up: GateUp::Separate { gate, up }, down, used })
     }
 
@@ -551,8 +601,8 @@ mod mmap_load {
     /// the mapped byte ranges — no allocation, no `pread`, no `read_raw` copy. Issues a
     /// best-effort `MADV_WILLNEED` hint for both ranges before returning, mirroring
     /// `uring_load::submit_batch` kicking off its reads without waiting for them.
-    fn qt_mmap_mxfp4(shards: &Shards, base_name: &str, rows: usize, cols: usize) -> Result<QT, ModelError> {
-        let packed_name = format!("{base_name}.weight_packed");
+    fn qt_mmap_mxfp4(shards: &Shards, naming: ExpertNaming, base_name: &str, rows: usize, cols: usize) -> Result<QT, ModelError> {
+        let packed_name = format!("{base_name}{}", naming.packed_suffix());
         let scale_name = format!("{base_name}.weight_scale");
         let MmapTensorRange { mmap: data_mmap, range: data_range } = shards
             .tensor_mmap_range(&packed_name)
@@ -1043,7 +1093,7 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
     let gs = cfg.group_size as usize;
     let specs = naming.tensor_specs(layer, eid, i, d);
     let load_one = |name: &str, rows: usize, cols: usize| -> Result<QT, ModelError> {
-        if naming.is_mxfp4() { qt_load_mxfp4(shards, name, rows, cols) } else { qt_load(shards, gs, name, rows, cols, bits) }
+        if naming.is_mxfp4() { qt_load_mxfp4(shards, naming, name, rows, cols) } else { qt_load(shards, gs, name, rows, cols, bits) }
     };
     let (gate_up, down) = if specs.len() == 2 {
         let gate_up = load_one(&specs[0].0, specs[0].1, specs[0].2)?;
@@ -1136,7 +1186,7 @@ fn mxfp4_expert_bytes(moe_inter: usize, hidden: usize) -> u64 {
 /// exists to prevent. Getting the accounting exactly right for the mmap path (e.g. reading
 /// `MADV_WILLNEED`'d-but-not-yet-faulted pages some other way) is left for a follow-up once this
 /// experiment's real A/B numbers justify the extra complexity.
-pub(crate) fn safe_mxfp4_capacity(requested: usize, n_moe_layers: usize, moe_inter: usize, hidden: usize) -> usize {
+pub fn safe_mxfp4_capacity(requested: usize, n_moe_layers: usize, moe_inter: usize, hidden: usize) -> usize {
     let budget = available_memory_bytes()
         .map(|avail| (avail as f64 * MXFP4_AUTO_CACHE_BUDGET_FRACTION) as u64)
         .unwrap_or(SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES)
@@ -1179,8 +1229,8 @@ pub(crate) fn safe_mxfp4_capacity_with_budget(requested: usize, n_moe_layers: us
 /// decode/requantize step, since rabbit's own `QTKind::MxFp4` byte layout was confirmed
 /// bit-for-bit identical to the real quantizer's (see `ExpertNaming::KimiK3Mxfp4`'s doc): `data`
 /// is `{base_name}.weight_packed` verbatim, `block_scale` is `{base_name}.weight_scale` verbatim.
-fn qt_load_mxfp4(shards: &Shards, base_name: &str, rows: usize, cols: usize) -> Result<QT, ModelError> {
-    let packed_name = format!("{base_name}.weight_packed");
+fn qt_load_mxfp4(shards: &Shards, naming: ExpertNaming, base_name: &str, rows: usize, cols: usize) -> Result<QT, ModelError> {
+    let packed_name = format!("{base_name}{}", naming.packed_suffix());
     let scale_name = format!("{base_name}.weight_scale");
     let data = shards.read_raw(&packed_name, false).map_err(ModelError::Safetensors)?;
     let block_scale = shards.read_raw(&scale_name, false).map_err(ModelError::Safetensors)?;
@@ -1743,6 +1793,123 @@ mod tests {
         assert_eq!(down_vals.len(), hidden * moe_inter);
         for &v in up_vals.iter().chain(down_vals.iter()) {
             assert!(E2M1_TEST_MAGNITUDES.contains(&v.abs()) || v == 0.0, "value {v} isn't an exact E2M1 magnitude");
+        }
+    }
+
+    /// Writes ONE set of MXFP4 bytes per expert tensor under BOTH MXFP4 namings at once: K3's
+    /// `language_model.model.layers.0.block_sparse_moe.experts.{e}.{w1,w3,w2}.weight_packed` and
+    /// Qwen 3.8's `model.layers.0.mlp.experts.{e}.{gate,up,down}_proj.weight`, sharing a single
+    /// `{name}.weight_scale` shape convention. Lets a test assert the two namings decode to
+    /// IDENTICAL values, which is the actual claim `ExpertNaming::packed_suffix` makes.
+    ///
+    /// The Qwen-named entries declare the real checkpoint's PACKED shapes (`[rows, cols/2]` for
+    /// the weight, `[rows, cols/32]` for the scale — as read off
+    /// `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`'s own shard header this session), while the K3-named
+    /// ones keep this test module's existing logical-shape convention. Both must load: rabbit
+    /// validates MXFP4 tensors by BYTE LENGTH against `rows`/`cols` from the config, never by the
+    /// declared shape, and this fixture pins that down.
+    fn build_dual_naming_mxfp4_fixture(name: &str, n_experts: usize, moe_inter: usize, hidden: usize) -> TempDir {
+        let dir = TempDir::new(name);
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), json!({"format": "rabbit-test"}));
+        let mut data = Vec::new();
+        let mut push_raw = |header: &mut serde_json::Map<String, serde_json::Value>, name: String, shape: Vec<usize>, bytes: &[u8]| {
+            let start = data.len() as u64;
+            data.extend_from_slice(bytes);
+            let end = data.len() as u64;
+            header.insert(name, json!({"dtype": "U8", "shape": shape, "data_offsets": [start, end]}));
+        };
+        let mk = |rows: usize, cols: usize, seed: u32| -> (Vec<u8>, Vec<u8>) {
+            let mut s = seed;
+            let w: Vec<f32> = (0..rows * cols).map(|_| xorshift(&mut s)).collect();
+            let mut t = QT::alloc_mxfp4(rows, cols);
+            t.fill(&w);
+            match t.kind {
+                QTKind::MxFp4 { data, block_scale } => (data.as_slice().to_vec(), block_scale.as_slice().to_vec()),
+                _ => unreachable!(),
+            }
+        };
+        for eid in 0..n_experts {
+            let k3 = |suf: &str| format!("language_model.model.layers.0.block_sparse_moe.experts.{eid}.{suf}");
+            let qwen = |suf: &str| format!("model.layers.0.mlp.experts.{eid}.{suf}");
+            for (i, (k3_suf, qwen_suf, rows, cols)) in
+                [("w1", "gate_proj", moe_inter, hidden), ("w3", "up_proj", moe_inter, hidden), ("w2", "down_proj", hidden, moe_inter)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let (packed, scale) = mk(rows, cols, (eid as u32) * 3 + i as u32 + 1);
+                push_raw(&mut header, format!("{}.weight_packed", k3(k3_suf)), vec![rows, cols], &packed);
+                push_raw(&mut header, format!("{}.weight_scale", k3(k3_suf)), vec![rows, cols.div_ceil(32)], &scale);
+                push_raw(&mut header, format!("{}.weight", qwen(qwen_suf)), vec![rows, cols.div_ceil(2)], &packed);
+                push_raw(&mut header, format!("{}.weight_scale", qwen(qwen_suf)), vec![rows, cols.div_ceil(32)], &scale);
+            }
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend_from_slice(&data);
+        fs::write(dir.0.join("model.safetensors"), out).unwrap();
+        dir
+    }
+
+    /// `ExpertNaming::Qwen38Mxfp4` must read `{name}.weight` (AMD-Quark's naming) where
+    /// `KimiK3Mxfp4` reads `{name}.weight_packed` (`compressed-tensors`'), and land
+    /// `gate_proj`/`up_proj`/`down_proj` in `gate`/`up`/`down` — checked against the K3 naming
+    /// reading the SAME bytes, so the assertion is "the suffix and the tensor names are the ONLY
+    /// difference", not merely "it loads something".
+    #[test]
+    fn qwen38_mxfp4_naming_reads_plain_weight_and_decodes_like_k3_naming() {
+        let (moe_inter, hidden) = (4usize, 40usize); // hidden > 32 -> 2 E8M0 blocks per gate/up row
+        let fixture = build_dual_naming_mxfp4_fixture("rabbit_test_ecache_qwen38_mxfp4", 1, moe_inter, hidden);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(1, moe_inter as i32, hidden as i32);
+
+        let mut qwen = ExpertCache::for_family(8, ExpertNaming::Qwen38Mxfp4);
+        let mut k3 = ExpertCache::for_family(8, ExpertNaming::KimiK3Mxfp4);
+        let q = qwen.get_or_load(&shards, &cfg, 0, 0, 4).unwrap();
+
+        assert_eq!(q.gate().rows, moe_inter);
+        assert_eq!(q.gate().cols, hidden);
+        assert_eq!(q.down.rows, hidden);
+        assert_eq!(q.down.cols, moe_inter);
+        assert!(matches!(q.gate().kind, QTKind::MxFp4 { .. }), "must land in the MXFP4 container, not a requantized copy");
+        assert!(matches!(q.up().kind, QTKind::MxFp4 { .. }));
+        assert!(matches!(q.down.kind, QTKind::MxFp4 { .. }));
+
+        let (qg, qu, qd) = (qt_values(q.gate()), qt_values(q.up()), qt_values(&q.down));
+        let r = k3.get_or_load(&shards, &cfg, 0, 0, 4).unwrap();
+        assert_eq!(qg, qt_values(r.gate()), "gate_proj must decode exactly like w1");
+        assert_eq!(qu, qt_values(r.up()), "up_proj must decode exactly like w3");
+        assert_eq!(qd, qt_values(&r.down), "down_proj must decode exactly like w2");
+        assert_ne!(qg, qu, "the fixture's gate/up differ, so an equal-values assertion above can't be vacuous");
+    }
+
+    /// Same claim for `ensure_loaded`'s batched (`io_uring` on Linux) path, which builds the
+    /// packed name itself in `uring_load::submit_batch` rather than going through
+    /// `qt_load_mxfp4` — a `packed_suffix` fix applied to only one of the two paths would pass
+    /// the test above and fail here.
+    #[test]
+    fn qwen38_mxfp4_naming_ensure_loaded_matches_get_or_load() {
+        let (moe_inter, hidden) = (4usize, 40usize);
+        let fixture = build_dual_naming_mxfp4_fixture("rabbit_test_ecache_qwen38_mxfp4_batch", 3, moe_inter, hidden);
+        let shards = Shards::open(&fixture.0).unwrap();
+        let cfg = tiny_cfg(3, moe_inter as i32, hidden as i32);
+        let eids = [0usize, 1, 2];
+
+        let mut cache_seq = ExpertCache::for_family(8, ExpertNaming::Qwen38Mxfp4);
+        for &eid in &eids {
+            cache_seq.get_or_load(&shards, &cfg, 0, eid, 32).unwrap();
+        }
+        let mut cache_batch = ExpertCache::for_family(8, ExpertNaming::Qwen38Mxfp4);
+        cache_batch.ensure_loaded(&shards, &cfg, 0, &eids, 32).unwrap();
+
+        for &eid in &eids {
+            let a = cache_seq.get(eid).unwrap();
+            let b = cache_batch.get(eid).unwrap();
+            assert_eq!(qt_values(a.gate()), qt_values(b.gate()), "expert {eid} gate");
+            assert_eq!(qt_values(a.up()), qt_values(b.up()), "expert {eid} up");
+            assert_eq!(qt_values(&a.down), qt_values(&b.down), "expert {eid} down");
         }
     }
 

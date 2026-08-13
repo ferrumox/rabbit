@@ -2,183 +2,180 @@
   <img src="assets/rabbit.svg" width="500" alt="rabbit — small hops, immense models">
 </p>
 
-**Small hops, immense models.** A Rust engine that runs frontier open-weight MoE models on a
-single machine. The dense part stays resident in RAM; the routed experts stream from disk on
-demand.
+**A 2.4-trillion-parameter model. One mini-PC. 46 GB of RAM.**
 
-Moonshot AI published **Kimi K3** on 2026-07-27, a 2.8-trillion-parameter Mixture-of-Experts
-model and one of the largest open-weight releases so far. rabbit runs it the next day, straight
-off Moonshot's published checkpoint. No conversion step.
+Frontier open-weight MoE inference in Rust. No GPU, no BLAS, no framework. The dense part stays in
+RAM. The routed experts, 1.26 TB of them, stay on disk and stream in as each token needs them.
 
 ```
-$ rabbit --model /mnt/data/kimi-k3 --prompt "What is the capital of France?" --max-tokens 40
-loading model (dbits=4, ebits=4)...
-model loaded in 610.0s (93 layers, 896 experts/layer)
-prefill (7 tokens)...
-  prefill done in 412.8s
-  ...
-...response["answer"] == "Paris"...
+$ rabbit --model /mnt/data/qwen38-max-mxfp4 --shard-dirs ~/qwen38-max-mxfp4-shards2 \
+         --prompt "¿Cuál es la capital de Francia? Respondé en una frase."
+model loaded in 113.1s (92 layers)
+prefill (14 tokens)...
+  prefill done in 59.3s
+  token 1/40 in 5.2s ...
 
-40 tokens in 2698.1s
+<think>
+The user is asking "What is the capital of France?" ... the capital of France is Paris.
+
+phase breakdown: expert wait (disk) 143.8s, expert matmul 76.6s, attention 22.4s, lm_head 0.6s
 ```
 
-Correctness validated three ways before that run. Bit-exact against a random-weight instance of
-Moonshot's own PyTorch reference (teacher-forcing, every position, `tests/teacher_forcing_k3.rs`).
-A structural smoke test against the real 1.56TB checkpoint (`examples/k3_smoke.rs`). And the real
-prompt above, answered correctly. No performance work has landed for K3 yet; the numbers above
-are correctness-first, not tuned. rabbit's other architecture, GLM-5.2, started from a similarly
-slow floor and is now 3.5× faster across eight measured versions. See
-[Honest numbers](#honest-numbers-ryzen-ai-9-hx-370-12-cores24-threads) and `PERFORMANCE.md`.
+Alibaba published Qwen3.8-Max (2.446 T parameters) in August 2026. rabbit runs it off AMD's MXFP4
+release with no conversion step, reading the on-disk format byte for byte.
 
-K3 brings Kimi Delta Attention plus a Gated MLA hybrid, Stable LatentMoE (routed experts compute
-in a narrower latent width, not the full hidden size), Attention Residuals (a transient
-block-pooling mechanism across layers), and native OCP MXFP4 quantization for its 896
-experts/layer. rabbit reads that MXFP4 straight off disk, byte for byte, no requantization.
+## Measured on a Slimbook ONE (Ryzen AI 9 HX 370, 12 cores, 123 GB RAM, 2x NVMe)
+
+| Model | Params | On disk | RAM used | Decode | Version |
+|---|---|---|---|---|---|
+| **Qwen3.8-Max** | 2.446 T | 1.37 TB (MXFP4) | **45.7 GB** | **4.71 s/token, 0.212 tok/s** | v0.29.0, first working version |
+| Kimi K3 | 2.8 T | 1.45 TB (MXFP4) | 46 GB | 5.93 s/token, 0.169 tok/s | v0.28.1, 7.3x faster than v0.23.0 |
+| GLM-5.2 | 744 B | 378 GB (int4) | | 1.02 words/s, 3.5x faster than v0.14.0 | v0.22.0 |
+| Kimi Linear 48B | 48 B | BF16 | | not characterized | |
+
+Every number comes from a real run against the real checkpoint. Full chronological logs, including
+what was tried and reverted: `PERFORMANCE_QWEN38.md`, `PERFORMANCE_KIMI_K3.md`, `PERFORMANCE.md`.
+
+Where a Qwen3.8-Max decode step goes: 59% waiting for expert bytes, 31% multiplying them, 9% for all
+92 layers of attention and Gated DeltaNet combined.
 
 ## The idea
 
-A large MoE model activates a small fraction of its parameters per token, and only the routed
-experts change token to token. So, across every architecture rabbit runs:
+A large MoE activates a small fraction of its parameters per token, and only the routed experts
+change from token to token. So:
 
-- the **dense part** (attention, shared experts, embeddings) stays **resident in RAM**, quantized;
-- the **routed experts**, thousands of them, tens of MB each, live **on disk** and are
-  **streamed on demand**, through a per-layer LRU cache, a persistent learned pin for the
-  hottest ones, and the OS page cache as a free extra tier.
+* the dense part (attention, shared experts, embeddings) stays resident in RAM, quantized. That is
+  24.3 GB for a 2.4 T model.
+* the routed experts, 47,104 of them on Qwen3.8-Max at 27 MB each, live on disk and stream on demand
+  through a per-layer LRU cache, a persistent learned pin for the hottest ones, and the OS page cache
+  as a free extra tier.
+
+Per token that means about 24.6 GB read from disk. Splitting the checkpoint across two NVMe drives
+(`--shard-dirs`) measures at 61%/39% of the reads, so both drives work in parallel.
 
 ## Architectures
 
-| | Kimi K3 | Kimi Linear 48B | GLM-5.2 |
-|---|---|---|---|
-| total / active params | 2.8T / not yet characterized | 48B / ~3B | 744B / ~40B |
-| attention | KDA + Gated MLA, extra output gates | Kimi Delta Attention + Gated MLA | MLA + DSA sparse indexer |
-| MoE routing | Stable LatentMoE (narrower latent width), shared experts | grouped routing, shared experts | `noaux_tc` sigmoid, shared expert |
-| native quantization read | OCP MXFP4 (routed experts) | BF16 | FP8 (E4M3, block-scale) |
-| checkpoint | Moonshot's real release | Moonshot's real release | pre-converted by colibrì's tooling |
-| status | correctness-validated, perf work pending | tuned (`--session`, real chat) | fully tuned, 8 versions of perf work |
+| | Qwen 3.8 | Kimi K3 | Kimi Linear 48B | GLM-5.2 |
+|---|---|---|---|---|
+| params (total / routed per token) | 2.446 T / 46.3 B | 2.8 T / 48.6 B | 48 B / ~3 B | 744 B / ~40 B |
+| attention | GQA + partial RoPE + output gate (23 of 92 layers) | KDA + Gated MLA | KDA + Gated MLA | MLA + DSA sparse indexer |
+| linear attention | Gated DeltaNet (69 of 92 layers) | Kimi Delta Attention | Kimi Delta Attention | none |
+| MoE routing | softmax top-10 of 512 + gated shared expert | Stable LatentMoE | grouped routing | `noaux_tc` sigmoid |
+| native quantization read | OCP MXFP4 | OCP MXFP4 | BF16 | FP8 (E4M3, block-scale) |
+| checkpoint | AMD's Quark MXFP4 release, as-is | Moonshot's release, as-is | Moonshot's release, as-is | pre-converted to int4 |
 
-One `Model`/`KvState`/`ExpertCaches` family-dispatch enum in `src/model.rs` routes to the right
-architecture from `config.json`'s `model_type`. `--chat`/`--serve`/`--prompt`/`--session` all
-work the same way across the three.
+One family-dispatch enum (`src/model.rs`) picks the architecture from `config.json`'s `model_type`.
+`--prompt`, `--chat`, `--serve` and `--session` work identically across all four.
 
-## What's implemented
-
-- **Faithful forward pass for all three architectures.** Validated token-exact against a
-  synthetic oracle built from each model family's own real reference code, plus real-checkpoint
-  validation for each.
-- **MLA attention** with **weight absorption** for decode (no per-token k/v reconstruction) and
-  dense reconstruction for prefill, parallelized with `rayon` across attention heads.
-- **DSA sparse attention** (GLM-5.2's lightning indexer) and **Kimi Delta Attention** (KDA's
-  chunked recurrence, short convolutions, per-channel decay gate). Real math, not approximated.
-- **int4/int8/int2 quantization**, native **FP8** (E4M3, block-scale) and **OCP MXFP4** checkpoint
-  loading, grouped-scale int4, and a **`.qs`** pre-quantized fast path.
-- **AVX2 + AVX-512/VNNI kernels**, runtime-selected, plus `rayon` parallelization across CPU
-  cores for every matmul and the absorbed-attention decode path.
-- **`io_uring`-batched expert streaming**, with a sequential-`pread` fallback. K3's MXFP4 experts
-  use the fallback today; batching that path is open work (see `ROADMAP.md`).
-- **Persistent expert usage cache** (`.rabbit_usage`). Learns which experts your usage routes to
-  and pins them, lazily, once a candidate is actually loaded through normal use.
-- **KV-cache persistence** (`--session`). Conversations reopen warm across restarts.
-- **A standalone checkpoint converter** (`bin/convert.rs`). Architecture-agnostic tensor
-  classification, per-bucket bit-depth control, a `--report` quality pass. No dependency on
-  colibrì's own tooling except for the pre-converted GLM-5.2 checkpoint above.
-- **OpenAI-compatible HTTP server** (`--serve`). Streaming and non-streaming
-  `/v1/chat/completions`, `/v1/models`, plus `/profile`, a rolling per-turn phase-timing window.
-- **Multi-turn chat** (`--chat`) with each model's own real chat template.
-
-Not yet built: live expert re-pinning, GPU/CUDA, MTP speculative decoding, ARM NEON,
-grammar-constrained decoding, and a web UI (`/profile` is a JSON endpoint, no page serves it yet;
-see `DASHBOARD_BRIEF.md`).
-
-## Honest numbers (Ryzen AI 9 HX 370, 12 cores/24 threads, 123GB RAM, NVMe SSD)
-
-| Model | RAM (GB) | Decode |
-|---|---|---|
-| Kimi K3 (2.78T MXFP4 MoE, `--expert-cache` auto=7) | 46 | 0.169 tok/s |
-| GLM-5.2 (744B FP8 MoE, `--expert-cache 64`) | — | 1.02 words/s |
-| Kimi Linear 48B | — | — |
-
-Full logs: `PERFORMANCE_KIMI_K3.md`, `PERFORMANCE.md`.
-
-### GLM-5.2
-
-| metric | value |
-|---|---|
-| checkpoint | 378 GB (`jlnsrk/GLM-5.2-colibri-int4`) |
-| `rayon` matmul parallelization | 128.9s → 36.3s for 5 tokens (3.5×), bit-exact output |
-| `rayon` absorbed-attention parallelization | 224.3s → 158.4s for 70 decode tokens (~29% faster) |
-| decode I/O share, steady state (warm cache) | 30-35% disk I/O, 65-70% compute |
-| prefill I/O share (cold cache) | ~75% disk I/O |
-| expert-cache hit rate, steady-state decode | 70-77% (miss floor 23-30%) |
-| usage-cache auto-pin | 150 experts (2/layer × 75 MoE layers): prefill hits 0 → 136 |
-| decode speed, current (v0.22.0) | 1.02 words/sec, up from 0.29 across eight measured versions |
-
-All measured against the real checkpoints, not estimated. See `PERFORMANCE.md` for the full
-chronological log, including techniques that were tried and reverted.
-
-## Building
+## Quickstart
 
 ```bash
 cargo build --release
-cargo test
+cargo test                       # 461 tests, no checkpoint needed
 ```
 
 ```bash
-./target/release/rabbit --model /mnt/data/kimi-k3 --prompt "What is the capital of France?"
-./target/release/rabbit --model /mnt/data/kimi-k3 --chat --session ~/.rabbit_session
-./target/release/rabbit --model /mnt/data/kimi-k3 --serve --port 8000
+# Qwen3.8-Max, split across two drives
+rabbit --model /mnt/data/qwen38-max-mxfp4 --shard-dirs ~/qwen38-max-mxfp4-shards2 \
+       --prompt "What is the capital of France?"
+
+rabbit --model <dir> --chat --session ~/.rabbit_session      # multi-turn, resumes across restarts
+rabbit --model <dir> --serve --port 8000                     # OpenAI-compatible HTTP
 ```
 
-`--model` auto-detects the architecture from the checkpoint's `config.json`. Kimi K3 and Kimi
-Linear read Moonshot's own published `safetensors` shards directly: download
-[`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) and point `--model` at it, no
-conversion step. GLM-5.2 needs a directory in colibrì's converted layout; a pre-converted
-checkpoint such as [`jlnsrk/GLM-5.2-colibri-int4`](https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4)
-works directly. See `--help` for the full flag list (`--max-tokens`, `--temperature`,
-`--nucleus`, `--expert-cache`, `--dbits`, `--ebits`, `--shard-dirs`, `--no-usage-cache`, ...).
+Checkpoints, no conversion needed:
+[`amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`](https://huggingface.co/amd/Qwen3.8-2.4T-A95B-Quark-MXFP4) (1.37 TB),
+[`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) (1.45 TB),
+[`moonshotai/Kimi-Linear-48B-A3B-Instruct`](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct).
+GLM-5.2 needs a pre-converted int4 checkpoint, which `bin/convert.rs` produces.
+
+`--help` lists the rest: `--expert-cache`, `--io-batch-size`, `--dbits`/`--ebits`, `--temperature`,
+`--nucleus`, `--think`, `--no-usage-cache`, `--mmap-experts`.
+
+## What's implemented
+
+* Faithful forward pass for four architectures, each validated token-exact against a tiny model built
+  from that family's own real reference code.
+* `io_uring`-batched expert streaming with per-expert early drain, so an expert's matmul starts the
+  moment its own bytes land instead of when the whole batch finishes. Sequential `pread` fallback
+  elsewhere.
+* RAM-aware `--expert-cache` auto-clamp. On Qwen3.8-Max the flat default of 64 would have asked for
+  about 236 GB, so it lowers itself to 9 and says so in the log.
+* Persistent expert usage cache (`.rabbit_usage`) that learns which experts your prompts route to and
+  pins them.
+* int4 / int8 / int2 quantization, native FP8 and OCP MXFP4 reading, grouped-scale int4, and a `.qs`
+  pre-quantized fast path.
+* AVX2 and AVX-512/VNNI kernels, runtime-selected, with `rayon` across cores.
+* KV-session persistence (`--session`) per architecture, including Qwen's hybrid state: an
+  append-only log for the 23 attention layers, an atomically-replaced snapshot for the 69 recurrent
+  ones.
+* OpenAI-compatible server (`--serve`) with streaming `/v1/chat/completions`, `/v1/models`, and
+  `/profile` for rolling per-turn phase timings.
+* Architecture-agnostic checkpoint converter (`bin/convert.rs`) with per-bucket bit-depth control and
+  a `--report` quality pass.
+
+Not built: GPU, MTP speculative decoding, ARM NEON, grammar-constrained decoding, live re-pinning, a
+web UI for `/profile`.
+
+## How correctness is checked
+
+Three independent layers, because fluent-looking output proves very little.
+
+1. Teacher forcing against the reference implementation. A tiny random model built from the family's
+   own PyTorch code (`tests/oracle/make_*_oracle.py`), then argmax compared at every position plus an
+   incremental-decode replay. Qwen 3.8 matches at all 12 positions and reproduces the reference
+   continuation exactly.
+2. Oracles for the pieces around the model. The tokenizer against HuggingFace's own `tokenizers`
+   (23 of 24 cases exact, the 24th a documented NFC difference that still round-trips), and the chat
+   template against the real `chat_template.jinja` rendered by Jinja2 (9 of 9).
+3. Property tests over the engine. Batched prefill equals token-by-token stepping, a restored session
+   continues bit-identically to a live one, and every tensor is asserted into its own field from a
+   synthetic checkpoint where each one holds a distinct value.
+
+Some of these caught real bugs before any weights existed. Qwen's `Qwen3_5MoeRMSNorm` scales by
+`(1 + w)` while its Gated DeltaNet norm scales by plain `w`; using the crate's usual RMSNorm would
+have quietly collapsed every activation toward zero, with no error anywhere.
 
 ## Repo layout
 
 ```
 src/
-├── kimi_k3/                                  Kimi K3: SituAndMul, LatentMoE, Attention Residuals, MXFP4
-├── kimi_linear/                              Kimi Linear 48B: KDA, short convs, tokenizer, chat template
-├── glm52/                                    GLM-5.2: MLA+DSA attention, MoE router, checkpoint converter
-├── model.rs                                  family-dispatch enum: Model/KvState/ExpertCaches/Tokenizer
-├── safetensors.rs, quant.rs, kernels.rs      shard index, quantization, scalar/AVX2/AVX-512/MXFP4 kernels
-├── expert_cache.rs, usage_cache.rs           LRU expert streaming + persistent usage learning
-├── generate.rs, kv_session.rs                shared generation loop + KV-cache persistence
-├── chat.rs, server.rs, main.rs               chat templates, HTTP server, CLI entrypoint
-tests/oracle/     per-architecture oracle generators (real reference code, vendored) + fixtures
-tools/            real-tokenizer validation fixtures (dev-only, not a runtime dependency)
-benches/          criterion benchmarks (kernels, expert loading)
+├── qwen38/           Qwen 3.8: GQA + partial RoPE, Gated DeltaNet, softmax MoE, (1+w) norms
+├── kimi_k3/          Kimi K3: SituAndMul, LatentMoE, Attention Residuals, MXFP4
+├── kimi_linear/      Kimi Linear 48B: KDA recurrence, short convs, tokenizer, chat template
+├── glm52/            GLM-5.2: MLA + DSA attention, MoE router, checkpoint converter
+├── model.rs          family dispatch: Model / KvState / ExpertCaches / Tokenizer
+├── expert_cache.rs   LRU + pinned expert streaming, io_uring batching, MXFP4/FP8/int4 loading
+├── kernels.rs        scalar / AVX2 / AVX-512-VNNI / MXFP4 matmuls
+├── quant.rs, safetensors.rs, usage_cache.rs, generate.rs, kv_session.rs
+└── chat.rs, server.rs, main.rs
+tests/oracle/         per-architecture reference-model generators (vendored real code)
+tools/                fixture downloaders, checkpoint download/convert scripts
+benches/              criterion benchmarks (kernels, expert loading)
 ```
 
-## Why Rust, why colibrì
+## Why this exists
 
-colibrì is C, hand-written, effectively zero-dependency, and GLM-5.2-only. rabbit ports the same
-algorithms to Rust with a short list of well-justified dependencies instead of a zero-dep stance,
-adds its own performance work (the `rayon` parallelization above, KV-session and expert-usage
-persistence), and generalizes the whole engine into a family-dispatch design that now runs two
-more architectures colibrì doesn't. Every architecture is validated the same way colibrì
-validates itself: token-exact teacher-forcing against a tiny synthetic model built from that
-architecture's own real reference code.
+Every algorithm here is implemented from the reference sources: each architecture's own published
+modeling code, read and ported rather than approximated, then validated against it. On top of that
+sit the pieces that make disk-resident inference work at all: `io_uring` expert streaming with
+per-expert early drain, a RAM-aware cache clamp, persistent expert-usage learning, hybrid KV-session
+persistence, and a family-dispatch design that serves four architectures from one engine.
 
-Part of the [ferrumox](../) AI lab, alongside [fox](../fox) (a production local-LLM server
-wrapping llama.cpp). rabbit is the opposite kind of project: a research engine for models that
-don't fit in memory even offloaded, built by hand instead of wrapping an existing runtime.
-
-The name is a nod to [RabbitLLM](https://github.com/ManuelSLemos/RabbitLLM), an earlier,
-unrelated project of mine (a fork of AirLLM that streams full model layers through limited GPU
-VRAM). Same interest in running large models on constrained hardware, different problem, a
-completely different technique. Nothing in this codebase is derived from that one.
+Part of the [ferrumox](../) AI lab, alongside [fox](../fox), a production local-LLM server wrapping
+llama.cpp. rabbit is the opposite kind of project: a research engine for models that don't fit in
+memory even offloaded, built by hand instead of wrapping a runtime.
 
 ## Versioning
 
-Pre-1.0, `0.MINOR.PATCH`, tracked via git tags and `release/vX.Y.Z` branches rather than
-`Cargo.toml`'s version field. `MINOR` bumps at the end of each development phase, `PATCH` for
-fixes/polish within one. `rabbit-plan.md` has the full phase-by-phase history through GLM-5.2 and
-Kimi Linear's bring-up.
+Pre-1.0, `0.MINOR.PATCH`, via git tags and `release/vX.Y.Z` branches. MINOR means a real measured
+improvement or a new architecture, PATCH means kept-but-neutral work. Development phases are logged
+in `rabbit-plan.md`, per-architecture port notes in `QWEN38_PORT.md`.
 
 ## License
 
-TBD.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+Checkpoints are not covered by this license: each model's weights carry their own terms (Qwen3.8-Max
+ships under Alibaba's own `qwen3.8-max` license, Kimi K3 and Kimi Linear under Moonshot's, GLM-5.2
+under Zhipu's). Check them before redistributing anything you convert.

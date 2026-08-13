@@ -83,7 +83,7 @@ because it hasn't been tested as widely as everything else on this page yet.
 
 `rayon` (the library rabbit uses to spread work across CPU cores) defaults to one thread per
 *logical* core — on this machine, 24 (12 physical cores × 2 via hyperthreading/SMT). Rabbit now
-sizes its thread pool to *physical* cores instead (12 here), matching a tuning colibrì already
+sizes its thread pool to *physical* cores instead (12 here), matching a tuning the reference implementation already
 does for the same reason. Measured on the real checkpoint, same prompt as everywhere else on this
 page: wall-clock speed was **the same either way** (68.4s at 24 threads vs 67.1s at 12 — within
 normal run-to-run noise, not a real difference), but total CPU time used was roughly **half**
@@ -214,7 +214,7 @@ runs landing clearly above the tight 0.730/0.730 "before" control band.
 
 ## v0.22.0: AVX-512/AVX2 for the MLA-absorb decode path
 
-Ported two optimizations found in colibrì's v1.1.0 release (pulled 2026-07-22) onto rabbit's
+Ported two optimizations found in the reference implementation's v1.1.0 release (pulled 2026-07-22) onto rabbit's
 absorbed-attention decode path — the path used for short decode sequences (the normal case while
 generating word by word). Two spots were still doing this math the plain, unvectorized way even
 though rabbit already had the AVX-512 building block sitting right next to them, unused, since
@@ -267,7 +267,7 @@ RAID0 setup (combining both drives into one striped array at the operating-syste
 out not to be practical: the original drive has no free space to shrink into an array without
 risky surgery on a live system (resizing its filesystem, reinstalling the boot loader). Instead,
 rabbit itself now knows how to read a checkpoint's files split across more than one directory —
-`--shard-dirs <dir1,dir2,...>` alongside `--model <dir>` — an idea borrowed from colibrì's own
+`--shard-dirs <dir1,dir2,...>` alongside `--model <dir>` — an idea borrowed from the reference implementation's own
 `COLI_MODEL_DIRS` feature. No operating-system array involved, and unlike RAID0, each drive keeps
 holding a genuinely complete, independently-readable portion of the checkpoint.
 
@@ -339,19 +339,19 @@ capacity and reliability reasons above, just not for speed.
   amortize that upfront cost against). Redesigned to load lazily instead before ever being
   released; the eager version never shipped.
 - **Batching three specific weight-reading steps during prompt processing** (ported from a real,
-  measured colibrì win — colibrì saw -4.5% total prompt-processing time from this exact change).
+  measured the reference implementation win — the reference implementation saw -4.5% total prompt-processing time from this exact change).
   Built it, proved it bit-identical with dedicated tests, added a stopwatch just for this one
   step to measure it in isolation (the step is normally too small next to disk I/O to see at
   all) — and found a **reproducible ~16-17% regression** in rabbit specifically (4.95s → 5.75s
-  average, repeated twice each side, stable both times), the opposite of colibrì's result. Root
-  cause, best understanding: colibrì's version of this step re-reads the same weight data from
+  average, repeated twice each side, stable both times), the opposite of the reference implementation's result. Root
+  cause, best understanding: the reference implementation's version of this step re-reads the same weight data from
   scratch on every one of many small calls, so batching genuinely saves work there; rabbit's
   equivalent step already reads each piece of weight data once per call regardless of batch size
   (a structural difference in how the two engines are built), so batching only added the cost of
   a bigger temporary buffer and its cleanup step without saving anything to offset it. Reverted,
   never shipped — a clear example of "a technique that's a real, measured win in the code it was
   copied from isn't automatically a win once ported," worth remembering before porting another
-  colibrì optimization without measuring it here first.
+  the reference implementation optimization without measuring it here first.
 
 ## Reproducing these numbers
 
@@ -384,6 +384,6 @@ branch tip).
 
 Hardware throughout: AMD Ryzen AI 9 HX 370 (12 cores / 24 threads, AVX2 + AVX-512F/BW/VNNI),
 123 GB RAM, NVMe SSD, running the real
-[`jlnsrk/GLM-5.2-colibri-int4`](https://huggingface.co/jlnsrk/GLM-5.2-colibri-int4) checkpoint
-(378 GB, 744B params, community int4 conversion via colibrì's own tooling). See `rabbit-plan.md`
+[`GLM-5.2-int4`](https://huggingface.co/GLM-5.2-int4) checkpoint
+(378 GB, 744B params, community int4 conversion via the reference implementation's own tooling). See `rabbit-plan.md`
 for the full phase-by-phase development history behind each version.

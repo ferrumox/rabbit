@@ -167,7 +167,7 @@ pub enum Role {
 
 /// Renders one incremental chat turn (`--chat`'s KV-continuation mode: only the NEW turn needs
 /// rendering, prior turns already live in `kv`) into the exact prompt text to encode and
-/// forward — dispatches on `model`'s family, since GLM-5.2, Kimi Linear, and Kimi K3 all use
+/// forward — dispatches on `model`'s family, since GLM-5.2, Kimi Linear, Kimi K3 and Qwen 3.8 all use
 /// genuinely different chat templates (see `glm52_render_turn`'s doc,
 /// `kimi_linear::chat_template::render_turn`'s doc, and `kimi_k3::chat_template::render_turn`'s
 /// doc for each one's specifics, all read from real reference sources, not guessed).
@@ -176,6 +176,7 @@ pub fn render_turn(model: &Model, user_msg: &str, first: bool, think: bool, syst
         Model::Glm52(_) => glm52_render_turn(user_msg, first, think, system),
         Model::KimiLinear(_) => crate::kimi_linear::chat_template::render_turn(user_msg, first, think, system),
         Model::KimiK3(_) => crate::kimi_k3::chat_template::render_turn(user_msg, first, think, system),
+        Model::Qwen38(_) => crate::qwen38::chat_template::render_turn(user_msg, first, think, system),
     }
 }
 
@@ -208,6 +209,7 @@ pub fn render_messages(model: &Model, messages: &[(Role, String)], think: bool) 
         Model::Glm52(_) => glm52_render_messages(messages, think),
         Model::KimiLinear(_) => crate::kimi_linear::chat_template::render_messages(messages, think),
         Model::KimiK3(_) => crate::kimi_k3::chat_template::render_messages(messages, think),
+        Model::Qwen38(_) => crate::qwen38::chat_template::render_messages(messages, think),
     }
 }
 

@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "rabbit"
-version = "0.28.2"
+version = "0.29.0"
 dependencies = [
  "base64",
  "criterion",
