@@ -163,7 +163,7 @@ more architectures colibrì doesn't. Every architecture is validated the same wa
 validates itself: token-exact teacher-forcing against a tiny synthetic model built from that
 architecture's own real reference code.
 
-Part of the [ferrumox](../) AI lab, alongside [fox](../fox) (a production local-LLM server
+Part of the [ferrumox](https://github.com/ferrumox) AI lab, alongside [fox](https://github.com/ferrumox/fox) (a production local-LLM server
 wrapping llama.cpp). rabbit is the opposite kind of project: a research engine for models that
 don't fit in memory even offloaded, built by hand instead of wrapping an existing runtime.
 
