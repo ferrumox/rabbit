@@ -736,10 +736,13 @@ pub struct ExpertCache {
     /// I/O-bound" from "already compute-bound" before investing in either kind of further
     /// optimization.
     pub load_nanos: u64,
-    /// The portion of `load_nanos` (Linux `io_uring` path only) spent purely in
-    /// `submit_and_wait` — actually waiting on the kernel/disk, not decoding or copying the
-    /// results afterward. `load_nanos - io_wait_nanos` is everything else `finish_loading`'s
-    /// async branch does (validation, scale decode, the `qt_from_raw` loop's buffer copies) —
+    /// The portion of `load_nanos` spent purely waiting for expert bytes, not decoding or
+    /// copying them afterward. On the Linux `io_uring` path that is the time in
+    /// `submit_and_wait`; on the plain `pread` path (every other OS, or no ring) it is the wall
+    /// time with at least one read in flight, from `Shards::read_wait_nanos`. Not measured for
+    /// `--mmap-experts`, whose reads happen as page faults inside the matmul.
+    /// `load_nanos - io_wait_nanos` is everything else the load does (validation, scale decode,
+    /// buffer copies, and on the `pread` path the quantizing of non-MXFP4 experts) —
     /// distinguishing the two is what found the buffer-copy fix documented in
     /// `PERFORMANCE.md`: about 40% of a real run's reported "disk I/O" time turned out to be
     /// this CPU-side work, not the drive.
@@ -946,7 +949,13 @@ impl ExpertCache {
             return Ok(PendingExpertLoad(LoadKind::Async(pending)));
         }
 
+        // Plain `pread` path (every OS without `io_uring`, or Linux without a usable ring): the
+        // reader's own wait counter supplies the "actual disk wait" figure that `io_uring`'s
+        // `complete_batch` measures on Linux. It counts wall time with at least one read in
+        // flight, so parallel loads are not counted once per thread.
+        let wait_before = shards.read_wait_nanos();
         let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock, self.naming)?;
+        self.io_wait_nanos += shards.read_wait_nanos().saturating_sub(wait_before);
         self.load_nanos += load_t.elapsed().as_nanos() as u64;
         Ok(PendingExpertLoad(LoadKind::Sync(loaded)))
     }

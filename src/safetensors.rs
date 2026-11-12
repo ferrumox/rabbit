@@ -179,7 +179,71 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn read_exact_at(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<()> {
+/// Wall-clock time during which at least one read was in flight, counted once however many
+/// threads were reading at the same moment. That is the plain-`pread` counterpart to what the
+/// Linux `io_uring` loader measures around its wait: time spent waiting for bytes, not the sum
+/// of every thread's read time (which would count the same second up to once per thread).
+///
+/// Every `Shards` read goes through `read_exact_at`, which brackets the read with `begin`/`end`.
+/// Callers that want the read time of one batch of work take `total_nanos()` before and after
+/// it (`expert_cache.rs`'s `begin_loading` does this around the `pread` expert loader).
+#[derive(Debug, Default)]
+pub struct ReadWaitTracker {
+    state: std::sync::Mutex<ReadWaitState>,
+}
+
+#[derive(Debug, Default)]
+struct ReadWaitState {
+    /// Reads currently in progress, across all threads.
+    in_flight: usize,
+    /// When `in_flight` last went from 0 to 1, i.e. when the current busy stretch started.
+    busy_since: Option<std::time::Instant>,
+    /// Sum of all finished busy stretches.
+    total: std::time::Duration,
+}
+
+impl ReadWaitState {
+    fn begin(&mut self, now: std::time::Instant) {
+        if self.in_flight == 0 {
+            self.busy_since = Some(now);
+        }
+        self.in_flight += 1;
+    }
+
+    fn end(&mut self, now: std::time::Instant) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if self.in_flight == 0 {
+            if let Some(start) = self.busy_since.take() {
+                self.total += now.saturating_duration_since(start);
+            }
+        }
+    }
+}
+
+impl ReadWaitTracker {
+    fn begin(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).begin(std::time::Instant::now());
+    }
+
+    fn end(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).end(std::time::Instant::now());
+    }
+
+    /// Total time with at least one read in flight, in nanoseconds. A busy stretch still in
+    /// progress is not included until its last read finishes.
+    pub fn total_nanos(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).total.as_nanos() as u64
+    }
+}
+
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8], tracker: &ReadWaitTracker) -> io::Result<()> {
+    tracker.begin();
+    let result = read_exact_at_untracked(file, offset, buf);
+    tracker.end();
+    result
+}
+
+fn read_exact_at_untracked(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
         let n = file.read_at(&mut buf[done..], offset)?;
@@ -222,6 +286,8 @@ pub struct Shards {
     /// needing `&mut self` (`Shards` is normally shared read-only across worker threads via
     /// `Arc<Shards>`).
     mmaps: Vec<OnceLock<Arc<memmap2::Mmap>>>,
+    /// Time spent with at least one read in flight — see `ReadWaitTracker`.
+    read_wait: ReadWaitTracker,
 }
 
 impl Shards {
@@ -265,7 +331,7 @@ impl Shards {
             let file = File::open(&path)?;
             let file_len = file.metadata()?.len();
             let mut hlen_buf = [0u8; 8];
-            read_exact_at(&file, 0, &mut hlen_buf)?;
+            read_exact_at_untracked(&file, 0, &mut hlen_buf)?;
             let hlen = u64::from_le_bytes(hlen_buf);
             // the header can't be bigger than the file it lives in — reject up front instead of
             // trusting a corrupt/malicious `hlen` into a multi-exabyte allocation attempt.
@@ -276,7 +342,7 @@ impl Shards {
                 )));
             }
             let mut header_buf = vec![0u8; hlen as usize];
-            read_exact_at(&file, 8, &mut header_buf)?;
+            read_exact_at_untracked(&file, 8, &mut header_buf)?;
             let header: Value = serde_json::from_slice(&header_buf)?;
             let data_start = 8 + hlen;
 
@@ -340,7 +406,7 @@ impl Shards {
         }
 
         let mmaps = files.iter().map(|_| OnceLock::new()).collect();
-        Ok(Shards { files, tensors, index, mmaps })
+        Ok(Shards { files, tensors, index, mmaps, read_wait: ReadWaitTracker::default() })
     }
 
     /// Every indexed tensor across every shard in this `Shards` — the converter's
@@ -354,6 +420,12 @@ impl Shards {
 
     pub fn find(&self, name: &str) -> Option<&Tensor> {
         self.index.get(name).map(|&i| &self.tensors[i])
+    }
+
+    /// Total time so far with at least one tensor read in flight, in nanoseconds — see
+    /// `ReadWaitTracker`. Take it before and after a batch of reads to time that batch.
+    pub fn read_wait_nanos(&self) -> u64 {
+        self.read_wait.total_nanos()
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -401,7 +473,7 @@ impl Shards {
             return self.read_f32_fp8_blockscale(name, drop_cache);
         }
         let mut raw = vec![0u8; t.nbytes as usize];
-        read_exact_at(&self.files[t.file_index], t.offset, &mut raw)?;
+        read_exact_at(&self.files[t.file_index], t.offset, &mut raw, &self.read_wait)?;
         let mut out = Vec::with_capacity(t.numel as usize);
         decode_floats(&raw, t.dtype, &mut out);
         if drop_cache {
@@ -423,7 +495,7 @@ impl Shards {
         let (rows, cols) = (t.shape[0], t.shape[1]);
 
         let mut raw = vec![0u8; t.nbytes as usize];
-        read_exact_at(&self.files[t.file_index], t.offset, &mut raw)?;
+        read_exact_at(&self.files[t.file_index], t.offset, &mut raw, &self.read_wait)?;
         if drop_cache {
             self.fadvise_dontneed(t.file_index, t.offset, t.nbytes);
         }
@@ -438,7 +510,7 @@ impl Shards {
     pub fn read_raw(&self, name: &str, drop_cache: bool) -> Result<Vec<u8>, SafetensorsError> {
         let t = self.find(name).ok_or_else(|| SafetensorsError::MissingTensor(name.to_string()))?;
         let mut raw = vec![0u8; t.nbytes as usize];
-        read_exact_at(&self.files[t.file_index], t.offset, &mut raw)?;
+        read_exact_at(&self.files[t.file_index], t.offset, &mut raw, &self.read_wait)?;
         if drop_cache {
             self.fadvise_dontneed(t.file_index, t.offset, t.nbytes);
         }
@@ -460,7 +532,7 @@ impl Shards {
         let byte_off = t.offset + elem_off * esz;
         let nbytes = n_elems * esz;
         let mut raw = vec![0u8; nbytes as usize];
-        read_exact_at(&self.files[t.file_index], byte_off, &mut raw)?;
+        read_exact_at(&self.files[t.file_index], byte_off, &mut raw, &self.read_wait)?;
         let mut out = Vec::with_capacity(n_elems as usize);
         decode_floats(&raw, t.dtype, &mut out);
         if drop_cache {
@@ -650,6 +722,56 @@ mod tests {
         // bf16 is just the top 16 bits of f32: 1.5 -> 0x3FC0, 3.0 -> 0x4040.
         assert_eq!(bf16_to_f32(0x3FC0), 1.5);
         assert_eq!(bf16_to_f32(0x4040), 3.0);
+    }
+
+    #[test]
+    fn read_wait_counts_overlapping_reads_once() {
+        // Two threads reading at the same time: 0-10 ms and 4-12 ms. The wall time with at
+        // least one read in flight is 0-12 ms, not the 18 ms the two reads add up to.
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut st = ReadWaitState::default();
+        st.begin(ms(0));
+        st.begin(ms(4));
+        st.end(ms(10));
+        assert_eq!(st.total, std::time::Duration::ZERO, "still busy: nothing is counted until the last read ends");
+        st.end(ms(12));
+        assert_eq!(st.total, std::time::Duration::from_millis(12));
+    }
+
+    #[test]
+    fn read_wait_adds_separate_busy_stretches_and_skips_idle_gaps() {
+        // 0-3 ms busy, idle until 10 ms, then 10-15 ms busy: 8 ms, the idle gap left out.
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut st = ReadWaitState::default();
+        st.begin(ms(0));
+        st.end(ms(3));
+        st.begin(ms(10));
+        st.end(ms(15));
+        assert_eq!(st.total, std::time::Duration::from_millis(8));
+        assert_eq!(st.in_flight, 0);
+    }
+
+    #[test]
+    fn read_wait_ignores_an_unmatched_end() {
+        let t0 = std::time::Instant::now();
+        let mut st = ReadWaitState::default();
+        st.end(t0);
+        assert_eq!(st.in_flight, 0);
+        assert_eq!(st.total, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn tensor_reads_advance_read_wait_and_header_reads_do_not() {
+        let dir = TempDir::new("rabbit_test_st_read_wait");
+        let payload = vec![7u8; 4 << 20];
+        fs::write(dir.0.join("a.safetensors"), build_safetensors(&[("big.raw", "U8", vec![payload.len()], payload.clone())])).unwrap();
+        let shards = Shards::open(&dir.0).unwrap();
+        assert_eq!(shards.read_wait_nanos(), 0, "opening a shard reads its header, which must not count");
+        let before = shards.read_wait_nanos();
+        assert_eq!(shards.read_raw("big.raw", false).unwrap(), payload);
+        assert!(shards.read_wait_nanos() > before, "a 4 MB tensor read must add to the wait counter");
     }
 
     #[test]
