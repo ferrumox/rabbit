@@ -793,8 +793,12 @@ mod tests {
         );
 
         // ...and at the real model's 92 layers (92 x 64 x 28 MB = ~165 GB of experts) that helper
-        // really does clamp, which is the whole reason this arm exists.
-        let real = crate::expert_cache::safe_mxfp4_capacity(64, 92, 2048, 8192);
+        // really does clamp, which is the whole reason this arm exists. Checked against a FIXED
+        // budget, not this host's RAM: on a machine with more than ~590 GB free, the RAM-aware
+        // clamp correctly keeps the full default, so asking the real host would make this test
+        // depend on the machine it runs on. 35 GB is the budget the 128 GB dev box measured
+        // (40% of its available RAM, see PERFORMANCE_QWEN38.md), where the clamp landed at 9.
+        let real = crate::expert_cache::safe_mxfp4_capacity_with_budget(64, 92, 2048, 8192, 35_000_000_000);
         assert!(real < 64, "92 MXFP4 layers must clamp below the flat default, got {real}");
         assert!(real >= 1, "...but never to zero");
     }

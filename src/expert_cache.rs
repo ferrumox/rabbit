@@ -736,10 +736,13 @@ pub struct ExpertCache {
     /// I/O-bound" from "already compute-bound" before investing in either kind of further
     /// optimization.
     pub load_nanos: u64,
-    /// The portion of `load_nanos` (Linux `io_uring` path only) spent purely in
-    /// `submit_and_wait` — actually waiting on the kernel/disk, not decoding or copying the
-    /// results afterward. `load_nanos - io_wait_nanos` is everything else `finish_loading`'s
-    /// async branch does (validation, scale decode, the `qt_from_raw` loop's buffer copies) —
+    /// The portion of `load_nanos` spent purely waiting for expert bytes, not decoding or
+    /// copying them afterward. On the Linux `io_uring` path that is the time in
+    /// `submit_and_wait`; on the plain `pread` path (every other OS, or no ring) it is the wall
+    /// time with at least one read in flight, from `Shards::read_wait_nanos`. Not measured for
+    /// `--mmap-experts`, whose reads happen as page faults inside the matmul.
+    /// `load_nanos - io_wait_nanos` is everything else the load does (validation, scale decode,
+    /// buffer copies, and on the `pread` path the quantizing of non-MXFP4 experts) —
     /// distinguishing the two is what found the buffer-copy fix documented in
     /// `PERFORMANCE.md`: about 40% of a real run's reported "disk I/O" time turned out to be
     /// this CPU-side work, not the drive.
@@ -946,7 +949,13 @@ impl ExpertCache {
             return Ok(PendingExpertLoad(LoadKind::Async(pending)));
         }
 
+        // Plain `pread` path (every OS without `io_uring`, or Linux without a usable ring): the
+        // reader's own wait counter supplies the "actual disk wait" figure that `io_uring`'s
+        // `complete_batch` measures on Linux. It counts wall time with at least one read in
+        // flight, so parallel loads are not counted once per thread.
+        let wait_before = shards.read_wait_nanos();
         let loaded = sequential_fallback(shards, cfg, layer, &misses, bits, self.clock, self.naming)?;
+        self.io_wait_nanos += shards.read_wait_nanos().saturating_sub(wait_before);
         self.load_nanos += load_t.elapsed().as_nanos() as u64;
         Ok(PendingExpertLoad(LoadKind::Sync(loaded)))
     }
@@ -1084,7 +1093,18 @@ impl ExpertCache {
 /// Used as `begin_loading`'s non-Linux (or ring-unavailable) synchronous path, and as
 /// `finish_loading`'s fallback when `uring_load::complete_batch` reports an I/O error.
 fn sequential_fallback(shards: &Shards, cfg: &Cfg, layer: usize, misses: &[usize], bits: u8, used: u64, naming: ExpertNaming) -> Result<Vec<ExpertSlot>, ModelError> {
-    misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used, naming)).collect()
+    if cfg!(target_os = "linux") {
+        // Linux: unchanged. This only runs when `io_uring` is unavailable or a batch failed.
+        misses.iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used, naming)).collect()
+    } else {
+        // FreeBSD and every other OS: this is the ONLY expert-loading path, so load the misses
+        // in parallel on the `rayon` pool. Each expert is an independent set of `pread`s into its
+        // own buffers, so this keeps several reads in flight at once (what `io_uring` batching
+        // gives Linux) and spreads the page-cache-to-buffer copies across cores. `collect` keeps
+        // the results in `misses` order, so the output is unchanged.
+        use rayon::prelude::*;
+        misses.par_iter().map(|&eid| load_expert(shards, cfg, layer, eid, bits, used, naming)).collect()
+    }
 }
 
 fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, used: u64, naming: ExpertNaming) -> Result<ExpertSlot, ModelError> {
@@ -1120,8 +1140,9 @@ fn load_expert(shards: &Shards, cfg: &Cfg, layer: usize, eid: usize, bits: u8, u
 /// `SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES`'s doc for what happens when this can't be read.
 const MXFP4_AUTO_CACHE_BUDGET_FRACTION: f64 = 0.4;
 
-/// Fallback safety budget when `/proc/meminfo` can't be read (non-Linux, missing, a sandboxed
-/// environment, a malformed `MemAvailable` line, ...) — the ORIGINAL fixed constant from before
+/// Fallback safety budget when available RAM can't be read (`/proc/meminfo` on Linux, `sysctl` on
+/// FreeBSD; any other OS, a missing file, a sandboxed environment, a malformed `MemAvailable`
+/// line, ...) — the ORIGINAL fixed constant from before
 /// this was made RAM-aware, kept only as a safety net for that case, not the primary mechanism
 /// anymore. Conservative on purpose: better to under-cache on an unusual host than risk the OOM
 /// this whole fix exists to prevent.
@@ -1141,15 +1162,56 @@ fn parse_mem_available_kb(meminfo: &str) -> Option<u64> {
     meminfo.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|rest| rest.split_whitespace().next()).and_then(|n| n.parse().ok())
 }
 
-/// Real available RAM right now, in bytes — `None` if it can't be determined (non-Linux, or any
-/// read/parse failure), in which case callers fall back to
+/// Real available RAM right now, in bytes — `None` if it can't be determined (not Linux or
+/// FreeBSD, or any read/parse failure), in which case callers fall back to
 /// `SAFE_MXFP4_AUTO_CACHE_FALLBACK_BUDGET_BYTES`.
 #[cfg(target_os = "linux")]
 fn available_memory_bytes() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
     parse_mem_available_kb(&content).map(|kb| kb * 1024)
 }
-#[cfg(not(target_os = "linux"))]
+
+/// FreeBSD's counterpart to Linux's `MemAvailable`, read with `sysctl(3)` because FreeBSD has no
+/// `/proc/meminfo`. Linux's `MemAvailable` is free memory plus page cache the kernel can drop
+/// without writing anything; on FreeBSD that is the free page count plus the inactive page count
+/// (the same pair `top`'s "Free" and "Inact" columns show). The laundry queue is left out on
+/// purpose: those pages are dirty and must be written back before they can be reused, so they
+/// are not quickly available. ZFS's ARC is wired memory and is not counted either, the same way
+/// Linux does not count it in `MemAvailable`.
+#[cfg(target_os = "freebsd")]
+fn available_memory_bytes() -> Option<u64> {
+    let page_size = sysctl_u64("vm.stats.vm.v_page_size")?;
+    let free_pages = sysctl_u64("vm.stats.vm.v_free_count")?;
+    let inactive_pages = sysctl_u64("vm.stats.vm.v_inactive_count")?;
+    Some(pages_to_available_bytes(free_pages, inactive_pages, page_size))
+}
+
+/// Reads one numeric sysctl by name. The `vm.stats.vm.*` counters are 32-bit (`u_int`) today,
+/// but this accepts a 64-bit value too, so a future widening of a counter keeps working.
+#[cfg(target_os = "freebsd")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    let rc = unsafe { libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, &mut len, std::ptr::null(), 0) };
+    if rc != 0 {
+        return None;
+    }
+    match len {
+        4 => Some(u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64),
+        8 => Some(u64::from_ne_bytes(buf)),
+        _ => None,
+    }
+}
+
+/// The arithmetic half of FreeBSD's `available_memory_bytes`, split out (like
+/// `parse_mem_available_kb` is for Linux) so a unit test can check it on any host.
+#[cfg(any(target_os = "freebsd", test))]
+fn pages_to_available_bytes(free_pages: u64, inactive_pages: u64, page_size: u64) -> u64 {
+    free_pages.saturating_add(inactive_pages).saturating_mul(page_size)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn available_memory_bytes() -> Option<u64> {
     None
 }
@@ -1405,6 +1467,25 @@ mod tests {
     fn parse_mem_available_kb_returns_none_on_a_malformed_value() {
         let fixture = "MemAvailable:   not-a-number kB\n";
         assert_eq!(parse_mem_available_kb(fixture), None);
+    }
+
+    #[test]
+    fn pages_to_available_bytes_adds_free_and_inactive_pages() {
+        // 4 KiB pages: 1,000 free + 3,000 inactive = 4,000 pages = 16,384,000 bytes.
+        assert_eq!(pages_to_available_bytes(1_000, 3_000, 4096), 16_384_000);
+    }
+
+    #[test]
+    fn pages_to_available_bytes_handles_a_large_machine_without_overflow() {
+        // ~848 GB of 4 KiB pages, all free: well past what a 32-bit page count times the page
+        // size would hold, so the multiply has to happen in u64.
+        let pages = 848u64 * 1024 * 1024 * 1024 / 4096;
+        assert_eq!(pages_to_available_bytes(pages, 0, 4096), 848u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pages_to_available_bytes_saturates_instead_of_wrapping() {
+        assert_eq!(pages_to_available_bytes(u64::MAX, 1, 4096), u64::MAX);
     }
 
     struct TempDir(std::path::PathBuf);
