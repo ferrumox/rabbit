@@ -144,7 +144,20 @@ fn handle_profile(request: Request, session: &Session) {
     respond_json(request, 200, body.to_string());
 }
 
+/// `GET /health`: answered before the API-key check, like llama-server's own `/health`, so a
+/// process manager (llama-swap's default `checkEndpoint`, a load balancer, a monitoring probe)
+/// can tell the server is up without holding the key. It reveals nothing but "up": the server
+/// only starts listening once the model has finished loading, so a 200 here means it is ready.
+fn is_health_check(method: &Method, url: &str) -> bool {
+    *method == Method::Get && url == "/health"
+}
+
 fn handle(request: Request, session: &mut Session, cfg: &ServeConfig) {
+    if is_health_check(request.method(), request.url()) {
+        respond_json(request, 200, json!({"status": "ok"}).to_string());
+        return;
+    }
+
     if let Some(key) = &cfg.api_key {
         let want = format!("Bearer {key}");
         let authorized = request
@@ -363,8 +376,8 @@ fn stream_chat_completion(request: Request, session: &mut Session, kv: &mut KvSt
         eprintln!("stream: client disconnected mid-response");
         return;
     }
-    let profile = match gen_result {
-        Ok((_, _, _, profile)) => profile,
+    let (completion_tokens, profile) = match gen_result {
+        Ok((_, _, n, profile)) => (n, profile),
         Err(e) => {
             eprintln!("stream: generation error: {e}");
             let _ = write_chunk(&mut *writer, &format!("data: {}\n\n", json!({"error": {"message": e.to_string(), "type": "server_error"}})));
@@ -390,12 +403,26 @@ fn stream_chat_completion(request: Request, session: &mut Session, kv: &mut KvSt
     }
 
     let finish_reason = if hit_stop { "stop" } else { "length" };
-    let final_chunk = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": cfg.model_id,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]});
-    let _ = write_chunk(&mut *writer, &format!("data: {final_chunk}\n\n"));
-    let _ = write_chunk(&mut *writer, "[DONE]\n\n"); // best-effort; client may already be gone
+    for event in stream_end_events(id, created, &cfg.model_id, finish_reason, prompt_ids.len(), completion_tokens) {
+        let _ = write_chunk(&mut *writer, &event); // best-effort; client may already be gone
+    }
     let _ = writer.write_all(b"0\r\n\r\n");
     let _ = writer.flush();
+}
+
+/// The last two server-sent events of a streamed reply: a final chunk carrying the
+/// `finish_reason` and the token counts, then the `data: [DONE]` end marker.
+///
+/// The counts are the same `usage` object the non-streamed reply returns. llama-server sends
+/// them in its last chunk too, which is where clients and proxies such as llama-swap read a
+/// streamed reply's token counts. The end marker must carry the `data: ` prefix: in the
+/// event-stream format a line without a field name is not an event, so a bare `[DONE]` line is
+/// skipped and a client only learns the reply ended when the connection closes.
+fn stream_end_events(id: &str, created: u64, model: &str, finish_reason: &str, prompt_tokens: usize, completion_tokens: usize) -> [String; 2] {
+    let final_chunk = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}});
+    [format!("data: {final_chunk}\n\n"), "data: [DONE]\n\n".to_string()]
 }
 
 fn request_id() -> u64 {
@@ -412,6 +439,28 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_ends_with_usage_then_a_data_done_event() {
+        let [last_chunk, done] = stream_end_events("chatcmpl-1", 7, "kimi-linear-48b", "stop", 15, 8);
+        assert_eq!(done, "data: [DONE]\n\n", "the end marker needs the `data: ` prefix to be an event");
+
+        let json_text = last_chunk.strip_prefix("data: ").and_then(|s| s.strip_suffix("\n\n")).expect("one data: event");
+        let v: Value = serde_json::from_str(json_text).unwrap();
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 15);
+        assert_eq!(v["usage"]["completion_tokens"], 8);
+        assert_eq!(v["usage"]["total_tokens"], 23);
+    }
+
+    #[test]
+    fn health_check_is_only_a_get_of_exactly_health() {
+        assert!(is_health_check(&Method::Get, "/health"));
+        assert!(!is_health_check(&Method::Post, "/health"), "only GET skips the key check");
+        assert!(!is_health_check(&Method::Get, "/health/x"));
+        assert!(!is_health_check(&Method::Get, "/v1/models"), "every other route still needs the key");
+    }
 
     #[test]
     fn constant_time_eq_matches_only_identical_bytes() {
