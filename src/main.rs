@@ -13,7 +13,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: rabbit --model <dir> (--prompt <text> | --chat | --serve) [--max-tokens N] \
 [--temperature F] [--nucleus F] [--seed N] [--dbits N] [--ebits N] [--expert-cache N] \
 [--io-batch-size N] [--think] [--mmap-experts] \
-[--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K] \
+[--session <path>] [--no-usage-cache] [--cache-route] [--threads N] [--host H] [--port N] [--api-key K | --api-key-file <path>] \
 [--shard-dirs <dir1,dir2,...>]";
 
 struct Args {
@@ -73,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut api_key = None;
+    let mut api_key_file: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -100,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
             "--host" => host = next("--host")?,
             "--port" => port = next("--port")?.parse().map_err(|e| format!("--port: {e}"))?,
             "--api-key" => api_key = Some(next("--api-key")?),
+            "--api-key-file" => api_key_file = Some(PathBuf::from(next("--api-key-file")?)),
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
         }
@@ -110,6 +112,13 @@ fn parse_args() -> Result<Args, String> {
     }
     if session.is_some() && !chat {
         return Err(format!("--session is only valid with --chat\n\n{USAGE}"));
+    }
+    if let Some(path) = api_key_file {
+        if api_key.is_some() {
+            return Err(format!("use either --api-key or --api-key-file, not both\n\n{USAGE}"));
+        }
+        let contents = std::fs::read_to_string(&path).map_err(|e| format!("--api-key-file {}: {e}", path.display()))?;
+        api_key = Some(api_key_from_file(&contents).map_err(|e| format!("--api-key-file {}: {e}", path.display()))?);
     }
 
     Ok(Args {
@@ -299,6 +308,21 @@ fn run_serve(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     server::serve(sess, cfg)
 }
 
+/// The key in an `--api-key-file`: the file's one non-blank line, with surrounding whitespace
+/// (including the trailing newline every editor adds) removed. Reading the key from a file keeps
+/// it out of the command line, where `ps` shows it to every user on the machine — the same
+/// reason llama-server has `--api-key-file`. rabbit's server checks a single key, so a file with
+/// several keys (which llama-server accepts, one per line) is refused rather than silently using
+/// only the first.
+fn api_key_from_file(contents: &str) -> Result<String, String> {
+    let keys: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    match keys.as_slice() {
+        [key] => Ok((*key).to_string()),
+        [] => Err("file has no key in it".to_string()),
+        more => Err(format!("file has {} keys (one per line); rabbit accepts exactly one", more.len())),
+    }
+}
+
 /// Sizes the global `rayon` pool to physical cores by default, not `std::thread::available_
 /// parallelism()`'s logical count (which includes SMT/hyperthread siblings) — measured on this
 /// project's own dev box (12 physical / 24 logical): running the default 24 threads vs 12
@@ -338,4 +362,32 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_key_from_file;
+
+    #[test]
+    fn api_key_file_trims_the_trailing_newline_and_spaces() {
+        assert_eq!(api_key_from_file("sk-abc123\n").unwrap(), "sk-abc123");
+        assert_eq!(api_key_from_file("  sk-abc123  \r\n").unwrap(), "sk-abc123");
+    }
+
+    #[test]
+    fn api_key_file_skips_blank_lines_around_the_key() {
+        assert_eq!(api_key_from_file("\n\nsk-abc123\n\n").unwrap(), "sk-abc123");
+    }
+
+    #[test]
+    fn api_key_file_rejects_an_empty_file() {
+        assert!(api_key_from_file("").is_err());
+        assert!(api_key_from_file(" \n\n").is_err());
+    }
+
+    #[test]
+    fn api_key_file_rejects_more_than_one_key() {
+        let err = api_key_from_file("sk-one\nsk-two\n").unwrap_err();
+        assert!(err.contains("2 keys"), "{err}");
+    }
 }
